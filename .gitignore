@@ -1,0 +1,82 @@
+# ── Python ──────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+*.so
+*.pyd
+.eggs/
+*.whl
+
+# ── Virtual environments ────────────────────────────────────────────
+venv/
+.venv/
+env/
+.env/
+*.conda/
+
+# ── IDE / Editor ────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Jupyter ─────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── PyTorch weights (too large for git) ─────────────────────────────
+*.pth
+*.pt
+*.ckpt
+
+# ── Training outputs (root only) ───────────────────────────────────
+/output/
+/checkpoints/
+/logs/
+/runs/
+/tensorboard/
+
+# ── Datasets (root only, NOT adatile/datasets/) ────────────────────
+/datasets/
+/数据集/
+
+# ── Cache ───────────────────────────────────────────────────────────
+.cache/
+*.cache
+/tile_cache/
+/density_maps/
+/prototype_cache/
+.pytest_cache/
+
+# ── Profiling / Benchmark outputs (root only) ───────────────────────
+/results/
+*.trace
+*.chrome_trace
+/profiler/
+
+# ── Environment / Config ────────────────────────────────────────────
+.env
+.env.local
+*.local.yaml
+*.local.yml
+
+# ── Misc ────────────────────────────────────────────────────────────
+*.tmp
+*.temp
+/tmp/
+/temp/
+/wandb/
+/.claude/
+*.code-workspace
+
+# ── Memory files (Claude project memory) ────────────────────────────
+!PROJECT.md
+!CODE_GUIDE.md
+!CLAUDE.md
