@@ -42,10 +42,11 @@ Thumbs.db
 /logs/
 /runs/
 /tensorboard/
-
+/outputs/
 # ── Datasets (root only, NOT adatile/datasets/) ────────────────────
 /datasets/
 /数据集/
+/dataset/
 
 # ── Cache ───────────────────────────────────────────────────────────
 .cache/

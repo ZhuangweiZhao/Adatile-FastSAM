@@ -13,13 +13,9 @@ from torch import Tensor
 from adatile.core import SparseImportancePredictor, SparsePrediction
 from adatile.registry import SPARSE
 
-# Re-export main implementations for backward compatibility
-# (code using `from adatile.sparse.base import AdaSPM` still works)
+# Re-export main implementations (restored from legacy/)
 from adatile.sparse.ada_spm import (
-    AdaSPM,
-    AdaSPMLite,
-    AdaSPMFull,
-    DensityOnlySPM,
+    AdaSPM, AdaSPMLite, AdaSPMFull, DensityOnlySPM,
 )
 
 

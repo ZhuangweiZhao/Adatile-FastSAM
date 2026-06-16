@@ -30,7 +30,7 @@ def get_1shot_config() -> Config:
                                                # produces tiles; was 0.5 default → Tiles=0
 
     # ── Tokenizer (GPU-friendly for 6GB) ─────────────────────────
-    cfg.tokenizer.max_tokens_per_image = 128
+    cfg.tokenizer.max_tokens_per_image = 64  # 64 for 6GB GPU; use 128+ on 12GB+
     cfg.tokenizer.skip_mode = "threshold"     # keeps borderline cells as coarse tiles
 
     # ── Few-Shot Split ───────────────────────────────────────────

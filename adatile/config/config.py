@@ -163,6 +163,10 @@ class DataConfig:
     num_workers: int = 4
     pin_memory: bool = True
 
+    # Dataset split names (COCO uses "train2017", iSAID uses "train")
+    split_train: str = "train"
+    split_val: str = "val"
+
     # Few-shot
     fewshot_split: Optional[str] = None  # e.g. "datasets/iSAID/fewshot_splits/5shot"
     n_shot: int = 5
@@ -212,6 +216,45 @@ class TrainConfig:
 
 
 @dataclass
+class CATConfig:
+    """CAT (Conditional Adaptive Tuning) configuration.
+
+    Controls the CAT-SAM-inspired prompt bridge and adapter modules.
+    Set enabled=False to use standard AdaTile without CAT modules.
+    """
+
+    enabled: bool = False
+    token_dim: int = 256
+    spm_dim: int = 128
+    adapter_reduction: int = 4
+    spatial_size: int = 32
+
+
+@dataclass
+class LossConfig:
+    """Loss function configuration.
+
+    Controls mask supervision and auxiliary loss weights.
+    Set any auxiliary weight to 0.0 to skip its computation entirely.
+    """
+
+    # Mask supervision (Focal + Dice)
+    mask_weight: float = 1.0
+    focal_alpha: float = 0.25
+    focal_gamma: float = 2.0
+    dice_weight: float = 5.0
+    focal_weight: float = 1.0
+
+    # Auxiliary losses — set to 0.0 to skip computation
+    density_weight: float = 0.5
+    sparsity_weight: float = 0.002
+    routing_weight: float = 0.1
+
+    # Matching
+    match_iou_threshold: float = 0.3
+
+
+@dataclass
 class EvalConfig:
     """Evaluation configuration."""
 
@@ -249,6 +292,8 @@ class Config:
     decoder: DecoderConfig = field(default_factory=DecoderConfig)
     data: DataConfig = field(default_factory=DataConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
+    loss: LossConfig = field(default_factory=LossConfig)
+    cat: CATConfig = field(default_factory=CATConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
 
     # Experiment metadata

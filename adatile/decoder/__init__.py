@@ -1,34 +1,30 @@
-"""Segmentation decoder module.
+"""Segmentation decoders.
 
-FastSAM-inspired mask decoder with tile merging support.
+Active (Stage A/B/C):
+    - LightDecoder: simple conv decoder for binary segmentation
+
+Legacy (train.py compatibility):
+    - DifferentiableDecoder: complex tile-level decoder
 """
 
 from adatile.registry import DECODER
+from adatile.decoder.light_decoder import LightDecoder
 
-# Import implementations to trigger @DECODER.register() decorators
-from adatile.decoder.base import (
-    FastSAMDecoder,
-    SegmentationDecoder,
-)
+# Legacy (moved to legacy/)
+DifferentiableDecoder = None
+TileProtoModule = None
 
 
 def build_decoder(name: str, **kwargs):
-    """Factory: instantiate a registered decoder by name.
-
-    Available names:
-        - "FastSAMDecoder" — FastSAM-inspired mask decoder with torchvision ops
-        - "fastsam_decoder" — alias for FastSAMDecoder
-    """
-    _aliases = {
-        "fastsam_decoder": "FastSAMDecoder",
-    }
+    """Factory: instantiate a registered decoder by name."""
+    _aliases = {"fastsam_decoder": "DifferentiableDecoder"}
     name = _aliases.get(name, name)
     return DECODER.build(name, **kwargs)
 
 
 __all__ = [
-    "DECODER",
+    "LightDecoder",
+    "DifferentiableDecoder",
+    "TileProtoModule",
     "build_decoder",
-    "FastSAMDecoder",
-    "SegmentationDecoder",
 ]

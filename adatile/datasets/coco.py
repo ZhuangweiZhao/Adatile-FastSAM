@@ -1,11 +1,8 @@
 """COCO-style instance segmentation datasets for AdaTile-FastSAM.
 
-Provides:
-    - CocoDataset: general COCO JSON loader with full mask/density support
-    - ISAIDDataset: iSAID remote sensing (15 classes, up to 4000×4000 px)
-    - LoveDADataset: LoveDA land-cover (7 classes, 1024×1024 px)
-    - Tile entropy and sparse-region statistics per image
-    - Class distribution analysis tools
+Active datasets:
+    - CocoDataset: COCO 2017 (80 classes)
+    - ISAIDDataset: iSAID remote sensing (15 classes)
 """
 
 from __future__ import annotations
@@ -483,65 +480,3 @@ class ISAIDDataset(CocoDataset):
             "recommended_tile_for_medium": 1536,
             "recommended_tile_for_large": 3072,
         }
-
-
-# ── LoveDA Dataset ───────────────────────────────────────────────────
-
-LOVEDA_CATEGORIES = [
-    {"id": 1, "name": "background"},
-    {"id": 2, "name": "building"},
-    {"id": 3, "name": "road"},
-    {"id": 4, "name": "water"},
-    {"id": 5, "name": "barren"},
-    {"id": 6, "name": "forest"},
-    {"id": 7, "name": "agriculture"},
-]
-
-
-@DATASET.register()
-class LoveDADataset(CocoDataset):
-    """LoveDA: A Remote Sensing Land-Cover Dataset for Domain Adaptive
-    Semantic Segmentation. 7 land-cover categories. 1024×1024 pixels.
-
-    Reference: Wang et al., NeurIPS 2021 Datasets and Benchmarks Track.
-    """
-
-    COCO_CATEGORIES = LOVEDA_CATEGORIES
-
-    def __init__(
-        self,
-        root_dir: str = "datasets/LoveDA",
-        split: str = "train",
-        transforms: Optional[callable] = None,
-        **kwargs,
-    ):
-        super().__init__(
-            root_dir=root_dir,
-            image_dir="images",
-            anno_file=f"{root_dir}/annotations/{split}/instances_{split}.json",
-            split=split,
-            transforms=transforms,
-            **kwargs,
-        )
-
-    def load_semantic_mask(
-        self, index: int, height: Optional[int] = None, width: Optional[int] = None
-    ) -> np.ndarray:
-        """LoveDA is primarily a semantic (land-cover) dataset.
-
-        Override to support both instance and semantic mask formats.
-        """
-        # Try to load from semantic mask files first
-        info = self.get_image_info(self._image_ids[index])
-        H = height or info.get("height", 1024)
-        W = width or info.get("width", 1024)
-
-        # Check for pre-computed semantic mask
-        fname = Path(info.get("file_name", ""))
-        mask_path = self.root_dir / "masks" / self.split / f"{fname.stem}.png"
-        if mask_path.exists():
-            with Image.open(mask_path) as im:
-                return np.array(im, dtype=np.int32)
-
-        # Fallback to instance-based semantic mask
-        return super().load_semantic_mask(index, H, W)

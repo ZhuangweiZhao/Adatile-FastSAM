@@ -1,8 +1,10 @@
-"""Model builders — construct full AdaTile-FastSAM pipelines from config."""
+"""Model builders — construct AdaTile-FastSAM pipelines.
 
-from adatile.modeling.adatile_fastsam import (
-    AdaTileFastSAM,
-    build_adatile_fastsam,
-)
+The old Config-based pipeline builder (AdaTileFastSAM class) has been
+removed. The active pipeline is built via:
 
-__all__ = ["AdaTileFastSAM", "build_adatile_fastsam"]
+    from adatile.engine import build_components
+    backbone, decoder, spm = build_components(args, device, num_classes)
+
+See tools/train_as_fastsam.py for the canonical training entry point.
+"""

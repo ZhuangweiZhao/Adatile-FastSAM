@@ -35,7 +35,7 @@ from adatile.utils import (
     synchronize,
 )
 from adatile.engine.hooks import HookBase
-from adatile.evaluation import COCOEvaluator, FewShotEvaluator
+from adatile.evaluation import COCOEvaluator
 
 
 class Trainer:
@@ -237,12 +237,22 @@ class Trainer:
                     loss = planning_loss
                 else:
                     loss = torch.tensor(0.0, device=self.device)
-                # Add output regularization
                 if output is not None and output.scores.numel() > 0:
                     loss = loss + output.scores.mean() * 0.001
                 loss_dict = {"loss": loss}
 
-        # Backward with scaler
+        # Free aux tensors NOT needed for backward to save GPU memory.
+        # Keep: density, importance, routing_weights (used in losses)
+        # Free: granularity_hard, granularity_soft, routed_tokens,
+        #        skipped_indices, planner_stats, prototypes
+        if aux is not None:
+            _keep = {"density", "importance", "routing_weights", "planning_alignment_loss"}
+            for _k in list(aux.keys()):
+                if _k not in _keep:
+                    aux[_k] = None
+            torch.cuda.empty_cache()
+
+        # Backward with scaler (outside autocast to save memory)
         loss = loss_dict.get("loss", loss_dict.get("loss_mask", 0.0))
         self.scaler.scale(loss).backward()
 

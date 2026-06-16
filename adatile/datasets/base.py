@@ -42,7 +42,7 @@ class BaseDataset(Dataset, ABC):
     ):
         self.root_dir = Path(root_dir)
         self.image_dir = self.root_dir / image_dir / split
-        self.anno_dir = self.root_dir / anno_dir / split
+        self.anno_dir = self.root_dir / anno_dir        # no split — filename already contains it
         self.split = split
         self.transforms = transforms
         self._image_ids: List[int] = []
