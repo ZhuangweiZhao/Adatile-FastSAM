@@ -98,6 +98,12 @@ def extract_p4_features(
             p4 = features["p4"]  # [1, 1280, H/16, W/16]
 
         # 将 GT mask 降采样到 P4 分辨率 | Downsample GT to P4 resolution
+        # 确保 gt_mask 是 [H, W] | Ensure gt_mask is [H, W]
+        if gt_mask.dim() == 3:
+            gt_mask = gt_mask.squeeze(0)
+        elif gt_mask.dim() == 4:
+            gt_mask = gt_mask.squeeze(0).squeeze(0)
+
         gt_p4 = F.interpolate(
             gt_mask.unsqueeze(0).unsqueeze(0).float(),
             size=p4.shape[2:],
