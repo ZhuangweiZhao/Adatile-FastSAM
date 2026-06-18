@@ -1,31 +1,52 @@
-"""Experiment logging system for AdaTile-FastSAM.
+"""
+adatile.logging — 结构化日志系统 | Structured Logging System
+=============================================================
 
-Auto-creates timestamped experiment directories, logs metrics to CSV,
-tracks GPU memory, records system info, handles exceptions gracefully.
+日志系统是整个项目第一个构建的核心基础设施模块。
+所有后续代码必须通过此系统路由所有可观测值。
+The logging system is the FIRST and CORE infrastructure module.
+All subsequent code MUST route values through this system.
 
-Paper-grade logging (NEW):
-    PaperLogger — enhanced metrics, anomaly detection, auto-visualization
-    AnomalyDetector — NaN/gradient/collapse detection
-    LogVisualizer — auto-generate publication-ready plots
+架构总览 | Architecture:
+    LogRecord   — 通用数据容器，记录"要记什么" | universal data container (what to log)
+    LogBackend  — 抽象输出后端，决定"写到哪里" | where to write (console, file, wandb, tensorboard)
+    LogContext  — 上下文管理器，标注"在哪个阶段/范围" | when/where in the pipeline (phase, scope, step)
+    MetricTracker — 时序聚合器，计算运行均值/EMA/标准差 | aggregation over time (running mean, EMA, etc.)
+    LogRegistry — 全局单例注册表，通过名称获取 Logger | global singleton registry (get_logger by name)
 
-Usage:
-    from adatile.logging import RunLogger          # default, all scripts
-    from adatile.logging import PaperLogger         # paper-grade tracking
-    from adatile.logging import ExperimentLogger    # legacy Trainer
+设计原则 | Design principles:
+1. 每个可观测值都走 Logger——禁止裸 print()
+   EVERY value worth observing goes through the logger — no bare print()
+2. 结构化：每条记录携带 step, phase, scope, tags
+   Structured: all records carry step, phase, scope, tags
+3. 可插拔后端：增减输出 sink 不改变业务代码
+   Pluggable backends: add/remove sinks without changing code
+4. 非阻塞：文件 I/O 在后台线程执行，不拖慢训练
+   Non-blocking: file I/O offloaded to background thread
+
+使用示例 | Usage:
+    >>> from adatile.logging import get_logger
+    >>> logger = get_logger("train")
+    >>> logger.add_backend(ConsoleBackend())
+    >>> logger.add_backend(FileBackend("runs/exp1/log.jsonl"))
+    >>>
+    >>> with logger.phase("train"):
+    ...     logger.log_metric("loss/total", 0.5, step=100)
+    ...     logger.log_loss("seg", 0.3, step=100)
 """
 
-from adatile.logging.experiment_logger import ExperimentLogger
-from adatile.logging.experiment_hook import ExperimentHook
-from adatile.logging.run_logger import RunLogger
-from adatile.logging.paper_logger import PaperLogger
-from adatile.logging.anomaly_detector import AnomalyDetector
-from adatile.logging.visualizer import LogVisualizer
+from adatile.logging.record import LogRecord, LogLevel
+from adatile.logging.base import LogBackend
+from adatile.logging.tracker import MetricTracker
+from adatile.logging.context import LogContext
+from adatile.logging.registry import LogRegistry, get_logger
 
 __all__ = [
-    "RunLogger",
-    "PaperLogger",
-    "ExperimentLogger",
-    "ExperimentHook",
-    "AnomalyDetector",
-    "LogVisualizer",
+    "LogRecord",
+    "LogLevel",
+    "LogBackend",
+    "MetricTracker",
+    "LogContext",
+    "LogRegistry",
+    "get_logger",
 ]

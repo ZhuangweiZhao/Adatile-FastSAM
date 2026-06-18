@@ -1,44 +1,112 @@
-# CLAUDE.md
+# CLAUDE.md — AdaTile-FastSAM v2
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
 
-**AS-FastSAM**: Adaptive Sparse FastSAM for Few-Shot High-Resolution Instance Segmentation.
+**AdaTile-FastSAM**: Adaptive Sparse FastSAM for Few-Shot High-Resolution Instance Segmentation.
 
-**Two innovations:**
+**Two innovations (from v1, carried forward):**
 1. **Ada-SPM** — density-supervised sparse perception module: learns importance maps → Top-K tile selection
 2. **Decoupled Sparse Training** — decoder always receives full features; SPM trained via GT-driven losses in parallel
+
+**v2 Status (2026-06-16):** Complete rewrite from scratch. All v1 code deleted. Building module by module with review.
+
+## Development Rules
+
+### 1. Logging First (日志先行)
+
+**ALL new code MUST route observable values through `adatile.logging`. No bare `print()`.**
+
+```python
+from adatile.logging import get_logger
+logger = get_logger("module_name")
+
+# Quantitative values
+logger.log_metric("iou", 0.85, step=step, tags=["few-shot"])
+logger.log_loss("seg", 0.3, step=step)
+
+# Progress / phase markers
+logger.log_info("phase", "Stage B complete", step=step)
+```
+
+See [[logging-first-rule]] for full details.
+
+### 2. Bilingual Comments (中英文注释)
+
+**ALL code MUST have clear Chinese + English bilingual comments.** Every file, class, function, and non-obvious logic block.
+
+```python
+# 计算 Top-K BCE loss：只对 importance 最高的 K% 像素计算 loss
+# Top-K BCE loss: compute loss only on top-K% highest importance pixels
+loss_spm = topk_bce_loss(importance, density_map, k=keep_ratio)
+```
+
+See [[bilingual-comments]] for full details.
+
+### 3. Test-Driven
+
+Each module: write tests first, then implementation. Tests must verify logging output.
+
+### 4. Review Each Module
+
+Complete one module → review → approve → next module. Do NOT batch multiple modules.
+
+## Project Structure
+
+```
+AdaTile-FastSAM/
+├── pyproject.toml          # Package metadata & tool config
+├── adatile/
+│   ├── __init__.py          # v2.0.0.dev0
+│   ├── logging/             # ✅ Structured logging system (30 tests)
+│   │   ├── record.py        #   LogRecord, LogLevel
+│   │   ├── base.py          #   LogBackend (ABC)
+│   │   ├── backends.py      #   Console, File (JSONL), Wandb
+│   │   ├── tracker.py       #   MetricTracker (running stats)
+│   │   ├── context.py       #   LogContext (phase/scope stack)
+│   │   └── registry.py      #   get_logger(), global registry
+│   ├── backbone/            # ⬜ Feature extraction
+│   ├── decoder/             # ⬜ Segmentation decoder
+│   ├── sparse/              # ⬜ Ada-SPM
+│   ├── losses/              # ⬜ Loss functions
+│   ├── datasets/            # ⬜ Data loading
+│   ├── utils/               # ⬜ Utilities
+│   └── config/              # ⬜ Configuration
+├── tools/                   # ⬜ Training & experiment scripts
+├── tests/                   # test_logging.py ✅
+└── configs/                 # ⬜ YAML configs
+```
+
+✅ = Complete | ⬜ = TODO
 
 ## Common Commands
 
 ```bash
-# Install
+# Install (dev mode)
 pip install -e ".[dev,viz]"
 
-# ── Unified Trainer (Stage A/B/C) ─────────────────────────
-python tools/train_as_fastsam.py                        # Stage A: Backbone + Decoder
-python tools/train_as_fastsam.py --use-spm              # Stage B: + Ada-SPM
-python tools/train_as_fastsam.py --use-spm --use-planner # Stage C: + Sparse Inference
-
-# ── Experiments ──────────────────────────────────────────
-python tools/ablation_spm_supervision.py    # SPM supervision: Density vs Top-K, λ sweep, keep_ratio sweep
-python tools/exp_fewshot.py                 # Few-shot: Baseline vs SPM
-python tools/ablation_domain_shift.py       # Domain shift (Urban/Rural)
-python tools/ablation_tile_ratio.py         # Keep ratio sweep
-
-# ── Dataset Building ─────────────────────────────────────
-python tools/build_isaid_dota.py            # Build iSAID+DOTA combined dataset
-
-# ── Tests & Linting ──────────────────────────────────────
+# Run all tests
 pytest tests/ -v
-mypy adatile/
+
+# Run specific test file
+pytest tests/test_logging.py -v
+
+# Lint
 ruff check adatile/
+mypy adatile/
 ```
 
-## Architecture
+## Key Lessons from v1 (must follow)
 
-### Core Pipeline
+1. **YOLOv8 eval mode**: `model.train()` crashes YOLOv8 detect head. Keep eval mode + `requires_grad` control.
+2. **Decoder-SPM decoupled**: Decoder always receives full features. SPM trained in parallel.
+3. **Budget loss differentiable**: `(imp > 0.5).float().mean()` has zero gradient → use `(imp.mean − target)²`.
+4. **SPM three pillars**: GT density focal + Top-K BCE + budget loss. Missing any → importance collapse.
+5. **Episodic training**: Baseline MUST also use episodic training for fair comparison.
+6. **Dice GT broadcast**: `unsqueeze(0)` with batch>1 → `[1,B,H,W]` broadcast explosion.
+
+## Architecture (from v1, for reference)
 
 ```
 FastSAM-x (hook P4, P8) ──→ LightDecoder ──→ mask [B,K,H/4,W/4]
@@ -48,35 +116,7 @@ FastSAM-x (hook P4, P8) ──→ LightDecoder ──→ mask [B,K,H/4,W/4]
                     L_spm (Top-K BCE) + L_budget (imp.mean − target)²
 ```
 
-### Module Map
-
-| Module | Role | Files |
-|--------|------|-------|
-| `adatile/backbone/` | Feature extraction | `fastsam_hook.py` (active), `base.py` |
-| `adatile/decoder/` | Segmentation decoder | `light_decoder.py` |
-| `adatile/sparse/` | Importance prediction | `light_spm.py` (active), `fpn_fusion.py` |
-| **`adatile/losses/`** | Loss functions | `seg_loss.py`, `spm_loss.py`, `budget_loss.py` |
-| `adatile/datasets/` | Data loading | `universal.py` (auto-detect) |
-| `adatile/logging/` | Experiment tracking | `run_logger.py` |
-| `tools/` | Scripts | `train_as_fastsam.py` (unified entry) |
-| `legacy/` | Old pipeline | FPN + transformer + tokenizer + router |
-
-### Loss Structure
-
-```
-UnifiedLoss (composition)
-  ├── SegLoss      → BinarySegLoss | MultiClassSegLoss
-  ├── TopKLoss     → per-image top-K ranking (Ada-SPM core)
-  ├── DensityLoss  → absolute density regression (baseline)
-  ├── FixedBudget  → (imp.mean - target)²   (manual)
-  └── LearnableBudget → auto-discover optimal target + λ
-```
-
-L_total = L_seg + λ_spm × L_spm(top-K) + λ_budget × (imp.mean − σ(w))² + λ_reg × σ(w)
-
-Default: λ_spm=1.0, budget_mode="ratio" with λ_budget=5.0, keep_ratio=0.15
-
-## Stage → Component Mapping
+### Stage → Component Mapping (v1 reference)
 
 | Stage | Backbone | Decoder | SPM | Loss |
 |-------|----------|---------|-----|------|
@@ -84,16 +124,17 @@ Default: λ_spm=1.0, budget_mode="ratio" with λ_budget=5.0, keep_ratio=0.15
 | B | FastSAMHook | LightDecoder | LightSPM | SegLoss + TopKLoss + Budget |
 | C | FastSAMHook | LightDecoder | LightSPM + Planner | + sparse inference |
 
-## Critical Lessons
+### Loss Structure (v1 reference)
 
-### 1. YOLOv8 Segment Head Cannot Be Fine-Tuned
-Use hook-based feature extraction + custom decoder.
+```
+UnifiedLoss
+  ├── SegLoss      → BinarySegLoss | MultiClassSegLoss
+  ├── TopKLoss     → per-image top-K ranking
+  ├── DensityLoss  → absolute density regression
+  ├── FixedBudget  → (imp.mean - target)²
+  └── LearnableBudget → auto-discover optimal target + λ
+```
 
-### 2. Importance + Decoder Must Be Decoupled
-Decoder always receives full features during training. SPM trained in parallel via GT-driven losses.
+L_total = L_seg + λ_spm × L_spm + λ_budget × L_budget + λ_reg × σ(w)
 
-### 3. Budget Loss Must Be Fully Differentiable
-`(imp > 0.5).float().mean()` has zero gradient. Fix: `(imp.mean − target)²`.
-
-### 4. Multi-Class Mask Detection
-{0, 255} masks need `n_unique ≤ 2 → binary` check, not just `max_val ≤ 1`.
+Default: λ_spm=1.0, budget_mode="ratio", λ_budget=5.0, keep_ratio=0.15

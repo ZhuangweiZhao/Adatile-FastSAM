@@ -1,0 +1,403 @@
+"""
+ISAIDDataset — iSAID 航拍实例分割数据集加载器。
+=====================================================
+iSAID aerial instance segmentation dataset loader.
+
+15 个类别，图像分辨率 800×800 到 4000×4000 像素。
+15 classes, image resolution 800×800 to 4000×4000 pixels.
+
+基于 COCO JSON 格式标注。
+Based on COCO JSON format annotations.
+
+数据集结构 | Dataset structure:
+    iSAID/
+    ├── train/
+    │   ├── images/              # *.png 航拍图像 | Aerial images
+    │   └── annotations/
+    │       └── instances_train.json  # COCO format
+    ├── val/
+    │   ├── images/
+    │   └── annotations/
+    │       └── instances_val.json
+    └── test/
+        └── images/
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import torch
+from PIL import Image
+
+from adatile.datasets.base import BaseSegDataset
+from adatile.logging import get_logger
+
+
+# ── iSAID 15 个类别 | 15 iSAID Categories ────────────────────
+
+ISAID_CATEGORIES: list[dict] = [
+    {"id": 1, "name": "small_vehicle"},
+    {"id": 2, "name": "large_vehicle"},
+    {"id": 3, "name": "plane"},
+    {"id": 4, "name": "storage_tank"},
+    {"id": 5, "name": "ship"},
+    {"id": 6, "name": "harbor"},
+    {"id": 7, "name": "ground_track_field"},
+    {"id": 8, "name": "soccer_ball_field"},
+    {"id": 9, "name": "tennis_court"},
+    {"id": 10, "name": "swimming_pool"},
+    {"id": 11, "name": "road"},
+    {"id": 12, "name": "basketball_court"},
+    {"id": 13, "name": "bridge"},
+    {"id": 14, "name": "helicopter"},
+    {"id": 15, "name": "roundabout"},
+]
+
+# 类别 ID → 名称映射 | Category ID → name mapping
+_CAT_ID_TO_NAME: dict[int, str] = {c["id"]: c["name"] for c in ISAID_CATEGORIES}
+_CAT_NAME_TO_ID: dict[str, int] = {c["name"]: c["id"] for c in ISAID_CATEGORIES}
+
+
+class ISAIDDataset(BaseSegDataset):
+    """
+    iSAID 航拍实例分割数据集 | iSAID Aerial Instance Segmentation Dataset.
+
+    特性 | Features:
+        - COCO JSON 格式标注解析 | COCO JSON annotation parsing
+        - 大图瓦片处理 | Large-image tile-based processing
+        - 掩码归一化（{0,255} → {0,1}）| Mask normalization
+        - 日志系统集成 | Logging system integration
+
+    Parameters
+    ----------
+    root_dir : str
+        iSAID 数据集根目录 | iSAID dataset root directory.
+    split : str
+        数据集划分 ("train", "val") | Dataset split.
+    tile_size : int | None
+        瓦片尺寸。None = 全图加载。大图建议 1024。
+        Tile size. None = full-image loading. Recommended 1024 for large images.
+    tile_overlap : float
+        瓦片重叠比例 (0.0 ~ 1.0) | Tile overlap ratio.
+    transforms : callable | None
+        数据增强变换 | Optional data augmentation transforms.
+    """
+
+    def __init__(
+        self,
+        root_dir: str = "datasets/iSAID",
+        split: str = "train",
+        tile_size: int | None = None,
+        tile_overlap: float = 0.0,
+        transforms=None,
+    ) -> None:
+        super().__init__(root_dir=root_dir, split=split, transforms=transforms)
+        self._tile_size = tile_size
+        self._tile_overlap = tile_overlap
+
+        # 加载 COCO 标注 | Load COCO annotations
+        self._coco_data = self._load_coco()
+        self._image_infos: list[dict] = self._coco_data["images"]
+        self._annotations: list[dict] = self._coco_data["annotations"]
+        self._categories: list[dict] = self._coco_data.get("categories", ISAID_CATEGORIES)
+
+        # 构建 image_id → annotations 索引 | Build image_id → annotations index
+        self._ann_by_image: dict[int, list[dict]] = {}
+        for ann in self._annotations:
+            img_id = ann["image_id"]
+            self._ann_by_image.setdefault(img_id, []).append(ann)
+
+        # 图像目录 | Image directory
+        self._img_dir = self.root_dir / self.split / "images"
+
+        # 预计算 tile 索引（仅在 tile 模式）| Precompute tile index (tile mode only)
+        self._tile_index: list[tuple[int, int, int, int]] = []  # (img_idx, x, y, tile_idx)
+        if self._tile_size is not None:
+            self._build_tile_index()
+
+        # 日志数据集统计 | Log dataset statistics
+        self.logger.log_info(
+            "dataset/isaid_init",
+            f"iSAID {split}: {len(self)} images, "
+            f"{len(self._annotations)} instances, "
+            f"{len(self._categories)} categories, "
+            f"tile_size={tile_size}",
+        )
+
+    def _build_tile_index(self) -> None:
+        """
+        构建瓦片索引：将每张图切分为瓦片，记录每个瓦片的位置。
+        Build tile index: split each image into tiles, record each tile position.
+        """
+        stride = int(self._tile_size * (1 - self._tile_overlap))
+        for img_idx, info in enumerate(self._image_infos):
+            h, w = info["height"], info["width"]
+            tile_idx = 0
+            for y in range(0, h, stride):
+                for x in range(0, w, stride):
+                    self._tile_index.append((img_idx, x, y, tile_idx))
+                    tile_idx += 1
+
+    def _extract_tile(
+        self, image: torch.Tensor, masks: torch.Tensor, x: int, y: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        从全图中提取瓦片 | Extract tile from full image.
+
+        Args:
+            image: [C, H, W] 全图 | Full image.
+            masks: [N, H, W] 全尺寸掩码 | Full-size masks.
+            x, y:  瓦片左上角坐标 | Tile top-left coordinates.
+
+        Returns:
+            (tile_image [C, th, tw], tile_masks [N, th, tw])
+        """
+        ts = self._tile_size
+        _, h, w = image.shape
+        th = min(ts, h - y)
+        tw = min(ts, w - x)
+
+        tile_img = image[:, y:y + th, x:x + tw]
+        tile_masks = masks[:, y:y + th, x:x + tw]
+        return tile_img, tile_masks
+
+    # ── 抽象方法实现 | Abstract Method Implementations ────────
+
+    def _load_image(self, index: int) -> torch.Tensor:
+        """
+        加载并归一化图像 [C, H, W] | Load and normalize image.
+
+        读取 PNG → RGB → float32 [0, 1]。
+        """
+        info = self._image_infos[index]
+        img_path = self._img_dir / info["file_name"]
+
+        # PIL 读取 → RGB → numpy → tensor
+        # PIL read → RGB → numpy → tensor
+        img = Image.open(img_path).convert("RGB")
+        img_np = np.array(img, dtype=np.float32) / 255.0  # [H, W, C], [0, 1]
+
+        # [H, W, C] → [C, H, W]
+        img_tensor = torch.from_numpy(img_np).permute(2, 0, 1)
+
+        return img_tensor
+
+    def _load_masks(self, index: int) -> torch.Tensor:
+        """
+        加载实例掩码 [N, H, W] | Load instance masks.
+
+        从 COCO 多边形标注渲染二值掩码。
+        Renders binary masks from COCO polygon annotations.
+
+        使用 pycocotools 的 annToMask（如果可用），
+        否则用简化的多边形光栅化。
+        Uses pycocotools annToMask if available,
+        otherwise simplified polygon rasterization.
+        """
+        info = self._image_infos[index]
+        img_id = info["id"]
+        h, w = info["height"], info["width"]
+
+        anns = self._ann_by_image.get(img_id, [])
+        if not anns:
+            # 无实例：返回空掩码 [0, H, W]
+            # No instances: return empty mask [0, H, W]
+            return torch.zeros(0, h, w, dtype=torch.float32)
+
+        masks_list = []
+        for ann in anns:
+            mask = self._render_mask(ann, h, w)
+            masks_list.append(mask)
+
+        # 堆叠为 [N, H, W] | Stack to [N, H, W]
+        masks = torch.stack(masks_list, dim=0)
+        return masks
+
+    def _load_image_id(self, index: int) -> int:
+        """返回 COCO image_id | Return COCO image_id."""
+        return self._image_infos[index]["id"]
+
+    def __len__(self) -> int:
+        """
+        数据集样本数量 | Number of samples in dataset.
+        Tile 模式：返回瓦片总数；否则返回图像数。
+        Tile mode: returns total tiles; otherwise returns image count.
+        """
+        if self._tile_size is not None:
+            return len(self._tile_index)
+        return len(self._image_infos)
+
+    def __getitem__(self, index: int) -> dict:
+        """
+        获取样本（支持 tile 模式）| Get sample (supports tile mode).
+
+        Tile 模式：通过 tile_index 映射到 (img_idx, x, y)。
+        非 tile 模式：直接使用父类实现。
+        Tile mode: maps through tile_index to (img_idx, x, y).
+        Non-tile mode: uses parent implementation directly.
+        """
+        if self._tile_size is not None:
+            img_idx, x, y, _ = self._tile_index[index]
+
+            # 加载全图 + 掩码 | Load full image + masks
+            image = self._load_image(img_idx)
+            masks = self._load_masks(img_idx)
+            image_id = self._load_image_id(img_idx)
+
+            # 提取瓦片 | Extract tile
+            tile_img, tile_masks = self._extract_tile(image, masks, x, y)
+
+            sample = {
+                "image": tile_img,
+                "masks": tile_masks,
+                "image_id": image_id,
+                "image_size": tuple(tile_img.shape[1:]),  # tile (H, W)
+            }
+            return self._apply_transforms(sample)
+
+        # 非 tile 模式 | Non-tile mode
+        return super().__getitem__(index)
+
+    # ── 掩码渲染 | Mask Rendering ─────────────────────────────
+
+    def _render_mask(self, ann: dict, h: int, w: int) -> torch.Tensor:
+        """
+        渲染单个实例掩码 | Render single instance mask.
+
+        支持 COCO 多边形 segmentation 格式。
+        Supports COCO polygon segmentation format.
+
+        Args:
+            ann: COCO 标注字典 | COCO annotation dict.
+            h:   图像高度 | Image height.
+            w:   图像宽度 | Image width.
+
+        Returns:
+            torch.Tensor [H, W] float32, 二值 (0/1) | Binary (0/1).
+        """
+        seg = ann.get("segmentation", [])
+
+        if not seg:
+            # 无分割 → 使用 bbox | No segmentation → use bbox
+            return self._render_bbox(ann["bbox"], h, w)
+
+        # 多边形光栅化 | Polygon rasterization
+        mask = np.zeros((h, w), dtype=np.uint8)
+
+        if isinstance(seg, list) and isinstance(seg[0], list):
+            # 多个多边形（带孔洞的情况）| Multiple polygons (for objects with holes)
+            for poly in seg:
+                self._draw_polygon(mask, poly, h, w)
+        elif isinstance(seg, list) and isinstance(seg[0], (int, float)):
+            # 单个多边形 | Single polygon
+            self._draw_polygon(mask, seg, h, w)
+        elif isinstance(seg, dict):
+            # RLE 格式（暂不实现）| RLE format (not implemented yet)
+            pass
+
+        return torch.from_numpy(mask.astype(np.float32))
+
+    def _draw_polygon(self, mask: np.ndarray, poly: list[float], h: int, w: int) -> None:
+        """
+        在 numpy 数组上绘制多边形 | Draw polygon on numpy array.
+
+        使用 OpenCV fillPoly（如果可用），否则使用 PIL。
+        Uses OpenCV fillPoly if available, otherwise PIL.
+        """
+        try:
+            import cv2
+        except ImportError:
+            self._draw_polygon_pil(mask, poly, h, w)
+            return
+
+        # OpenCV 绘制 | OpenCV drawing
+        pts = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
+        # 裁剪到图像边界 | Clip to image boundary
+        pts[:, :, 0] = np.clip(pts[:, :, 0], 0, w - 1)
+        pts[:, :, 1] = np.clip(pts[:, :, 1], 0, h - 1)
+        cv2.fillPoly(mask, [pts], 1)
+
+    def _draw_polygon_pil(self, mask: np.ndarray, poly: list[float], h: int, w: int) -> None:
+        """
+        PIL 回退方案：多边形光栅化 | PIL fallback: polygon rasterization.
+        将 float 坐标转为整数点对。| Convert float coords to int point pairs.
+        """
+        from PIL import ImageDraw
+
+        # 转为 (x, y) 点对 | Convert to (x, y) point pairs
+        pts = [(int(poly[i]), int(poly[i + 1])) for i in range(0, len(poly), 2)]
+        # 裁剪 | Clip
+        pts = [(max(0, min(x, w - 1)), max(0, min(y, h - 1))) for x, y in pts]
+
+        pil_mask = Image.new("L", (w, h), 0)
+        ImageDraw.Draw(pil_mask).polygon(pts, fill=1)
+        mask[:] = np.array(pil_mask)
+
+    def _render_bbox(self, bbox: list[float], h: int, w: int) -> torch.Tensor:
+        """
+        bbox 回退方案：矩形掩码 | Bbox fallback: rectangular mask.
+        bbox: [x, y, width, height].
+        """
+        x, y, bw, bh = bbox
+        mask = np.zeros((h, w), dtype=np.float32)
+
+        # 裁剪到边界 | Clip to bounds
+        x1 = max(0, int(x))
+        y1 = max(0, int(y))
+        x2 = min(w, int(x + bw))
+        y2 = min(h, int(y + bh))
+
+        mask[y1:y2, x1:x2] = 1.0
+        return torch.from_numpy(mask)
+
+    # ── COCO 加载 | COCO Loading ──────────────────────────────
+
+    def _load_coco(self) -> dict:
+        """
+        加载 COCO JSON 标注文件 | Load COCO JSON annotation file.
+
+        文件命名约定：instances_{split}.json
+        File naming convention: instances_{split}.json
+        """
+        ann_path = self.root_dir / self.split / "annotations" / f"instances_{self.split}.json"
+        if not ann_path.exists():
+            raise FileNotFoundError(
+                f"COCO 标注文件未找到 | COCO annotation file not found: {ann_path}"
+            )
+        with open(ann_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    # ── 公共属性 | Public Properties ──────────────────────────
+
+    @property
+    def num_classes(self) -> int:
+        """类别总数 | Total number of classes."""
+        return len(self._categories)
+
+    def category_name(self, cat_id: int) -> str:
+        """
+        根据类别 ID 获取名称 | Get category name by ID.
+
+        Args:
+            cat_id: 类别 ID (1-15) | Category ID.
+
+        Returns:
+            str: 类别名称 | Category name.
+        """
+        return _CAT_ID_TO_NAME.get(cat_id, f"unknown_{cat_id}")
+
+    def category_id(self, name: str) -> int:
+        """
+        根据名称获取类别 ID | Get category ID by name.
+
+        Args:
+            name: 类别名称 | Category name.
+
+        Returns:
+            int: 类别 ID, 未知返回 -1 | Category ID, -1 if unknown.
+        """
+        return _CAT_NAME_TO_ID.get(name, -1)

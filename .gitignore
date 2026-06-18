@@ -76,7 +76,7 @@ Thumbs.db
 /wandb/
 /.claude/
 *.code-workspace
-
+/data/
 # ── Memory files (Claude project memory) ────────────────────────────
 !PROJECT.md
 !CODE_GUIDE.md

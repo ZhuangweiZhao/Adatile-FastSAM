@@ -1,114 +1,142 @@
-"""Lightweight Decoder for Stage A — binary semantic segmentation.
-
-Simple U-Net-like decoder: upsample + skip connection + conv blocks.
-Output: [B, 1, H/4, W/4] binary mask logits.
-
-Reference: CS-FastSAM StructureDecoder (simplified).
 """
+LightDecoder — 轻量解码器 | Lightweight Segmentation Decoder.
+===============================================================
+
+P4 特征 → 渐进上采样 + 多层 Conv → 分割掩码。
+P4 features → gradual upsampling + multi-layer Conv → segmentation mask.
+
+结构 | Architecture (~800K params):
+    P4 [B, 1280, H/16, W/16]
+         │
+    Conv(1280→64, 3×3) + BN + ReLU
+         │
+    Upsample 2×  →  H/8
+         │
+    Conv(64→64, 3×3) + BN + ReLU
+         │
+    Upsample 2×  →  H/4
+         │
+    Conv(64→32, 3×3) + BN + ReLU
+         │
+    Upsample 2×  →  H/2
+         │
+    Conv(32→32, 3×3) + BN + ReLU
+         │
+    Upsample → target_size
+         │
+    Conv(32→1, 1×1)
+         │
+    Sigmoid → Binary Mask
+"""
+
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
 
-
-class ConvBlock(nn.Module):
-    """Conv3x3 → BN → ReLU × 2"""
-
-    def __init__(self, in_ch, out_ch):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, x):
-        return self.conv(x)
+from adatile.logging import get_logger
 
 
 class LightDecoder(nn.Module):
-    """Simple decoder for binary segmentation.
+    """
+    轻量解码器 | Lightweight Decoder.
 
-    Architecture:
-        P4 [B, 128, H/16, W/16] ──→ upsample ──→ conv ──→ mask [B, 1, H/4, W/4]
-        P8 [B, 128, H/8, W/8]  ──→ skip connection ──┘
+    从 P4 特征（stride-16）渐进上采样到原始分辨率。
+    Gradually upsamples P4 features (stride-16) to original resolution.
 
-    Args:
-        in_channels: Feature channels from backbone (default 128).
-        decoder_channels: Internal decoder channels.
-        num_classes: Output channels (1 for binary, K for multi-class).
+    ~800K 可训练参数 | ~800K trainable parameters.
     """
 
-    def __init__(
-        self,
-        in_channels: int = 128,
-        decoder_channels: int = 64,
-        num_classes: int = 1,
-    ):
+    def __init__(self, in_channels: int = 1280):
         super().__init__()
+        self.logger = get_logger("decoder.light")
 
-        # P4 (low-res, high-semantic) → upsample path
-        self.up_conv = nn.Sequential(
-            nn.ConvTranspose2d(in_channels, decoder_channels, 2, stride=2),
-            nn.BatchNorm2d(decoder_channels),
+        # Stage 1: 压缩特征 | Compress features
+        self.stage1 = nn.Sequential(
+            nn.Conv2d(in_channels, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
         )
-
-        # P8 skip projection
-        self.skip_proj = nn.Sequential(
-            nn.Conv2d(in_channels, decoder_channels, 1, bias=False),
-            nn.BatchNorm2d(decoder_channels),
+        # Stage 2: H/16 → H/8
+        self.stage2 = nn.Sequential(
+            nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
         )
-
-        # Skip fusion gate
-        self.fusion_gate = nn.Sequential(
-            nn.Conv2d(decoder_channels * 2, decoder_channels, 1),
-            nn.BatchNorm2d(decoder_channels),
+        # Stage 3: H/8 → H/4
+        self.stage3 = nn.Sequential(
+            nn.Conv2d(64, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
         )
-
-        # Decoder conv blocks
-        self.dec_conv = ConvBlock(decoder_channels, decoder_channels)
-
-        # Upsample to H/4
-        self.final_up = nn.Sequential(
-            nn.ConvTranspose2d(decoder_channels, decoder_channels, 2, stride=2),
-            nn.BatchNorm2d(decoder_channels),
+        # Stage 4: H/4 → H/2
+        self.stage4 = nn.Sequential(
+            nn.Conv2d(32, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
         )
-        self.final_conv = ConvBlock(decoder_channels, decoder_channels // 2)
+        # 最终投影 | Final projection
+        self.head = nn.Conv2d(32, 1, kernel_size=1, bias=True)
 
-        # Output head
-        self.head = nn.Conv2d(decoder_channels // 2, num_classes, 1)
+        # 参数统计 | Parameter stats
+        n_total = sum(p.numel() for p in self.parameters())
+        n_trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        self.logger.log_info(
+            "light_decoder/init",
+            f"LightDecoder: params={n_total:,} (trainable={n_trainable:,})",
+        )
 
-    def forward(self, features: dict, proto_guide=None) -> torch.Tensor:
-        """proto_guide ignored — here for API compatibility with ProtoGuidedDecoder."""
-        return self._forward(features)
+    def forward(self, features: dict[str, torch.Tensor],
+                target_size: tuple[int, int] | None = None) -> torch.Tensor:
+        """
+        前向传播 | Forward pass.
 
-    def _forward(self, features: dict) -> torch.Tensor:
-        p4 = features["P4"]  # low-res
-        p8 = features["P8"]  # mid-res
+        Args:
+            features:    {"p4": [B, 1280, H/16, W/16]}
+            target_size: (H, W) 目标尺寸。None → 返回 stride-2 的 logit。
+                        Target size. None → return stride-2 logits.
 
-        # Upsample P4 → match P8 spatial size
-        up = self.up_conv(p4)  # [B, dec_c, H/8, W/8]
+        Returns:
+            logit [B, 1, *, *] — raw logits (before sigmoid) for BCEWithLogitsLoss.
+        """
+        x = features["p4"]  # [B, 1280, H/16, W/16]
 
-        # Skip from P8
-        skip = self.skip_proj(p8)  # [B, dec_c, H/8, W/8]
+        # Stage 1: compress at stride-16
+        x = self.stage1(x)   # [B, 64, H/16, W/16]
 
-        # Gated fusion
-        fused = self.fusion_gate(torch.cat([up, skip], dim=1))
+        # Stage 2: H/16 → H/8
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = self.stage2(x)   # [B, 64, H/8, W/8]
 
-        # Conv refine
-        refined = self.dec_conv(fused)
+        # Stage 3: H/8 → H/4
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = self.stage3(x)   # [B, 32, H/4, W/4]
 
-        # Upsample to H/4
-        out = self.final_up(refined)
-        out = self.final_conv(out)
+        # Stage 4: H/4 → H/2
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = self.stage4(x)   # [B, 32, H/2, W/2]
 
-        # Output mask logits
-        return self.head(out)  # [B, num_classes, H/4, W/4]
+        # Final upsample to target
+        if target_size is not None:
+            x = F.interpolate(x, size=target_size, mode="bilinear", align_corners=False)
+
+        # 投影到单通道 logit | Project to single-channel logit
+        logit = self.head(x)  # [B, 1, *, *]
+
+        return logit  # raw logit, NO sigmoid
+
+    def predict(self, features: dict[str, torch.Tensor],
+                target_size: tuple[int, int]) -> torch.Tensor:
+        """
+        预测二值掩码 | Predict binary mask.
+
+        Args:
+            features:    backbone 输出 | Backbone output.
+            target_size: (H, W) 目标尺寸 | Target size.
+
+        Returns:
+            [B, 1, H, W] binary mask.
+        """
+        logit = self.forward(features, target_size=target_size)
+        return (torch.sigmoid(logit) > 0.5).float()

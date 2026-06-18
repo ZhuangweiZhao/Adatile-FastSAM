@@ -1,41 +1,21 @@
-"""Backbone networks.
+"""
+adatile.backbone — 特征提取骨架 | Feature extraction backbone.
+===============================================================
 
-Active (Stage A/B/C):
-    - FastSAMHookBackbone: hook-based FastSAM feature extractor (P4/P8)
+基于 thirdLibrary/FastSAM 的 FastSAM 骨干网络，
+通过前向钩子提取多尺度特征图 (P4, P8)。
 
-Legacy (train.py compatibility):
-    - FastSAMBackbone: YOLOv8 API-based (superseded by hook version)
-    - TimmBackbone, ResNet50Backbone: timm-based backbones
+FastSAM backbone based on thirdLibrary/FastSAM,
+extracts multi-scale feature maps via forward hooks (P4, P8).
+
+导出 | Exports:
+    FastSAMBackbone  — 带钩子的 FastSAM 特征提取器 | FastSAM feature extractor with hooks
+    build_backbone   — 工厂函数，按名称构建 | Factory function, build by name
 """
 
-from adatile.registry import BACKBONE
-
-from adatile.backbone.base import TimmBackbone, ResNet50Backbone
-from adatile.backbone.fastsam_hook import FastSAMHookBackbone
-from adatile.backbone.fpn import MultiScaleFPNFusion, LightweightFPNFusion
-
-# Legacy alias (moved to legacy/)
-FastSAMBackbone = None
-
-
-def build_backbone(name: str, **kwargs):
-    """Factory: instantiate a registered backbone by name."""
-    _aliases = {
-        "fastsam": "FastSAMBackbone",
-        "fastsam_vit_b": "ResNet50Backbone",
-        "resnet50": "ResNet50Backbone",
-        "fastsam_hook": "FastSAMHookBackbone",
-    }
-    name = _aliases.get(name, name)
-    return BACKBONE.build(name, **kwargs)
-
+from adatile.backbone.fastsam_backbone import FastSAMBackbone, build_backbone
 
 __all__ = [
-    "FastSAMHookBackbone",
     "FastSAMBackbone",
-    "TimmBackbone",
-    "ResNet50Backbone",
-    "MultiScaleFPNFusion",
-    "LightweightFPNFusion",
     "build_backbone",
 ]

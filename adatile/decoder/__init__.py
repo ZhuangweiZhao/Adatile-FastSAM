@@ -1,30 +1,18 @@
-"""Segmentation decoders.
+"""
+adatile.decoder — 分割掩码解码器 | Segmentation mask decoder.
+===============================================================
 
-Active (Stage A/B/C):
-    - LightDecoder: simple conv decoder for binary segmentation
-
-Legacy (train.py compatibility):
-    - DifferentiableDecoder: complex tile-level decoder
+导出 | Exports:
+    LinearProbe  — 1×1 Conv 线性探针 (E002) | E002: P4 only linear probe
+    FusionProbe  — P4+P8 融合探针 (E003) | E003: P4+P8 fusion probe
 """
 
-from adatile.registry import DECODER
+from adatile.decoder.linear_probe import LinearProbe
+from adatile.decoder.fusion_probe import FusionProbe
 from adatile.decoder.light_decoder import LightDecoder
 
-# Legacy (moved to legacy/)
-DifferentiableDecoder = None
-TileProtoModule = None
-
-
-def build_decoder(name: str, **kwargs):
-    """Factory: instantiate a registered decoder by name."""
-    _aliases = {"fastsam_decoder": "DifferentiableDecoder"}
-    name = _aliases.get(name, name)
-    return DECODER.build(name, **kwargs)
-
-
 __all__ = [
+    "LinearProbe",
+    "FusionProbe",
     "LightDecoder",
-    "DifferentiableDecoder",
-    "TileProtoModule",
-    "build_decoder",
 ]

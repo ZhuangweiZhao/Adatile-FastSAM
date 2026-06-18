@@ -1,0 +1,112 @@
+# ════════════════════════════════════════════════════════════════
+# AdaTile-FastSAM v2 — 项目配置文件 | Project Configuration
+# ════════════════════════════════════════════════════════════════
+
+# ── 构建系统 | Build System ──────────────────────────────────
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# ── 项目元数据 | Project Metadata ────────────────────────────
+[project]
+name = "adatile-fastsam"
+version = "2.0.0.dev0"
+# 项目描述 | Project description
+description = "AdaTile-FastSAM: Adaptive Sparse FastSAM for Few-Shot High-Resolution Instance Segmentation"
+readme = "CLAUDE.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "AdaTile Team" },
+]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# ── 核心依赖 | Core Dependencies ─────────────────────────────
+dependencies = [
+    # 深度学习框架 | Deep learning framework
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    # FastSAM 模型 | FastSAM model (YOLOv8-based)
+    "ultralytics>=8.2.0",
+    # 数值计算与图像处理 | Numerical & image processing
+    "numpy>=1.24.0",
+    "opencv-python>=4.8.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.65.0",
+    "pillow>=10.0.0",
+    # 地理空间数据处理 | Geospatial data handling
+    "shapely>=2.0.0",
+    "tifffile>=2023.0.0",
+]
+
+# ── 可选依赖 | Optional Dependencies ─────────────────────────
+[project.optional-dependencies]
+# 开发工具 | Development tools
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "mypy>=1.0",
+    "ruff>=0.1.0",
+    "black>=23.0",
+    "pre-commit>=3.0",
+]
+# 可视化 | Visualization (wandb, matplotlib, tensorboard)
+viz = [
+    "wandb>=0.15.0",
+    "matplotlib>=3.7.0",
+    "seaborn>=0.12.0",
+    "tensorboard>=2.13.0",
+]
+# 性能分析 | Profiling
+profiling = [
+    "torchinfo>=1.8.0",
+    "flops-counter>=0.1.0",
+]
+
+# ── 命令行入口 | CLI Entry Points ────────────────────────────
+[project.scripts]
+adatile-train = "tools.train:main"
+adatile-eval = "tools.eval:main"
+
+# ── setuptools 配置 | setuptools Configuration ────────────────
+[tool.setuptools.packages.find]
+include = ["adatile*", "tools*"]
+
+# ── pytest 配置 | pytest Configuration ────────────────────────
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+# 默认参数: 详细输出 + 短错误追踪 + 严格标记
+# Default args: verbose + short traceback + strict markers
+addopts = ["-v", "--tb=short", "--strict-markers"]
+
+# ── ruff 配置 | ruff Linter Configuration ────────────────────
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+# 启用的规则: E=pycodestyle, F=pyflakes, I=isort, N=pep8-naming, W=pycodestyle-warnings, UP=pyupgrade, B=bug-bear, C4=comprehensions, SIM=simplify
+select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
+
+# ── mypy 配置 | mypy Type Checking ───────────────────────────
+[tool.mypy]
+python_version = "3.10"
+strict = false
+warn_return_any = true
+warn_unused_configs = true
+# 忽略缺少类型存根的第三方库 | Ignore missing stubs for third-party libs
+ignore_missing_imports = true
+
+# ── black 配置 | black Code Formatter ─────────────────────────
+[tool.black]
+line-length = 100
+target-version = ["py310"]
