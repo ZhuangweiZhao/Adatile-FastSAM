@@ -31,6 +31,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
 from adatile.datasets.base import BaseSegDataset
@@ -70,12 +71,21 @@ class ISAIDDataset(BaseSegDataset):
         - COCO JSON 格式标注解析 | COCO JSON annotation parsing
         - 大图瓦片处理 | Large-image tile-based processing
         - 掩码归一化（{0,255} → {0,1}）| Mask normalization
+        - 语义模式：返回 [H,W] 类别标签 | Semantic mode: returns [H,W] class labels
         - 日志系统集成 | Logging system integration
+
+    两种输出模式 | Two output modes:
+        semantic=False (默认 | default):
+            sample["masks"] → [N_inst, H, W] 实例二值掩码 | instance binary masks
+        semantic=True:
+            sample["mask"]  → [H, W] 语义类别标签 | semantic class labels (0=bg, 1-15)
+            sample["masks"] → 不可用 | not available
 
     Parameters
     ----------
     root_dir : str
         iSAID 数据集根目录 | iSAID dataset root directory.
+        期望结构见 prep_isaid.py | Expected structure: see prep_isaid.py.
     split : str
         数据集划分 ("train", "val") | Dataset split.
     tile_size : int | None
@@ -83,6 +93,8 @@ class ISAIDDataset(BaseSegDataset):
         Tile size. None = full-image loading. Recommended 1024 for large images.
     tile_overlap : float
         瓦片重叠比例 (0.0 ~ 1.0) | Tile overlap ratio.
+    semantic : bool
+        True = 语义模式 (返回[H,W]标签) | semantic mode (returns [H,W] labels).
     transforms : callable | None
         数据增强变换 | Optional data augmentation transforms.
     """
@@ -93,11 +105,24 @@ class ISAIDDataset(BaseSegDataset):
         split: str = "train",
         tile_size: int | None = None,
         tile_overlap: float = 0.0,
+        semantic: bool = False,
         transforms=None,
     ) -> None:
+        """
+        Parameters
+        ----------
+        semantic : bool
+            True = 返回语义标签 [H, W] (category IDs)
+                   Return semantic label map [H, W] (category IDs).
+            False = 返回实例掩码 [N, H, W] (二值 per-instance)
+                    Return instance masks [N, H, W] (binary per-instance).
+        """
         super().__init__(root_dir=root_dir, split=split, transforms=transforms)
         self._tile_size = tile_size
         self._tile_overlap = tile_overlap
+        # 语义模式：返回 [H,W] 类别标签 而非 [N,H,W] 实例掩码
+        # Semantic mode: return [H,W] class labels instead of [N,H,W] instance masks
+        self._semantic = semantic
 
         # 加载 COCO 标注 | Load COCO annotations
         self._coco_data = self._load_coco()
@@ -125,7 +150,8 @@ class ISAIDDataset(BaseSegDataset):
             f"iSAID {split}: {len(self)} images, "
             f"{len(self._annotations)} instances, "
             f"{len(self._categories)} categories, "
-            f"tile_size={tile_size}",
+            f"tile_size={tile_size}, "
+            f"semantic={semantic}",
         )
 
     def _build_tile_index(self) -> None:
@@ -147,6 +173,8 @@ class ISAIDDataset(BaseSegDataset):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         从全图中提取瓦片 | Extract tile from full image.
+        边界瓦片自动补零到 tile_size × tile_size (YOLOv8 要求尺寸一致)。
+        Edge tiles auto-padded to tile_size × tile_size for YOLOv8 compatibility.
 
         Args:
             image: [C, H, W] 全图 | Full image.
@@ -154,15 +182,25 @@ class ISAIDDataset(BaseSegDataset):
             x, y:  瓦片左上角坐标 | Tile top-left coordinates.
 
         Returns:
-            (tile_image [C, th, tw], tile_masks [N, th, tw])
+            (tile_image [C, ts, ts], tile_masks [N, ts, ts])
         """
         ts = self._tile_size
         _, h, w = image.shape
         th = min(ts, h - y)
         tw = min(ts, w - x)
 
+        # 提取实际像素 | Extract actual pixels
         tile_img = image[:, y:y + th, x:x + tw]
         tile_masks = masks[:, y:y + th, x:x + tw]
+
+        # 边界瓦片补零 | Pad edge tiles to ts × ts
+        if th < ts or tw < ts:
+            pad_h = ts - th
+            pad_w = ts - tw
+            tile_img = F.pad(tile_img, (0, pad_w, 0, pad_h), value=0)
+            if tile_masks.dim() == 3:
+                tile_masks = F.pad(tile_masks, (0, pad_w, 0, pad_h), value=0)
+
         return tile_img, tile_masks
 
     # ── 抽象方法实现 | Abstract Method Implementations ────────
@@ -217,6 +255,53 @@ class ISAIDDataset(BaseSegDataset):
         masks = torch.stack(masks_list, dim=0)
         return masks
 
+    def _load_semantic_mask(self, index: int) -> torch.Tensor:
+        """
+        加载语义分割掩码 [H, W] | Load semantic segmentation mask.
+
+        将同一图像的所有实例按 category_id 渲染到单通道标签图。
+        Renders all instances into a single-channel label map by category_id.
+
+        渲染规则 | Rendering rule:
+            - 背景像素 → 0 (ignore_index 用于 loss)
+            - Background pixels → 0 (used as ignore_index in loss)
+            - 实例像素 → category_id (1-15)
+            - Instance pixels → category_id (1-15)
+            - 重叠区域 → 后渲染的实例覆盖先渲染的
+            - Overlapping regions → later instances overwrite earlier ones
+
+        Args:
+            index: 图像在 self._image_infos 中的索引
+
+        Returns:
+            torch.Tensor [H, W] int64, 语义标签 | semantic labels
+        """
+        info = self._image_infos[index]
+        img_id = info["id"]
+        h, w = info["height"], info["width"]
+
+        anns = self._ann_by_image.get(img_id, [])
+        if not anns:
+            # 无标注图像 → 全零标签 (全部算背景)
+            # No annotation → all-zero label (all background)
+            return torch.zeros(h, w, dtype=torch.long)
+
+        # 按 category_id 分层渲染 | Layer-by-category rendering
+        # 后渲染的覆盖先渲染的 (处理重叠实例)
+        # Later renders overwrite earlier (handles overlapping instances)
+        sem = np.zeros((h, w), dtype=np.int32)
+
+        for ann in anns:
+            cat_id = ann.get("category_id", 0)  # 1-15, 0 为无效
+            if cat_id <= 0:
+                continue
+            # 渲染单实例二值掩码 | Render single-instance binary mask
+            mask = self._render_mask(ann, h, w)  # [H, W] float32, {0, 1}
+            # 将该实例的像素赋值为类别 ID | Assign category ID to instance pixels
+            sem = np.where(mask.numpy() > 0.5, cat_id, sem)
+
+        return torch.from_numpy(sem.astype(np.int64))
+
     def _load_image_id(self, index: int) -> int:
         """返回 COCO image_id | Return COCO image_id."""
         return self._image_infos[index]["id"]
@@ -243,6 +328,27 @@ class ISAIDDataset(BaseSegDataset):
         if self._tile_size is not None:
             img_idx, x, y, _ = self._tile_index[index]
 
+            if self._semantic:
+                image = self._load_image(img_idx)
+                sem_mask = self._load_semantic_mask(img_idx)
+                image_id = self._load_image_id(img_idx)
+                ts = self._tile_size
+                _, h, w = image.shape
+                th, tw = min(ts, h - y), min(ts, w - x)
+                tile_img = image[:, y:y+th, x:x+tw]
+                tile_mask = sem_mask[y:y+th, x:x+tw]
+                # 边界补零 | Pad edge tiles to ts×ts
+                if th < ts or tw < ts:
+                    tile_img = F.pad(tile_img, (0, ts-tw, 0, ts-th), value=0)
+                    tile_mask = F.pad(tile_mask, (0, ts-tw, 0, ts-th), value=0)
+                sample = {
+                    "image": tile_img,
+                    "mask": tile_mask,
+                    "image_id": image_id,
+                    "image_size": (ts, ts),
+                }
+                return self._apply_transforms(sample)
+
             # 加载全图 + 掩码 | Load full image + masks
             image = self._load_image(img_idx)
             masks = self._load_masks(img_idx)
@@ -260,6 +366,17 @@ class ISAIDDataset(BaseSegDataset):
             return self._apply_transforms(sample)
 
         # 非 tile 模式 | Non-tile mode
+        if self._semantic:
+            image = self._load_image(index)
+            sem_mask = self._load_semantic_mask(index)
+            image_id = self._load_image_id(index)
+            sample = {
+                "image": image,
+                "mask": sem_mask,       # [H, W] long, category IDs
+                "image_id": image_id,
+                "image_size": tuple(image.shape[1:]),
+            }
+            return self._apply_transforms(sample)
         return super().__getitem__(index)
 
     # ── 掩码渲染 | Mask Rendering ─────────────────────────────
@@ -362,14 +479,43 @@ class ISAIDDataset(BaseSegDataset):
 
         文件命名约定：instances_{split}.json
         File naming convention: instances_{split}.json
+
+        test split 无标注, 返回空结构 (优雅降级)
+        test split has no annotations, returns empty dict (graceful degradation)
         """
         ann_path = self.root_dir / self.split / "annotations" / f"instances_{self.split}.json"
         if not ann_path.exists():
+            if self.split == "test":
+                self.logger.log_info(
+                    "dataset/isaid_no_annotations",
+                    f"iSAID {self.split}: no annotation file (expected for test split), "
+                    f"返回空标注 | returning empty annotations",
+                )
+                return {"images": self._scan_images(), "annotations": [], "categories": []}
             raise FileNotFoundError(
                 f"COCO 标注文件未找到 | COCO annotation file not found: {ann_path}"
             )
         with open(ann_path, "r", encoding="utf-8") as f:
             return json.load(f)
+
+    def _scan_images(self) -> list[dict]:
+        """
+        扫描图像目录生成 image_info | Scan image directory to generate image_info.
+        用于无标注的 split (test)。
+        """
+        from PIL import Image
+        img_dir = self.root_dir / self.split / "images"
+        infos = []
+        for png in sorted(img_dir.glob("*.png")):
+            with Image.open(png) as img:
+                w, h = img.size
+            infos.append({
+                "id": len(infos),
+                "file_name": png.name,
+                "height": h,
+                "width": w,
+            })
+        return infos
 
     # ── 公共属性 | Public Properties ──────────────────────────
 
