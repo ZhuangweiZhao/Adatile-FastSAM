@@ -44,19 +44,20 @@ def parse_args():
     return p.parse_args()
 
 
-def extract_zips(src: Path):
-    """自动解压 Cityscapes zip 文件 | Auto-extract Cityscapes zip files."""
+def extract_zips(src: Path, tmp_dir: Path):
+    """解压到临时目录 | Extract zips to tmp directory (src may be read-only)."""
+    import shutil
     for fname in ["leftImg8bit_trainvaltest.zip", "gtFine_trainvaltest.zip"]:
         zp = src / fname
         if not zp.exists():
             continue
-        # 检查是否已解压 | Check if already extracted
+        # 检查是否已解压到 tmp | Check if already extracted to tmp
         if fname.startswith("leftImg8bit"):
-            if (src / "leftImg8bit" / "train").exists():
+            if (tmp_dir / "leftImg8bit" / "train").exists():
                 print(f"  {fname} already extracted, skipping")
                 continue
         else:
-            if (src / "gtFine" / "train").exists():
+            if (tmp_dir / "gtFine" / "train").exists():
                 print(f"  {fname} already extracted, skipping")
                 continue
 
@@ -64,7 +65,7 @@ def extract_zips(src: Path):
             total = len(zf.namelist())
             print(f"  Extracting {fname} ({total} files)...")
             for m in tqdm(zf.namelist(), desc=f"  {fname.split('_')[0]}", unit="f"):
-                zf.extract(m, src)
+                zf.extract(m, tmp_dir)
 
 
 def _process_single(args_tuple: tuple) -> dict:
@@ -129,13 +130,15 @@ def main():
     print(f"  Source: {src}  →  Output: {dst}")
     print("=" * 60)
 
-    # ── Step 0: 自动解压 | Auto-extract zips ──
-    extract_zips(src)
+    # ── Step 0: 自动解压到 tmp | Auto-extract zips to tmp ──
+    tmp_src = dst / "_extracted"
+    tmp_src.mkdir(parents=True, exist_ok=True)
+    extract_zips(src, tmp_src)
 
     # ── Step 1: 构建任务列表 | Build task list ──
     for split in ["train", "val"]:
-        img_root = src / "leftImg8bit" / split
-        label_root = src / "gtFine" / split
+        img_root = tmp_src / "leftImg8bit" / split
+        label_root = tmp_src / "gtFine" / split
         img_out = dst / "images" / split
         mask_out = dst / "masks" / split
         img_out.mkdir(parents=True, exist_ok=True)
