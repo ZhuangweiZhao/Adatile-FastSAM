@@ -47,6 +47,7 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 
 from adatile.config import ExperimentConfig, ExperimentRecorder, generate_exp_id
 from adatile.datasets import MassachusettsBuildingsDataset
+from adatile.datasets.isaid_tiles import FastISAIDTileDataset
 from adatile.backbone import FastSAMBackbone
 from adatile.metrics import compute_dice
 from adatile.utils.seed import set_seed
@@ -55,7 +56,11 @@ from adatile.utils.seed import set_seed
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--data-root", type=str, default="data/Massachusetts_Buildings")
+    p.add_argument("--dataset", type=str, default="mass_buildings",
+                   choices=["mass_buildings", "isaid"])
     p.add_argument("--n-list", type=str, default="2,4,6,8,12")
+    p.add_argument("--num-classes", type=int, default=15,
+                   help="类别数 (仅 isaid) | num classes (isaid only)")
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--embed-dim", type=int, default=128)
