@@ -52,6 +52,7 @@ from adatile.config import ExperimentConfig, ExperimentRecorder, generate_exp_id
 from adatile.datasets import MassachusettsBuildingsDataset
 from adatile.backbone import FastSAMBackbone
 from adatile.metrics import compute_dice
+from adatile.utils.seed import set_seed
 
 
 def parse_args():
@@ -596,8 +597,7 @@ def main():
           f"({args.epochs_s2} epochs, frozen Proto)")
     print("=" * 70)
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    set_seed(args.seed)
 
     exp_id = generate_exp_id(name=f"{args.name}_k{args.router_k}")
     config = ExperimentConfig(exp_id=exp_id, output_dir=args.output_dir,

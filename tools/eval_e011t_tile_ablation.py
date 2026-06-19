@@ -37,6 +37,7 @@ from adatile.config import ExperimentConfig, ExperimentRecorder, generate_exp_id
 from adatile.datasets.isaid_tiles import FastISAIDTileDataset
 from adatile.backbone import FastSAMBackbone
 from adatile.logging import get_logger
+from adatile.utils.seed import set_seed
 
 logger = get_logger("e011t_tile")
 
@@ -163,7 +164,7 @@ def analyze_tile_size(model, backbone, val_ds, device, num_classes, n_protos,
                 miou_val += (inter + 1e-8) / union
                 valid_cls += 1
         if valid_cls > 0:
-            mious.append(miou_val / valid_cls)
+            mious.append((miou_val / valid_cls).item())
 
         # ── Proto-Category 亲和力 | Proto-category affinity ──
 
@@ -295,8 +296,7 @@ def main():
                     f"seed={args.seed} device={device}")
 
     # 固定随机种子 | Fix random seed
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    set_seed(args.seed)
 
     # ── 实验管理 | Experiment management ──
     exp_id = generate_exp_id(name="e011t_tile")
@@ -305,6 +305,8 @@ def main():
                               dataset_root="data/iSAID_tiles")
     recorder = ExperimentRecorder(config)
     recorder.record_config()
+    # 覆盖默认 image_size 为实际 tile 尺寸列表 | Override with actual tile sizes
+    recorder.logger.log_info("config/tile_sizes", f"{args.tile_sizes}")
     output_path = Path(config.output_dir) / exp_id
     output_path.mkdir(parents=True, exist_ok=True)
     logger.log_info("exp/output", f"Results: {output_path}")
@@ -360,8 +362,8 @@ def main():
                         f"{len(train_ds)} train tiles, {len(val_ds)} val tiles")
 
         # 训练 | Train ProtoHead
-        torch.manual_seed(args.seed)
-        np.random.seed(args.seed)
+        set_seed(args.seed)
+        set_seed(args.seed)
 
         proto_head = ProtoHead(in_channels=1280, embed_dim=args.embed_dim,
                                 n_protos=args.n_protos,

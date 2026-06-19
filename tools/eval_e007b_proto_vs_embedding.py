@@ -47,6 +47,7 @@ from adatile.config import ExperimentConfig, ExperimentRecorder, generate_exp_id
 from adatile.datasets import MassachusettsBuildingsDataset
 from adatile.backbone import FastSAMBackbone
 from adatile.metrics import compute_dice, format_param_count
+from adatile.utils.seed import set_seed
 
 
 def parse_args():
@@ -455,8 +456,7 @@ def main():
     print("=" * 70)
 
     # ── Set seed ──
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    set_seed(args.seed)
 
     exp_id = generate_exp_id(name=args.name)
     config = ExperimentConfig(exp_id=exp_id, output_dir=args.output_dir,
@@ -489,8 +489,7 @@ def main():
 
     # ── A: Embedding Head ──
     print(f"\n  [3A] Embedding Head (Baseline) — no structural constraint")
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    set_seed(args.seed)
     embed_head = EmbeddingHead(in_channels=1280, embed_dim=args.embed_dim).to(device)
 
     t0 = time.time()
@@ -502,8 +501,7 @@ def main():
 
     # ── B: Proto Head ──
     print(f"\n  [3B] Proto Head (Treatment) — cosine similarity constraints")
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    set_seed(args.seed)
     proto_head = ProtoHead(in_channels=1280, embed_dim=args.embed_dim,
                             n_protos=args.n_protos).to(device)
 

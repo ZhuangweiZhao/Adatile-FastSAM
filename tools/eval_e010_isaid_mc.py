@@ -47,6 +47,7 @@ from adatile.config import ExperimentConfig, ExperimentRecorder, generate_exp_id
 from adatile.datasets.isaid_tiles import FastISAIDTileDataset
 from adatile.backbone import FastSAMBackbone
 from adatile.logging import get_logger
+from adatile.utils.seed import set_seed
 
 logger = get_logger("e010_isaid_mc")
 
@@ -353,8 +354,7 @@ def main():
     print(f"  E007-B 多类别复现 | E007-B multi-class replication")
     print("=" * 70)
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    set_seed(args.seed)
 
     exp_id = generate_exp_id(name=args.name)
     config = ExperimentConfig(exp_id=exp_id, output_dir=args.output_dir,
@@ -380,7 +380,7 @@ def main():
 
     # ── A: EmbeddingHead ──
     logger.log_info("phase", "[3A] EmbeddingHead (Baseline)")
-    torch.manual_seed(args.seed); np.random.seed(args.seed)
+    set_seed(args.seed)
     embed_head = EmbeddingHead(in_channels=1280, embed_dim=args.embed_dim,
                                 num_classes=args.num_classes).to(device)
     embed_params = sum(p.numel() for p in embed_head.parameters())
@@ -406,7 +406,7 @@ def main():
 
     # ── B: ProtoHead ──
     logger.log_info("phase", "[3B] ProtoHead (Treatment)")
-    torch.manual_seed(args.seed); np.random.seed(args.seed)
+    set_seed(args.seed)
     proto_head = ProtoHead(in_channels=1280, embed_dim=args.embed_dim,
                             n_protos=args.n_protos,
                             num_classes=args.num_classes).to(device)

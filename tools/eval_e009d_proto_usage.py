@@ -49,6 +49,7 @@ from adatile.config import ExperimentConfig, ExperimentRecorder, generate_exp_id
 from adatile.datasets import MassachusettsBuildingsDataset
 from adatile.backbone import FastSAMBackbone
 from adatile.metrics import compute_dice
+from adatile.utils.seed import set_seed
 
 
 def parse_args():
@@ -338,8 +339,7 @@ def main():
     print(f"  Core: How many protos does the model actually use?")
     print("=" * 70)
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    set_seed(args.seed)
 
     exp_id = generate_exp_id(name=args.name)
     config = ExperimentConfig(exp_id=exp_id, output_dir=args.output_dir,
@@ -363,8 +363,8 @@ def main():
         print(f"  Training ProtoHead N={n}")
         print(f"{'─'*60}")
 
-        torch.manual_seed(args.seed)
-        np.random.seed(args.seed)
+        set_seed(args.seed)
+        set_seed(args.seed)
 
         proto_head = ProtoHead(in_channels=1280, embed_dim=args.embed_dim,
                                 n_protos=n).to(device)

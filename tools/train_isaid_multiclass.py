@@ -37,6 +37,7 @@ from adatile.config import ExperimentConfig, ExperimentRecorder, generate_exp_id
 from adatile.datasets.isaid_tiles import FastISAIDTileDataset
 from adatile.backbone import FastSAMBackbone
 from adatile.logging import get_logger
+from adatile.utils.seed import set_seed
 
 logger = get_logger("isaid_mc")
 
@@ -381,8 +382,7 @@ def main():
                     f"seed={args.seed}, device={device}")
 
     # 固定随机种子 | Fix random seed (可复现性 | reproducibility)
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    set_seed(args.seed)
 
     # ── 实验管理 | Experiment management ──
     exp_id = generate_exp_id(name=args.name)

@@ -44,6 +44,7 @@ from adatile.config import ExperimentConfig, ExperimentRecorder, generate_exp_id
 from adatile.datasets import MassachusettsBuildingsDataset
 from adatile.backbone import FastSAMBackbone
 from adatile.metrics import compute_dice
+from adatile.utils.seed import set_seed
 
 
 def parse_args():
@@ -513,8 +514,7 @@ def main():
     print(f"  N_protos={args.n_protos}, D={args.embed_dim}, Epochs={args.epochs}")
     print("=" * 70)
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    set_seed(args.seed)
 
     # 区分实验名 | Distinguish experiment names
     suffix = {"post-hoc-sim": "a", "post-hoc-weighted": "b",

@@ -88,9 +88,11 @@ class FastISAIDTileDataset(Dataset):
         mask_np = np.array(mask)  # [H, W], uint8 [0-15] or [0-1]
 
         if self.semantic:
+            # 类别 ID 0-15 → int64 标签 | Category IDs 0-15 → int64 labels
             mask_t = torch.from_numpy(mask_np.astype(np.int64))  # [H, W] long
         else:
-            mask_t = torch.from_numpy(mask_np.astype(np.float32)) / 255.0  # [H,W] float
+            # 二值模式: >0 即为前景 | Binary mode: >0 = foreground
+            mask_t = torch.from_numpy((mask_np > 0).astype(np.float32))  # [H,W] float
 
         return {
             "image": img_t,

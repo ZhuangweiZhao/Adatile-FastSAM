@@ -38,6 +38,7 @@ from adatile.config import ExperimentConfig, ExperimentRecorder, generate_exp_id
 from adatile.datasets.isaid_tiles import FastISAIDTileDataset
 from adatile.backbone import FastSAMBackbone
 from adatile.logging import get_logger
+from adatile.utils.seed import set_seed
 
 logger = get_logger("e011_spm_isaid")
 
@@ -371,7 +372,7 @@ def main():
     print("  N={}, K={}, C={}".format(args.n_protos, args.router_k, args.num_classes))
     print("=" * 70)
 
-    torch.manual_seed(args.seed); np.random.seed(args.seed)
+    set_seed(args.seed)
 
     exp_id = generate_exp_id(name=args.name)
     config = ExperimentConfig(exp_id=exp_id, output_dir=args.output_dir,
