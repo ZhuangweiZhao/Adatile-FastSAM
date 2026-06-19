@@ -71,36 +71,27 @@ class FastISAIDTileDataset(Dataset):
         return len(self._tiles)
 
     def __getitem__(self, index: int) -> dict:
-        """
-        返回 | Returns:
-            sample["image"]:  [3, H, W] float32, [0,1]
-            sample["mask"]:   [H, W] int64 (semantic) or uint8 (binary)
-        """
         fname = self._tiles[index]
 
-        # 图像: cv2 读取 (比 PIL 更鲁棒) | Image: cv2 read (more robust than PIL)
+        # 图像: cv2 → RGB float32 | Image: cv2 → RGB float32
         try:
             import cv2
             img_bgr = cv2.imread(str(self._img_dir / fname), cv2.IMREAD_COLOR)
             if img_bgr is None:
-                raise ValueError(f"cv2 failed to read {fname}")
+                raise ValueError(f"Corrupted image: {fname}")
             img_np = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        except Exception:
-            # PIL fallback
-            from PIL import Image
-            img = Image.open(self._img_dir / fname).convert("RGB")
-            img_np = np.array(img, dtype=np.float32) / 255.0
-        img_t = torch.from_numpy(img_np).permute(2, 0, 1)  # [3, H, W]
-
-        # 掩码 | Mask (单通道 PNG)
-        try:
+            # 掩码: cv2 单通道读取 | Mask: cv2 grayscale read
             mask_np = cv2.imread(str(self._mask_dir / fname), cv2.IMREAD_UNCHANGED)
             if mask_np is None:
-                raise ValueError(f"cv2 failed to read mask {fname}")
+                raise ValueError(f"Corrupted mask: {fname}")
         except Exception:
-            from PIL import Image
-            mask = Image.open(self._mask_dir / fname)
-            mask_np = np.array(mask)  # [H, W], uint8
+            # 损坏文件 → 跳过, 随机选另一个 | Corrupted file → skip, pick another
+            logger.log_info("data/skip_corrupted",
+                            f"Skipping corrupted tile: {fname}, trying next")
+            new_idx = (index + 1) % len(self._tiles)
+            return self.__getitem__(new_idx)
+
+        img_t = torch.from_numpy(img_np).permute(2, 0, 1)  # [3, H, W]
 
         if self.semantic:
             # 类别 ID 0-15 → int64 标签 | Category IDs 0-15 → int64 labels
