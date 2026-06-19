@@ -412,8 +412,8 @@ def main():
         proto_head, backbone, val_ds, device, args.num_classes, args.n_protos,
         is_spm=False
     )
-    logger.log_info("before", f"Active={n_active_before}/{args.n_protos}, "
-                    f"BG-dominant={n_bg_before}/{args.n_protos}")
+    logger.log_info("before", f"Active={int(n_active_before)}/{args.n_protos}, "
+                    f"BG-dominant={int(n_bg_before)}/{args.n_protos}")
 
     # ── Stage 2: SPM Router ──
     logger.log_info("phase", f"[Stage 2] SPM Router training (K={args.router_k})")
@@ -428,8 +428,8 @@ def main():
         spm_head, backbone, val_ds, device, args.num_classes, args.n_protos,
         is_spm=True, router_k=args.router_k
     )
-    logger.log_info("after", f"Active={n_active_after}/{args.n_protos}, "
-                    f"BG-dominant={n_bg_after}/{args.n_protos}")
+    logger.log_info("after", f"Active={int(n_active_after)}/{args.n_protos}, "
+                    f"BG-dominant={int(n_bg_after)}/{args.n_protos}")
 
     # ── Summary ──
     delta_bg = n_bg_before - n_bg_after
@@ -469,9 +469,9 @@ def main():
         verdict = "no_reduction"
     print(f"  {'─'*60}")
 
-    recorder.record_metric("bg_before", n_bg_before, tags=["e011"])
-    recorder.record_metric("bg_after", n_bg_after, tags=["e011"])
-    recorder.record_metric("delta_bg", delta_bg, tags=["e011"])
+    recorder.record_metric("bg_before", int(n_bg_before), tags=["e011"])
+    recorder.record_metric("bg_after", int(n_bg_after), tags=["e011"])
+    recorder.record_metric("delta_bg", int(delta_bg), tags=["e011"])
     recorder.logger.log_info("e011/verdict", verdict)
     recorder.finalize(); recorder.close()
     print(f"\n  Results: {output_path}/")
