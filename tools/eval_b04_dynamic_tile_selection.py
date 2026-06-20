@@ -40,11 +40,38 @@ from adatile.logging import get_logger
 from adatile.logging.backends import ConsoleBackend, FileBackend
 from adatile.utils.seed import set_seed
 from adatile.backbone import FastSAMBackbone
+from adatile.datasets.isaid_tiles import FastISAIDTileDataset
 
 TILE_SIZE = 1024
 NUM_CLASSES = 15
 NUM_OUT_CH = 16
 RARE_CLASSES = {12: 5, 14: 5, 15: 5}  # pool/soccer/plane ×5 oversample
+MAX_DECODE_BATCH = 16  # max tiles in one decode batch (OOM guard)
+
+# iSAID 类别映射 | iSAID category mapping
+_ACTUAL_TO_CODE_ID = {1:4,2:2,3:1,4:3,5:5,6:10,7:6,8:9,9:7,10:8,11:11,12:13,13:12,14:15,15:14}
+
+
+def _render_semantic_mask(annotations: list, h: int, w: int) -> np.ndarray:
+    """渲染语义掩码 [H,W] uint8 | Render semantic mask."""
+    import cv2
+    sem = np.zeros((h, w), dtype=np.uint8)
+    for ann in annotations:
+        cat_id = _ACTUAL_TO_CODE_ID.get(ann.get("category_id", 0), 0)
+        if cat_id <= 0: continue
+        seg = ann.get("segmentation", [])
+        if not seg:
+            bbox = ann.get("bbox", [0,0,0,0])
+            sem[max(0,int(bbox[1])):min(h,int(bbox[1]+bbox[3])),
+                max(0,int(bbox[0])):min(w,int(bbox[0]+bbox[2]))] = cat_id
+            continue
+        if isinstance(seg, dict): continue
+        for poly in (seg if isinstance(seg[0], list) else [seg]):
+            pts = np.array(poly, dtype=np.int32).reshape(-1,1,2)
+            pts[:,:,0] = np.clip(pts[:,:,0], 0, w-1)
+            pts[:,:,1] = np.clip(pts[:,:,1], 0, h-1)
+            cv2.fillPoly(sem, [pts], cat_id)
+    return sem
 
 
 def parse_args():
@@ -107,7 +134,6 @@ class LightDecoder(nn.Module):
 
 def build_train_dataset(tile_root, log):
     """FG>5% 过滤 + 稀有类过采样."""
-    from adatile.datasets.isaid_tiles import FastISAIDTileDataset
     from PIL import Image
 
     ds = FastISAIDTileDataset(tile_root, split="train", semantic=True)
@@ -295,28 +321,6 @@ def train_fdr(args, device, log):
     log("b04/fdr", f"{'='*50}")
     log("b04/fdr", f"Step 2: Train FDR ({args.fdr_epochs} epochs)")
 
-    ACTUAL_TO_CODE_ID = {1:4,2:2,3:1,4:3,5:5,6:10,7:6,8:9,9:7,10:8,11:11,12:13,13:12,14:15,15:14}
-
-    def render_semantic_mask(annotations, h, w):
-        import cv2
-        sem = np.zeros((h, w), dtype=np.uint8)
-        for ann in annotations:
-            cat_id = ACTUAL_TO_CODE_ID.get(ann.get("category_id", 0), 0)
-            if cat_id <= 0: continue
-            seg = ann.get("segmentation", [])
-            if not seg:
-                bbox = ann.get("bbox", [0,0,0,0])
-                sem[max(0,int(bbox[1])):min(h,int(bbox[1]+bbox[3])),
-                    max(0,int(bbox[0])):min(w,int(bbox[0]+bbox[2]))] = cat_id
-                continue
-            if isinstance(seg, dict): continue
-            for poly in (seg if isinstance(seg[0], list) else [seg]):
-                pts = np.array(poly, dtype=np.int32).reshape(-1,1,2)
-                pts[:,:,0] = np.clip(pts[:,:,0], 0, w-1)
-                pts[:,:,1] = np.clip(pts[:,:,1], 0, h-1)
-                cv2.fillPoly(sem, [pts], cat_id)
-        return sem
-
     src_root = Path(args.src_root)
     with open(src_root/"train"/"annotations"/"instances_train.json") as f:
         coco = json.load(f)
@@ -345,11 +349,11 @@ def train_fdr(args, device, log):
     for epoch in range(1, args.fdr_epochs + 1):
         fdr.train()
         total_loss, n = 0.0, 0
-        for img_id, img_path, anns in tqdm(fdr_images[:50], desc=f"  FDR E{epoch}", leave=False):
+        for img_id, img_path, anns in tqdm(fdr_images, desc=f"  FDR E{epoch}", leave=False):
             from PIL import Image
             img = np.array(Image.open(img_path).convert("RGB"))
             H, W = img.shape[:2]
-            mask = render_semantic_mask(anns, H, W)
+            mask = _render_semantic_mask(anns, H, W)
 
             scale = args.image_size / max(H, W)
             nH, nW = int(H*scale), int(W*scale)
@@ -406,38 +410,17 @@ def evaluate_dynamic(args, fdr, decoder, backbone, device, log):
     log("b04/eval", f"{'='*50}")
     log("b04/eval", "Step 3: Dynamic Tile Selection Evaluation")
 
-    ACTUAL_TO_CODE_ID = {1:4,2:2,3:1,4:3,5:5,6:10,7:6,8:9,9:7,10:8,11:11,12:13,13:12,14:15,15:14}
-    def render_semantic_mask(annotations, h, w):
-        import cv2
-        sem = np.full((h,w), 255, dtype=np.uint8)
-        for ann in annotations:
-            cat_id = ACTUAL_TO_CODE_ID.get(ann.get("category_id",0),0)
-            if cat_id<=0: continue
-            seg = ann.get("segmentation",[])
-            if not seg:
-                bbox=ann.get("bbox",[0,0,0,0])
-                sem[max(0,int(bbox[1])):min(h,int(bbox[1]+bbox[3])),
-                    max(0,int(bbox[0])):min(w,int(bbox[0]+bbox[2]))]=cat_id
-                continue
-            if isinstance(seg,dict): continue
-            for poly in (seg if isinstance(seg[0],list) else [seg]):
-                pts=np.array(poly,dtype=np.int32).reshape(-1,1,2)
-                pts[:,:,0]=np.clip(pts[:,:,0],0,w-1)
-                pts[:,:,1]=np.clip(pts[:,:,1],0,h-1)
-                cv2.fillPoly(sem,[pts],cat_id)
-        return sem
-
     src_root = Path(args.src_root)
     with open(src_root/"train"/"annotations"/"instances_train.json") as f:
         coco = json.load(f)
     img_id_to_anns = {}
     for ann in coco["annotations"]:
-        img_id_to_anns.setdefault(ann["image_id"],[]).append(ann)
+        img_id_to_anns.setdefault(ann["image_id"], []).append(ann)
 
     img_dir = src_root/"train"/"images"
     val_images = []
     for img_info in coco["images"][:20]:
-        anns = img_id_to_anns.get(img_info["id"],[])
+        anns = img_id_to_anns.get(img_info["id"], [])
         if anns and (img_dir/img_info["file_name"]).exists():
             val_images.append((img_info, str(img_dir/img_info["file_name"]), anns))
 
@@ -446,21 +429,19 @@ def evaluate_dynamic(args, fdr, decoder, backbone, device, log):
     K_LIST = [int(k) for k in args.top_k_list.split(",")]
     decoder.eval(); backbone.eval()
 
-    results = {k: {"mious":[], "times_s":[], "n_tiles":0} for k in K_LIST}
+    results = {k: {"mious": [], "times_s": [], "n_tiles": []} for k in K_LIST}
 
     for img_info, img_path, anns in tqdm(val_images, desc="  Dynamic eval"):
         from PIL import Image
         img_np = np.array(Image.open(img_path).convert("RGB"))
         H, W = img_np.shape[:2]
-        gt_mask = render_semantic_mask(anns, H, W)
+        gt_mask = _render_semantic_mask(anns, H, W)
 
-        # FDR
-        t_fdr = time.perf_counter()
+        # FDR 预测 tile 重要性 | FDR predicts tile importance
         tile_scores = fdr.predict_tile_scores(img_np, device)
-        t_fdr = time.perf_counter() - t_fdr
         n_ty, n_tx = tile_scores.shape
 
-        # Pre-extract all tiles
+        # Pre-extract all tiles as tensors
         all_tiles = []
         for ty in range(n_ty):
             for tx in range(n_tx):
@@ -468,69 +449,76 @@ def evaluate_dynamic(args, fdr, decoder, backbone, device, log):
                 x0, x1 = tx*TILE_SIZE, min(tx*TILE_SIZE+TILE_SIZE, W)
                 tile = img_np[y0:y1, x0:x1]
                 th, tw = tile.shape[:2]
-                if th<TILE_SIZE or tw<TILE_SIZE:
-                    p = np.zeros((TILE_SIZE,TILE_SIZE,3), dtype=np.uint8)
-                    p[:th,:tw] = tile; tile = p
-                tile_t = torch.from_numpy(tile.astype(np.float32)/255.0).permute(2,0,1)
+                if th < TILE_SIZE or tw < TILE_SIZE:
+                    p = np.zeros((TILE_SIZE, TILE_SIZE, 3), dtype=np.uint8)
+                    p[:th, :tw] = tile; tile = p
+                tile_t = torch.from_numpy(tile.astype(np.float32)/255.0).permute(2, 0, 1)
                 all_tiles.append((tile_t, y0, y1, x0, x1, th, tw))
 
         for K in K_LIST:
             if K >= 100:
-                sel = np.ones(n_ty*n_tx, dtype=bool)
+                sel = np.ones(n_ty * n_tx, dtype=bool)
             else:
-                nk = max(1, int(n_ty*n_tx*K/100))
+                nk = max(1, int(n_ty * n_tx * K / 100))
                 idx = np.argsort(tile_scores.flatten())[::-1][:nk]
-                sel = np.zeros(n_ty*n_tx, dtype=bool); sel[idx] = True
+                sel = np.zeros(n_ty * n_tx, dtype=bool); sel[idx] = True
 
-            # Batch selected tiles
-            batch_tensors, batch_pos = [], []
-            for i, (tile_t, y0,y1,x0,x1,th,tw) in enumerate(all_tiles):
+            # Collect selected tiles
+            selected_tensors, selected_pos = [], []
+            for i, (tile_t, y0, y1, x0, x1, th, tw) in enumerate(all_tiles):
                 if sel[i]:
-                    batch_tensors.append(tile_t)
-                    batch_pos.append((y0,y1,x0,x1,th,tw))
+                    selected_tensors.append(tile_t)
+                    selected_pos.append((y0, y1, x0, x1, th, tw))
 
-            pred_full = np.zeros((H,W), dtype=np.int64)
-            if batch_tensors:
-                batch = torch.stack(batch_tensors).to(device)
-                torch.cuda.synchronize()
-                t0 = time.perf_counter()
-                feats = backbone(batch)
-                logits = decoder(feats["p4"], target_size=(TILE_SIZE,TILE_SIZE))
-                preds = logits.argmax(dim=1).cpu().numpy()
-                torch.cuda.synchronize()
-                t_dec = time.perf_counter() - t0
+            pred_full = np.zeros((H, W), dtype=np.int64)
+            t_dec_total = 0.0
 
-                for i, (y0,y1,x0,x1,th,tw) in enumerate(batch_pos):
-                    pred_full[y0:y0+min(th,TILE_SIZE), x0:x0+min(tw,TILE_SIZE)] = \
-                        preds[i][:th,:tw]
+            if selected_tensors:
+                # Sub-batch 推理, 避免 OOM | Sub-batched inference, avoid OOM
+                for sb_start in range(0, len(selected_tensors), MAX_DECODE_BATCH):
+                    sb_end = min(sb_start + MAX_DECODE_BATCH, len(selected_tensors))
+                    batch = torch.stack(selected_tensors[sb_start:sb_end]).to(device)
+                    torch.cuda.synchronize()
+                    t0 = time.perf_counter()
+                    feats = backbone(batch)
+                    logits = decoder(feats["p4"], target_size=(TILE_SIZE, TILE_SIZE))
+                    preds = logits.argmax(dim=1).cpu().numpy()
+                    torch.cuda.synchronize()
+                    t_dec_total += time.perf_counter() - t0
+
+                    for j in range(sb_end - sb_start):
+                        y0, y1, x0, x1, th, tw = selected_pos[sb_start + j]
+                        pred_full[y0:y0+min(th, TILE_SIZE),
+                                  x0:x0+min(tw, TILE_SIZE)] = preds[j][:th, :tw]
 
             # mIoU
             miou_v, valid = 0.0, 0
-            for c in range(1, NUM_CLASSES+1):
-                pc = (pred_full==c); tc = (gt_mask==c)
-                inter = (pc&tc).sum(); union = (pc|tc).sum()
-                if union>0: miou_v += inter/union; valid += 1
+            for c in range(1, NUM_CLASSES + 1):
+                pc = (pred_full == c); tc = (gt_mask == c)
+                inter = (pc & tc).sum(); union = (pc | tc).sum()
+                if union > 0: miou_v += inter / union; valid += 1
 
-            results[K]["mious"].append(miou_v/max(valid,1))
-            results[K]["times_s"].append(t_dec if batch_tensors else 0)
-            results[K]["n_tiles"] = len(batch_tensors)
+            results[K]["mious"].append(miou_v / max(valid, 1))
+            results[K]["times_s"].append(t_dec_total)
+            results[K]["n_tiles"].append(len(selected_tensors))
 
     # Summary
     log("b04/summary", f"  {'K%':<6} {'FG-mIoU':>9} {'ΔmIoU':>8} {'Tiles':>7} {'Time(ms)':>9} {'Speedup':>8}")
     base_miou = np.mean(results[100]["mious"])
     base_time = np.mean(results[100]["times_s"])
+    base_tiles = int(np.mean(results[100]["n_tiles"]))
 
     log("b04/summary",
         f"  {'100%':<6} {base_miou*100:>8.2f}% {'-':>8} "
-        f"{results[100]['n_tiles']:>7} {base_time*1000:>8.1f}ms {'1.00×':>8}")
+        f"{base_tiles:>7} {base_time*1000:>8.1f}ms {'1.00×':>8}")
 
     for K in sorted(K_LIST):
         if K == 100: continue
         miou = np.mean(results[K]["mious"])
         dt = np.mean(results[K]["times_s"])
-        nt = results[K]["n_tiles"]
-        dmiou = (miou - base_miou)*100
-        sp = base_time/max(dt,1e-8)
+        nt = int(np.mean(results[K]["n_tiles"]))
+        dmiou = (miou - base_miou) * 100
+        sp = base_time / max(dt, 1e-8)
         log("b04/summary",
             f"  {K:>4}%  {miou*100:>8.2f}% {dmiou:>+7.2f}% "
             f"{nt:>7} {dt*1000:>8.1f}ms {sp:>7.2f}×")
