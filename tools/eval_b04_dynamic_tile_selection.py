@@ -268,17 +268,21 @@ def train_decoder(args, device):
         total_loss, n = 0.0, 0
 
         for batch in tqdm(train_loader, desc=f"  Dec E{epoch}", leave=False):
-            img = batch["image"].to(device)
-            tgt = batch["mask"].to(device)
+            img = batch["image"].to(device)    # [B,3,1024,1024]
+            tgt = batch["mask"].to(device)     # [B,1024,1024]
+            # 缩放到 512 提升空间分辨率 | Resize to 512 for better spatial resolution
+            img_small = F.interpolate(img, size=(512, 512), mode="bilinear", align_corners=False)
+            tgt_small = F.interpolate(tgt.unsqueeze(1).float(), size=(512, 512),
+                                      mode="nearest").squeeze(1).long()
             with torch.no_grad():
-                feats = backbone(img)
-            logit = decoder(feats["p4"], target_size=tgt.shape[1:])
+                feats = backbone(img_small)
+            logit = decoder(feats["p4"], target_size=(512, 512))
 
-            # Focal Loss (γ=2.0, α=0.25) — 小目标/难样本聚焦
-            # Focal Loss — focus on hard, small-object samples
+            # Focal Loss (γ=5.0) — 极度聚焦前景, 背景几乎无梯度
+            # Focal Loss — extreme foreground focus, background contributes almost nothing
             ce = F.cross_entropy(logit, tgt, ignore_index=255, reduction="none")
             pt = torch.exp(-ce)
-            focal_weight = (1 - pt) ** 2.0  # γ=2.0
+            focal_weight = (1 - pt) ** 5.0  # γ=5.0: 97%背景→权重≈0, 前景驱动全部梯度
             focal_loss = (focal_weight * ce).mean()
 
             # Dice Loss (多类, 排除背景) — 直接优化 IoU, 不用 one-hot 避免 OOM
@@ -314,8 +318,12 @@ def train_decoder(args, device):
             for batch in val_loader:
                 img = batch["image"].to(device)
                 tgt = batch["mask"].to(device)
-                feats = backbone(img)
-                logit = decoder(feats["p4"], target_size=tgt.shape[1:])
+                # 缩放到 512 (与训练一致) | Resize to 512 (consistent with training)
+                img_small = F.interpolate(img, size=(512, 512), mode="bilinear", align_corners=False)
+                tgt_small = F.interpolate(tgt.unsqueeze(1).float(), size=(512, 512),
+                                          mode="nearest").squeeze(1).long()
+                feats = backbone(img_small)
+                logit = decoder(feats["p4"], target_size=(512, 512))
                 pred = logit.argmax(dim=1)
 
                 # 诊断: 唯一值 | Diagnostic: unique values
@@ -427,7 +435,7 @@ def run_dynamic_selection(args, fdr, decoder, backbone, device):
     backbone.eval()
 
     # Per-K 统计 | Per-K statistics
-    all_results = {k: {"mious": [], "pred_times": [], "decode_times": [], "n_tiles": []}
+    all_results = {k: {"mious": [], "fdr_times": [], "decode_times": [], "n_tiles": []}
                    for k in K_LIST}
 
     for img_info, img_path, anns in tqdm(val_images, desc="  Dynamic eval"):
