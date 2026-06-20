@@ -51,7 +51,8 @@ ACTUAL_TO_CODE_ID = {
     9: 7, 10: 8, 11: 11, 12: 13, 13: 12, 14: 15, 15: 14,
 }
 TILE_SIZE = 1024
-NUM_CLASSES = 15
+NUM_CLASSES = 15  # 15 foreground classes (1-15)
+NUM_OUT_CH = 16    # 0=background + 15 foreground = 16 output channels
 BACKBONE_STRIDE = 32
 FDR_FEAT_PER_TILE = 32
 
@@ -214,9 +215,9 @@ def train_decoder(args, device):
 
     # 模型 | Model
     backbone = FastSAMBackbone(freeze_backbone=True).eval()
-    decoder = LightDecoder(1280, NUM_CLASSES).to(device)
+    decoder = LightDecoder(1280, NUM_OUT_CH).to(device)
     n_p = sum(p.numel() for p in decoder.parameters())
-    logger.log_info("b04/decoder", f"LightDecoder: {n_p:,} params")
+    logger.log_info("b04/decoder", f"LightDecoder: {n_p:,} params (16ch: bg+15fg)")
 
     opt = torch.optim.Adam(decoder.parameters(), lr=args.lr)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.decoder_epochs, eta_min=1e-6)
@@ -237,9 +238,10 @@ def train_decoder(args, device):
             total_loss += loss.item(); n += 1
         sch.step()
 
-        # Validation
+        # Validation (前景类 IoU, 排除背景 class 0)
+        # Validation with foreground IoU (exclude background class 0)
         decoder.eval()
-        mious = []
+        fg_mious = []
         with torch.no_grad():
             for batch in val_loader:
                 img = batch["image"].to(device)
@@ -248,16 +250,18 @@ def train_decoder(args, device):
                 logit = decoder(feats["p4"], target_size=tgt.shape[1:])
                 pred = logit.argmax(dim=1)
                 miou_v = 0.0; valid = 0
-                for c in range(NUM_CLASSES):
-                    pc = (pred==c); tc = (tgt==c)
-                    inter = (pc&tc).sum().float()
-                    union = (pc|tc).sum().float()
-                    if union > 0: miou_v += inter/union; valid += 1
-                if valid > 0: mious.append((miou_v/valid).item())
+                # 只计算前景类 1-15, 排除背景 class 0 | Foreground only, skip background
+                for c in range(1, NUM_CLASSES + 1):
+                    pc = (pred == c); tc = (tgt == c)
+                    inter = (pc & tc).sum().float()
+                    union = (pc | tc).sum().float()
+                    if union > 0: miou_v += inter / union; valid += 1
+                if valid > 0: fg_mious.append((miou_v / valid).item())
 
-        miou = float(np.mean(mious))
+        miou = float(np.mean(fg_mious)) if fg_mious else 0.0
         logger.log_info("b04/decoder",
-                        f"E{epoch}/{args.decoder_epochs} loss={total_loss/n:.4f} mIoU={miou:.4f}")
+                        f"E{epoch}/{args.decoder_epochs} loss={total_loss/n:.4f} "
+                        f"FG-mIoU={miou:.4f}")
 
         if miou > best_miou:
             best_miou = miou
@@ -398,9 +402,9 @@ def run_dynamic_selection(args, fdr, decoder, backbone, device):
             # 裁剪 | Crop
             pred_full = pred_full[:H, :W]
 
-            # 计算 mIoU | Compute mIoU
+            # 计算 mIoU (仅前景类, 排除背景) | Compute mIoU (foreground only)
             miou_v, valid = 0.0, 0
-            for c in range(NUM_CLASSES):
+            for c in range(1, NUM_CLASSES + 1):
                 pc = (pred_full == c)
                 tc = (gt_mask == c)
                 inter = (pc & tc).sum()
@@ -461,7 +465,7 @@ def main():
     if args.skip_decoder_train:
         # 加载已有权重 | Load existing weights
         logger.log_info("b04/decoder", "Skipping decoder training (--skip-decoder-train)")
-        decoder = LightDecoder(1280, NUM_CLASSES).to(device)
+        decoder = LightDecoder(1280, NUM_OUT_CH).to(device)
         backbone = FastSAMBackbone(freeze_backbone=True).eval()
         ckpt_path = output_dir / "decoder_best.pt"
         if ckpt_path.exists():
