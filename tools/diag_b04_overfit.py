@@ -81,10 +81,10 @@ class LightDecoder(nn.Module):
 
 @torch.no_grad()
 def visualize(model, backbone, loader, output_dir, device, n=5):
-    """保存 GT vs Pred 对照图."""
-    if not PIL_AVAILABLE:
-        logger.log_info("diag", "PIL not available, skipping viz")
-        return
+    """保存拼接对照图: 原图 | GT | Pred | GT Overlay | Pred Overlay."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
 
     viz_dir = Path(output_dir) / "viz"
     viz_dir.mkdir(parents=True, exist_ok=True)
@@ -103,46 +103,47 @@ def visualize(model, backbone, loader, output_dir, device, n=5):
         gt = tgt[0].cpu().numpy()
         img_np = img[0].cpu().numpy().transpose(1, 2, 0)
 
-        # 上色: 背景=黑色, 前景=彩色 | Color: bg=black, fg=colored
-        cmap = plt_get_cmap() if 'plt_get_cmap' in dir() else None
-
-        # 原图
-        Image.fromarray((img_np * 255).astype(np.uint8)).save(
-            viz_dir / f"sample{saved:02d}_image.png")
-
-        # GT: 前景用颜色, 背景=0
-        gt_color = np.zeros((gt.shape[0], gt.shape[1], 3), dtype=np.uint8)
+        # 上色 | Colorize
+        gt_color = np.zeros((*gt.shape, 3), dtype=np.uint8)
+        pred_color = np.zeros((*pred.shape, 3), dtype=np.uint8)
         for c in range(1, 16):
             gt_color[gt == c] = COLOR_MAP[c % len(COLOR_MAP)]
-        Image.fromarray(gt_color).save(viz_dir / f"sample{saved:02d}_gt.png")
-
-        # Pred
-        pred_color = np.zeros((pred.shape[0], pred.shape[1], 3), dtype=np.uint8)
-        for c in range(1, 16):
             pred_color[pred == c] = COLOR_MAP[c % len(COLOR_MAP)]
-        Image.fromarray(pred_color).save(viz_dir / f"sample{saved:02d}_pred.png")
 
-        # Overlay: image + GT + pred
         gt_overlay = (img_np * 0.5 + gt_color.astype(np.float32) / 255.0 * 0.5)
         pred_overlay = (img_np * 0.5 + pred_color.astype(np.float32) / 255.0 * 0.5)
-        Image.fromarray((gt_overlay * 255).astype(np.uint8)).save(
-            viz_dir / f"sample{saved:02d}_overlay_gt.png")
-        Image.fromarray((pred_overlay * 255).astype(np.uint8)).save(
-            viz_dir / f"sample{saved:02d}_overlay_pred.png")
 
-        # 统计 | Stats
+        # 拼接 5 列: 原图 | GT mask | Pred mask | GT Overlay | Pred Overlay
+        fig, axes = plt.subplots(1, 5, figsize=(22, 5))
+
+        titles = ["Image", "GT Mask", "Pred Mask", "GT Overlay", "Pred Overlay"]
+        images = [img_np, gt_color, pred_color, gt_overlay, pred_overlay]
+
+        gt_cls = sorted(set(gt.flatten()) - {0})
+        pred_cls = sorted(set(pred.flatten()) - {0})
         gt_bg = (gt == 0).mean()
         pred_bg = (pred == 0).mean()
-        gt_classes = set(gt.flatten().tolist())
-        pred_classes = set(pred.flatten().tolist())
+
+        for ax, title, im in zip(axes, titles, images):
+            ax.imshow(im)
+            ax.set_title(title, fontsize=10)
+            ax.axis("off")
+
+        fig.suptitle(f"Sample {saved} | GT classes: {gt_cls} → Pred classes: {pred_cls}\n"
+                     f"GT bg={gt_bg:.1%} | Pred bg={pred_bg:.1%}",
+                     fontsize=10, fontfamily="monospace")
+        fig.tight_layout()
+        fig.savefig(viz_dir / f"sample{saved:02d}_comparison.png",
+                    dpi=120, bbox_inches="tight")
+        plt.close(fig)
+
         logger.log_info("diag",
-                        f"Sample {saved}: gt_classes={sorted(gt_classes)} "
-                        f"pred_classes={sorted(pred_classes)} "
-                        f"gt_bg={gt_bg:.3f} pred_bg={pred_bg:.3f}")
+                        f"Sample {saved}: GT={gt_cls} Pred={pred_cls} "
+                        f"GT_bg={gt_bg:.3f} Pred_bg={pred_bg:.3f}")
 
         saved += 1
 
-    logger.log_info("diag", f"Saved {saved} viz samples to {viz_dir}/")
+    logger.log_info("diag", f"Saved {saved} comparison images to {viz_dir}/")
 
 
 # 颜色表 | Color map for visualization
