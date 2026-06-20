@@ -91,11 +91,11 @@ def visualize(model, backbone, loader, output_dir, device, n=5):
 
     model.eval()
     saved = 0
-    for imgs, gt_scores, fg_px, n_ty_arr, n_tx_arr in loader:
+    for batch in loader:
         if saved >= n:
             break
-        img = imgs[:1].to(device)
-        tgt = gt_scores[:1].to(device)
+        img = batch["image"][:1].to(device)
+        tgt = batch["mask"][:1].to(device)
 
         feats = backbone(img)
         logit = model(feats["p4"], target_size=tgt.shape[1:])
