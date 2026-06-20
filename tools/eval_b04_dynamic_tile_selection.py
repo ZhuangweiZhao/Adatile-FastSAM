@@ -83,44 +83,59 @@ def parse_args():
 
 class LightDecoder(nn.Module):
     """
-    从 FastSAM P4 特征预测 15 类分割 | 15-class segmentation from FastSAM P4.
-    P4: [B, 1280, H/16, W/16] → [B, 15, H, W].
+    从 FastSAM P4 特征预测多类分割 | Multi-class segmentation from FastSAM P4.
+    P4: [B, 1280, H/16, W/16] → 渐进上采样 → [B, C, H, W].
 
-    先 1×1 降维（1280→256），再 3×3 做空间推理，减少参数量。
-    1×1 channel reduction first (1280→256), then 3×3 spatial reasoning.
+    三步上采样 (stride 16 → 8 → 4 → 1)，让 decoder 有空间容量学习小目标。
+    Progressive 3-step upsampling gives decoder spatial capacity for small objects.
     """
 
-    def __init__(self, in_channels: int = 1280, num_classes: int = 15):
+    def __init__(self, in_channels: int = 1280, num_classes: int = 16):
         super().__init__()
-        self.decoder = nn.Sequential(
-            # 1×1 降维 | Channel reduction: 1280 → 256
+        # Stage 1: 1×1 降维 + 3×3 空间 (stride=16) | Channel reduction + spatial
+        self.stage1 = nn.Sequential(
             nn.Conv2d(in_channels, 256, 1, bias=False),
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
-            # 3×3 空间推理 | Spatial reasoning
             nn.Conv2d(256, 128, 3, padding=1, bias=False),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
-            # 上采样 + 细化 | Upsample + refine
+        )
+        # Stage 2: upsample 2× → stride=8
+        self.stage2 = nn.Sequential(
             nn.Conv2d(128, 64, 3, padding=1, bias=False),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, num_classes, 1, bias=True),
         )
+        # Stage 3: upsample 2× → stride=4
+        self.stage3 = nn.Sequential(
+            nn.Conv2d(64, 32, 3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+        )
+        # Head: 1×1 → logits, then upsample to target
+        self.head = nn.Conv2d(32, num_classes, 1, bias=True)
 
     def forward(self, p4: torch.Tensor, target_size: tuple = None) -> torch.Tensor:
         """
         Args:
             p4: [B, 1280, H/16, W/16].
-            target_size: (H, W) 上采样目标尺寸 | upsample target.
+            target_size: (H, W) target resolution.
         Returns:
-            [B, 15, H, W] logits.
+            [B, C, H, W] logits.
         """
-        out = self.decoder(p4)
+        x = self.stage1(p4)                                  # [B, 128, H/16, W/16]
+        x = F.interpolate(x, scale_factor=2, mode="bilinear",   # → H/8, W/8
+                         align_corners=False)
+        x = self.stage2(x)                                    # [B, 64, H/8, W/8]
+        x = F.interpolate(x, scale_factor=2, mode="bilinear",   # → H/4, W/4
+                         align_corners=False)
+        x = self.stage3(x)                                    # [B, 32, H/4, W/4]
+        x = self.head(x)                                       # [B, C, H/4, W/4]
         if target_size is not None:
-            out = F.interpolate(out, size=target_size, mode="bilinear",
-                               align_corners=False)
-        return out
+            x = F.interpolate(x, size=target_size, mode="bilinear",  # → H, W
+                             align_corners=False)
+        return x
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -207,6 +222,20 @@ def train_decoder(args, device):
     max_tiles = min(len(train_ds), args.train_images * 8)
     train_ds._tiles = train_ds._tiles[:max_tiles]
     logger.log_info("b04/decoder", f"Train tiles: {len(train_ds)}, Val: {len(val_ds)}")
+
+    # 快速诊断: 检查 val mask 是否有前景 | Quick diagnostic: any foreground in val?
+    val_fg_count = 0
+    for i in range(min(100, len(val_ds))):
+        m = val_ds[i]["mask"]
+        vals = m.unique().tolist()
+        if any(v > 0 for v in vals):
+            val_fg_count += 1
+        if i < 3:
+            logger.log_info("b04/debug",
+                            f"Val tile[{i}]: shape={list(m.shape)}, unique={vals}")
+    logger.log_info("b04/debug",
+                    f"Val foreground ratio: {val_fg_count}/{min(100, len(val_ds))} "
+                    f"({val_fg_count/max(1,min(100,len(val_ds)))*100:.1f}%)")
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=2, pin_memory=True)
