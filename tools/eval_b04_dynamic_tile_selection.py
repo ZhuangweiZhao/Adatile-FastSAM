@@ -234,6 +234,20 @@ def train_decoder(args, device, log):
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                             num_workers=2, pin_memory=True)
 
+    # 过滤 val 为 FG>5% 用于训练监控 | Filter val to FG>5% for training monitor
+    from PIL import Image
+    val_fg5_tiles = []
+    for fname in tqdm(val_ds._tiles, desc="  Filter Val FG>5%"):
+        mask = np.array(Image.open(val_ds._mask_dir / fname))
+        if (mask > 0).sum() / mask.size > 0.05:
+            val_fg5_tiles.append(fname)
+    log("b04/decoder", f"Val FG>5% tiles: {len(val_fg5_tiles)}/{len(val_ds)} "
+                       f"({len(val_fg5_tiles)/len(val_ds)*100:.1f}%)")
+    val_fg5_ds = FastISAIDTileDataset(args.tile_root, split="val", semantic=True)
+    val_fg5_ds._tiles = val_fg5_tiles
+    val_fg5_loader = DataLoader(val_fg5_ds, batch_size=args.batch_size, shuffle=False,
+                                num_workers=2, pin_memory=True)
+
     backbone = FastSAMBackbone(freeze_backbone=True).eval()
     decoder = LightDecoder(1280, NUM_OUT_CH).to(device)
     n_p = sum(p.numel() for p in decoder.parameters())
@@ -276,10 +290,12 @@ def train_decoder(args, device, log):
         sch.step()
         avg_loss = total_loss / max(n, 1)
 
-        # Validation
+        # Validation (2 sets: full val + FG>5% val)
         decoder.eval()
         per_cls_inter = torch.zeros(NUM_OUT_CH, device=device)
         per_cls_union = torch.zeros(NUM_OUT_CH, device=device)
+        per_cls_inter_fg5 = torch.zeros(NUM_OUT_CH, device=device)
+        per_cls_union_fg5 = torch.zeros(NUM_OUT_CH, device=device)
         with torch.no_grad():
             for batch in val_loader:
                 img = batch["image"].to(device)
@@ -291,43 +307,56 @@ def train_decoder(args, device, log):
                     pc = (pred == c); tc = (tgt == c)
                     per_cls_inter[c] += (pc & tc).sum().float()
                     per_cls_union[c] += (pc | tc).sum().float()
+            for batch in val_fg5_loader:
+                img = batch["image"].to(device)
+                tgt = batch["mask"].to(device)
+                feats = backbone(img)
+                logit = decoder(feats["p4"], target_size=tgt.shape[1:])
+                pred = logit.argmax(dim=1)
+                for c in range(1, NUM_OUT_CH):
+                    pc = (pred == c); tc = (tgt == c)
+                    per_cls_inter_fg5[c] += (pc & tc).sum().float()
+                    per_cls_union_fg5[c] += (pc | tc).sum().float()
 
-        miou_sum, valid = 0.0, 0
-        for c in range(1, NUM_OUT_CH):
-            if per_cls_union[c] > 0:
-                miou_sum += (per_cls_inter[c] / per_cls_union[c]).item()
-                valid += 1
-        miou = miou_sum / max(valid, 1)
+        def _calc_miou(inter, union):
+            s, v = 0.0, 0
+            for c in range(1, NUM_OUT_CH):
+                if union[c] > 0: s += (inter[c] / union[c]).item(); v += 1
+            return s / max(v, 1), int(v)
+
+        miou, valid = _calc_miou(per_cls_inter, per_cls_union)
+        miou_fg5, valid_fg5 = _calc_miou(per_cls_inter_fg5, per_cls_union_fg5)
 
         # 每 epoch 打印 + 日志 + JSONL | Print + log + JSONL every epoch
         epoch_metrics = {
             "epoch": epoch, "loss": round(avg_loss, 6),
-            "val_fg_miou": round(miou, 6),
-            "val_n_classes": int(valid),
+            "fg_miou_all_val": round(miou, 6),
+            "fg_miou_fg5_val": round(miou_fg5, 6),
+            "n_classes_all": int(valid),
+            "n_classes_fg5": int(valid_fg5),
         }
         for c in range(1, NUM_OUT_CH):
-            if per_cls_union[c] > 0:
-                epoch_metrics[f"iou_cls{c}"] = round(
-                    (per_cls_inter[c] / per_cls_union[c]).item(), 6)
+            if per_cls_union_fg5[c] > 0:
+                epoch_metrics[f"iou_fg5_cls{c}"] = round(
+                    (per_cls_inter_fg5[c] / per_cls_union_fg5[c]).item(), 6)
 
         # 终端 + FileBackend | Console + FileBackend
         log("b04/decoder",
             f"E{epoch:2d}/{args.decoder_epochs} loss={avg_loss:.4f} "
-            f"FG-mIoU={miou:.4f}")
+            f"mIoU(all)={miou:.4f} mIoU(FG>5%)={miou_fg5:.4f}")
         # 指标 JSONL (增量) | Metrics JSONL (append)
         with open(metrics_path, "a") as mf:
             mf.write(json.dumps(epoch_metrics) + "\n")
             mf.flush()
 
-        if miou > best_miou:
-            best_miou = miou
+        if miou_fg5 > best_miou:
+            best_miou = miou_fg5
             best_state = {k: v.clone() for k, v in decoder.state_dict().items()}
-            # 实时保存 checkpoint | Save checkpoint immediately
             torch.save(best_state, str(Path(args.output_dir) / "decoder_best.pt"))
 
     if best_state:
         decoder.load_state_dict(best_state)
-    log("b04/decoder", f"Best Val-FG-mIoU={best_miou:.4f}")
+    log("b04/decoder", f"Best FG>5%-mIoU={best_miou:.4f}")
     return decoder, backbone, best_miou
 
 
