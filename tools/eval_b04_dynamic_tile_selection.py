@@ -233,7 +233,11 @@ def train_decoder(args, device):
             with torch.no_grad():
                 feats = backbone(img)
             logit = decoder(feats["p4"], target_size=tgt.shape[1:])
-            loss = F.cross_entropy(logit, tgt, ignore_index=255)
+            # 加权 loss: 降背景权重, 避免模型全预测 0
+            # Weighted loss: reduce bg weight to prevent all-0 collapse
+            weight = torch.ones(NUM_OUT_CH, device=device)
+            weight[0] = 0.05  # 背景权重 ×0.05 (背景占 ~60-90% 像素)
+            loss = F.cross_entropy(logit, tgt, weight=weight, ignore_index=255)
             opt.zero_grad(); loss.backward(); opt.step()
             total_loss += loss.item(); n += 1
         sch.step()
