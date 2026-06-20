@@ -94,8 +94,8 @@ def train_eval(decoder, backbone, loader, epochs, device, binary, num_classes, l
         # ── 评估: 每 5 epoch 或 epoch 1 | Evaluate: every 5 or epoch 1 ──
         if epoch % 5 == 0 or epoch == 1 or epoch == epochs:
             decoder.eval()
-            per_class_inter = torch.zeros(num_classes)
-            per_class_union = torch.zeros(num_classes)
+            per_class_inter = torch.zeros(num_classes, device=device)
+            per_class_union = torch.zeros(num_classes, device=device)
             bg_px, total_px = 0.0, 0
             all_pred_vals, all_tgt_vals = set(), set()
 
