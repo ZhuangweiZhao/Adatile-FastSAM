@@ -227,25 +227,50 @@ def train_decoder(args, device):
     for epoch in range(1, args.decoder_epochs + 1):
         decoder.train()
         total_loss, n = 0.0, 0
+
         for batch in tqdm(train_loader, desc=f"  Dec E{epoch}", leave=False):
             img = batch["image"].to(device)
             tgt = batch["mask"].to(device)
             with torch.no_grad():
                 feats = backbone(img)
             logit = decoder(feats["p4"], target_size=tgt.shape[1:])
-            # 加权 loss: 降背景权重, 避免模型全预测 0
-            # Weighted loss: reduce bg weight to prevent all-0 collapse
-            weight = torch.ones(NUM_OUT_CH, device=device)
-            weight[0] = 0.05  # 背景权重 ×0.05 (背景占 ~60-90% 像素)
-            loss = F.cross_entropy(logit, tgt, weight=weight, ignore_index=255)
+
+            # Focal Loss (γ=2.0, α=0.25) — 小目标/难样本聚焦
+            # Focal Loss — focus on hard, small-object samples
+            ce = F.cross_entropy(logit, tgt, ignore_index=255, reduction="none")
+            pt = torch.exp(-ce)
+            focal_weight = (1 - pt) ** 2.0  # γ=2.0
+            focal_loss = (focal_weight * ce).mean()
+
+            # Dice Loss (多类, 排除背景) — 直接优化 IoU, 不用 one-hot 避免 OOM
+            # Multi-class Dice Loss (exclude bg) — no one-hot to avoid OOM
+            probs = F.softmax(logit, dim=1)
+            dice_sum = 0.0
+            valid_dice = 0
+            for c in range(1, NUM_OUT_CH):  # exclude background class 0
+                p_c = probs[:, c]                    # [B, H, W]
+                t_c = (tgt == c).float()             # [B, H, W] (bool→float, no one-hot)
+                inter = (p_c * t_c).sum()
+                union = p_c.sum() + t_c.sum() + 1e-8
+                if t_c.sum() > 0:
+                    dice_sum += (2 * inter / union)
+                    valid_dice += 1
+            dice_loss = 1.0 - (dice_sum / max(valid_dice, 1))
+
+            loss = 0.5 * focal_loss + 0.5 * dice_loss
+
             opt.zero_grad(); loss.backward(); opt.step()
             total_loss += loss.item(); n += 1
-        sch.step()
 
-        # Validation (前景类 IoU, 排除背景 class 0)
-        # Validation with foreground IoU (exclude background class 0)
+        sch.step()
+        avg_loss = total_loss / max(n, 1)
+
+        # ── 验证 + 诊断 | Validation + Diagnostics ──
         decoder.eval()
-        fg_mious = []
+        fg_mious, fg_dices = [], []
+        all_pred_vals, all_tgt_vals = set(), set()
+        total_bg_pred, total_px = 0.0, 0
+
         with torch.no_grad():
             for batch in val_loader:
                 img = batch["image"].to(device)
@@ -253,8 +278,15 @@ def train_decoder(args, device):
                 feats = backbone(img)
                 logit = decoder(feats["p4"], target_size=tgt.shape[1:])
                 pred = logit.argmax(dim=1)
+
+                # 诊断: 唯一值 | Diagnostic: unique values
+                all_pred_vals.update(pred.unique().cpu().tolist())
+                all_tgt_vals.update(tgt.unique().cpu().tolist())
+                total_bg_pred += (pred == 0).sum().item()
+                total_px += pred.numel()
+
+                # FG-mIoU (foreground classes 1-15)
                 miou_v = 0.0; valid = 0
-                # 只计算前景类 1-15, 排除背景 class 0 | Foreground only, skip background
                 for c in range(1, NUM_CLASSES + 1):
                     pc = (pred == c); tc = (tgt == c)
                     inter = (pc & tc).sum().float()
@@ -262,10 +294,32 @@ def train_decoder(args, device):
                     if union > 0: miou_v += inter / union; valid += 1
                 if valid > 0: fg_mious.append((miou_v / valid).item())
 
+                # Dice per class (foreground only, no one-hot)
+                probs_val = F.softmax(logit, dim=1)
+                dice_v = 0.0; dv = 0
+                for c in range(1, NUM_OUT_CH):
+                    pc_v = probs_val[:, c]
+                    tc_v = (tgt == c).float()
+                    inter_v = (pc_v * tc_v).sum()
+                    union_v = pc_v.sum() + tc_v.sum() + 1e-8
+                    if tc_v.sum() > 0:
+                        dice_v += (2 * inter_v / union_v).item(); dv += 1
+                if dv > 0: fg_dices.append(dice_v / dv)
+
         miou = float(np.mean(fg_mious)) if fg_mious else 0.0
+        dice_val = float(np.mean(fg_dices)) if fg_dices else 0.0
+        bg_pred_ratio = total_bg_pred / max(total_px, 1)
+
+        # 诊断日志 | Diagnostic log (every 5 epochs or epoch 1)
+        if epoch == 1 or epoch % 5 == 0 or epoch == args.decoder_epochs:
+            logger.log_info("b04/debug",
+                            f"E{epoch:2d} pred.unique={sorted(all_pred_vals)} "
+                            f"gt.unique={sorted(all_tgt_vals)} "
+                            f"bg_pred_ratio={bg_pred_ratio:.3f}")
         logger.log_info("b04/decoder",
-                        f"E{epoch}/{args.decoder_epochs} loss={total_loss/n:.4f} "
-                        f"FG-mIoU={miou:.4f}")
+                        f"E{epoch}/{args.decoder_epochs} loss={avg_loss:.4f} "
+                        f"FG-mIoU={miou:.4f} Dice={dice_val:.4f} "
+                        f"bg_pred%={bg_pred_ratio*100:.1f}%")
 
         if miou > best_miou:
             best_miou = miou
