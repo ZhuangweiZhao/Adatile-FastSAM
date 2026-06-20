@@ -128,8 +128,8 @@ class FileBackend(LogBackend):
         filepath: str | Path,
         *,
         min_level: str = "DEBUG",
-        buffer_size: int = 100,
-        flush_interval: float = 5.0,
+        buffer_size: int = 1,
+        flush_interval: float = 1.0,
     ) -> None:
         super().__init__(min_level=min_level)
         self._path = Path(filepath)

@@ -278,6 +278,8 @@ def train_decoder(args, device, log):
         if miou > best_miou:
             best_miou = miou
             best_state = {k: v.clone() for k, v in decoder.state_dict().items()}
+            # 实时保存 checkpoint | Save checkpoint immediately
+            torch.save(best_state, str(Path(args.output_dir) / "decoder_best.pt"))
 
     if best_state:
         decoder.load_state_dict(best_state)
@@ -391,6 +393,7 @@ def train_fdr(args, device, log):
         if epoch == 1 or epoch % 5 == 0:
             log("b04/fdr", f"FDR E{epoch:2d}/{args.fdr_epochs} loss={total_loss/max(n,1):.4f}")
 
+    torch.save(fdr.state_dict(), str(Path(args.output_dir) / "fdr_best.pt"))
     return fdr
 
 
