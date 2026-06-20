@@ -209,6 +209,7 @@ class FDRPredictor(nn.Module):
 
 def train_decoder(args, device):
     """训练 LightDecoder on iSAID tiles | Train LightDecoder on iSAID tiles."""
+    from PIL import Image
     from adatile.datasets.isaid_tiles import FastISAIDTileDataset
 
     logger.log_info("b04/decoder", "=" * 40)
@@ -218,10 +219,19 @@ def train_decoder(args, device):
     train_ds = FastISAIDTileDataset(args.tile_root, split="train", semantic=True)
     val_ds = FastISAIDTileDataset(args.tile_root, split="val", semantic=True)
 
-    # 限制训练数据 | Limit training data
-    max_tiles = min(len(train_ds), args.train_images * 8)
-    train_ds._tiles = train_ds._tiles[:max_tiles]
-    logger.log_info("b04/decoder", f"Train tiles: {len(train_ds)}, Val: {len(val_ds)}")
+    # 过滤: 只训练 fg_ratio > 1% 的 tile, 排除全背景 tile
+    # Filter: only train on tiles with fg_ratio > 1% to avoid all-background collapse
+    train_tiles_orig = list(train_ds._tiles)
+    train_tiles_fg = []
+    for fname in tqdm(train_tiles_orig, desc="  Filtering train tiles", leave=False):
+        mask = np.array(Image.open(train_ds._mask_dir / fname))
+        if (mask > 0).sum() / mask.size > 0.01:
+            train_tiles_fg.append(fname)
+    train_ds._tiles = train_tiles_fg
+    logger.log_info("b04/decoder",
+                    f"Train tiles: {len(train_ds)} (filtered from {len(train_tiles_orig)}, "
+                    f"kept {len(train_ds)/len(train_tiles_orig)*100:.1f}% with FG>1%)")
+    logger.log_info("b04/decoder", f"Val tiles: {len(val_ds)} (all)")
 
     # 快速诊断: 检查 val mask 是否有前景 | Quick diagnostic: any foreground in val?
     val_fg_count = 0
