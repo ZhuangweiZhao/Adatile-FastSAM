@@ -243,6 +243,9 @@ def train_decoder(args, device, log):
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.decoder_epochs, eta_min=1e-6)
     best_miou, best_state = 0.0, None
 
+    # 每 epoch 指标记录 | Per-epoch metrics log
+    metrics_path = Path(args.output_dir) / "decoder_metrics.jsonl"
+
     for epoch in range(1, args.decoder_epochs + 1):
         decoder.train()
         total_loss, n = 0.0, 0
@@ -296,10 +299,25 @@ def train_decoder(args, device, log):
                 valid += 1
         miou = miou_sum / max(valid, 1)
 
-        if epoch == 1 or epoch % 10 == 0 or epoch == args.decoder_epochs:
-            log("b04/decoder",
-                f"E{epoch:2d}/{args.decoder_epochs} loss={avg_loss:.4f} "
-                f"Val-FG-mIoU={miou:.4f} n_classes={valid}/{NUM_OUT_CH-1}")
+        # 每 epoch 打印 + 日志 + JSONL | Print + log + JSONL every epoch
+        epoch_metrics = {
+            "epoch": epoch, "loss": round(avg_loss, 6),
+            "val_fg_miou": round(miou, 6),
+            "val_n_classes": int(valid),
+        }
+        for c in range(1, NUM_OUT_CH):
+            if per_cls_union[c] > 0:
+                epoch_metrics[f"iou_cls{c}"] = round(
+                    (per_cls_inter[c] / per_cls_union[c]).item(), 6)
+
+        # 终端 + FileBackend | Console + FileBackend
+        log("b04/decoder",
+            f"E{epoch:2d}/{args.decoder_epochs} loss={avg_loss:.4f} "
+            f"FG-mIoU={miou:.4f}")
+        # 指标 JSONL (增量) | Metrics JSONL (append)
+        with open(metrics_path, "a") as mf:
+            mf.write(json.dumps(epoch_metrics) + "\n")
+            mf.flush()
 
         if miou > best_miou:
             best_miou = miou
@@ -345,6 +363,7 @@ def train_fdr(args, device, log):
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.fdr_epochs, eta_min=1e-6)
 
     FDR_FEAT = TILE_SIZE // 32
+    fdr_metrics_path = Path(args.output_dir) / "fdr_metrics.jsonl"
 
     for epoch in range(1, args.fdr_epochs + 1):
         fdr.train()
@@ -394,8 +413,12 @@ def train_fdr(args, device, log):
                 total_loss += loss.item(); n += 1
 
         sch.step()
-        if epoch == 1 or epoch % 5 == 0:
-            log("b04/fdr", f"FDR E{epoch:2d}/{args.fdr_epochs} loss={total_loss/max(n,1):.4f}")
+        # 每 epoch 打印 + 日志 + JSONL | Print + log + JSONL every epoch
+        fdr_epoch_loss = round(total_loss/max(n, 1), 6)
+        log("b04/fdr", f"FDR E{epoch:2d}/{args.fdr_epochs} loss={fdr_epoch_loss:.4f}")
+        with open(fdr_metrics_path, "a") as mf:
+            mf.write(json.dumps({"epoch": epoch, "loss": fdr_epoch_loss}) + "\n")
+            mf.flush()
 
     torch.save(fdr.state_dict(), str(Path(args.output_dir) / "fdr_best.pt"))
     return fdr
