@@ -290,33 +290,30 @@ def train_decoder(args, device, log):
         sch.step()
         avg_loss = total_loss / max(n, 1)
 
-        # Validation (2 sets: full val + FG>5% val)
+        # Validation (3 sets: train FG>5% + val full + val FG>5%)
         decoder.eval()
-        per_cls_inter = torch.zeros(NUM_OUT_CH, device=device)
-        per_cls_union = torch.zeros(NUM_OUT_CH, device=device)
-        per_cls_inter_fg5 = torch.zeros(NUM_OUT_CH, device=device)
-        per_cls_union_fg5 = torch.zeros(NUM_OUT_CH, device=device)
+        per_cls = {
+            "train": (torch.zeros(NUM_OUT_CH, device=device),
+                      torch.zeros(NUM_OUT_CH, device=device)),
+            "val_all": (torch.zeros(NUM_OUT_CH, device=device),
+                        torch.zeros(NUM_OUT_CH, device=device)),
+            "val_fg5": (torch.zeros(NUM_OUT_CH, device=device),
+                        torch.zeros(NUM_OUT_CH, device=device)),
+        }
         with torch.no_grad():
-            for batch in val_loader:
-                img = batch["image"].to(device)
-                tgt = batch["mask"].to(device)
-                feats = backbone(img)
-                logit = decoder(feats["p4"], target_size=tgt.shape[1:])
-                pred = logit.argmax(dim=1)
-                for c in range(1, NUM_OUT_CH):
-                    pc = (pred == c); tc = (tgt == c)
-                    per_cls_inter[c] += (pc & tc).sum().float()
-                    per_cls_union[c] += (pc | tc).sum().float()
-            for batch in val_fg5_loader:
-                img = batch["image"].to(device)
-                tgt = batch["mask"].to(device)
-                feats = backbone(img)
-                logit = decoder(feats["p4"], target_size=tgt.shape[1:])
-                pred = logit.argmax(dim=1)
-                for c in range(1, NUM_OUT_CH):
-                    pc = (pred == c); tc = (tgt == c)
-                    per_cls_inter_fg5[c] += (pc & tc).sum().float()
-                    per_cls_union_fg5[c] += (pc | tc).sum().float()
+            for key, loader in [("train", train_loader), ("val_all", val_loader),
+                                ("val_fg5", val_fg5_loader)]:
+                inter, union = per_cls[key]
+                for batch in loader:
+                    img = batch["image"].to(device)
+                    tgt = batch["mask"].to(device)
+                    feats = backbone(img)
+                    logit = decoder(feats["p4"], target_size=tgt.shape[1:])
+                    pred = logit.argmax(dim=1)
+                    for c in range(1, NUM_OUT_CH):
+                        pc = (pred == c); tc = (tgt == c)
+                        inter[c] += (pc & tc).sum().float()
+                        union[c] += (pc | tc).sum().float()
 
         def _calc_miou(inter, union):
             s, v = 0.0, 0
@@ -324,26 +321,38 @@ def train_decoder(args, device, log):
                 if union[c] > 0: s += (inter[c] / union[c]).item(); v += 1
             return s / max(v, 1), int(v)
 
-        miou, valid = _calc_miou(per_cls_inter, per_cls_union)
-        miou_fg5, valid_fg5 = _calc_miou(per_cls_inter_fg5, per_cls_union_fg5)
+        miou_train, valid_train = _calc_miou(*per_cls["train"])
+        miou_all, valid_all = _calc_miou(*per_cls["val_all"])
+        miou_fg5, valid_fg5 = _calc_miou(*per_cls["val_fg5"])
 
-        # 每 epoch 打印 + 日志 + JSONL | Print + log + JSONL every epoch
+        # 每 epoch 诊断 | Per-epoch diagnostics
         epoch_metrics = {
             "epoch": epoch, "loss": round(avg_loss, 6),
-            "fg_miou_all_val": round(miou, 6),
-            "fg_miou_fg5_val": round(miou_fg5, 6),
-            "n_classes_all": int(valid),
-            "n_classes_fg5": int(valid_fg5),
+            "miou_train": round(miou_train, 6),
+            "miou_val_all": round(miou_all, 6),
+            "miou_val_fg5": round(miou_fg5, 6),
         }
-        for c in range(1, NUM_OUT_CH):
-            if per_cls_union_fg5[c] > 0:
-                epoch_metrics[f"iou_fg5_cls{c}"] = round(
-                    (per_cls_inter_fg5[c] / per_cls_union_fg5[c]).item(), 6)
+        # 每 5 epoch 打印 per-class IoU + pred 分布 | Every 5 epochs: per-class IoU + pred distribution
+        if epoch == 1 or epoch % 5 == 0 or epoch == args.decoder_epochs:
+            # pred 类别分布 | Pred class distribution
+            inter_fg5, union_fg5 = per_cls["val_fg5"]
+            per_cls_iou = {}
+            for c in range(1, NUM_OUT_CH):
+                if union_fg5[c] > 0:
+                    iou_c = (inter_fg5[c] / union_fg5[c]).item()
+                    per_cls_iou[c] = round(iou_c, 4)
+                    epoch_metrics[f"iou_val_fg5_cls{c}"] = round(iou_c, 6)
+            log("b04/diag",
+                f"E{epoch:2d} pred_dist: bg={1-miou_train:.3f} "
+                f"(train_mIoU={miou_train:.3f}) "
+                f"val_fg5 IoU: {per_cls_iou}")
+        # per-class IoU already saved from per_cls_iou above
 
         # 终端 + FileBackend | Console + FileBackend
         log("b04/decoder",
             f"E{epoch:2d}/{args.decoder_epochs} loss={avg_loss:.4f} "
-            f"mIoU(all)={miou:.4f} mIoU(FG>5%)={miou_fg5:.4f}")
+            f"train={miou_train:.4f} val={miou_all:.4f}/{miou_fg5:.4f} "
+            f"(all/FG>5%)")
         # 指标 JSONL (增量) | Metrics JSONL (append)
         with open(metrics_path, "a") as mf:
             mf.write(json.dumps(epoch_metrics) + "\n")
