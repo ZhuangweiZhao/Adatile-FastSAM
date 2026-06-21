@@ -164,6 +164,36 @@ class CachedFDRDataset(Dataset):
 
 
 # ═══════════════════════════════════════════════════
+# Collate: pad images in batch to same size
+# ═══════════════════════════════════════════════════
+
+def pad_collate(batch):
+    """Pad images to max H/W in batch, keep gt_scores as-is."""
+    max_h = max(b["image"].shape[1] for b in batch)
+    max_w = max(b["image"].shape[2] for b in batch)
+
+    images, gt_scores, n_tys, n_txs = [], [], [], []
+    for b in batch:
+        img = b["image"]  # [3, H, W]
+        _, h, w = img.shape
+        if h < max_h or w < max_w:
+            padded = torch.zeros(3, max_h, max_w)
+            padded[:, :h, :w] = img
+            img = padded
+        images.append(img)
+        gt_scores.append(b["gt_scores"])
+        n_tys.append(b["n_ty"])
+        n_txs.append(b["n_tx"])
+
+    return {
+        "image": torch.stack(images),
+        "gt_scores": gt_scores,  # list of tensors (variable size)
+        "n_ty": n_tys,
+        "n_tx": n_txs,
+    }
+
+
+# ═══════════════════════════════════════════════════
 # Precompute GT cache
 # ═══════════════════════════════════════════════════
 
@@ -197,15 +227,15 @@ def train_fdr(model, train_loader, device, epochs, lr):
         total_loss, n = 0.0, 0
         for batch in train_loader:
             images = batch["image"].to(device)
-            gt_scores = batch["gt_scores"].to(device)
+            gt_scores_list = batch["gt_scores"]  # list of [n_ty, n_tx] tensors
 
             imp = model(images)
             _, _, Hf, Wf = imp.shape
 
             losses = []
             for i in range(images.size(0)):
-                n_ty_i = int(batch["n_ty"][i])
-                n_tx_i = int(batch["n_tx"][i])
+                n_ty_i = batch["n_ty"][i]
+                n_tx_i = batch["n_tx"][i]
                 imp_i = imp[i, 0]
 
                 preds = []
@@ -220,7 +250,7 @@ def train_fdr(model, train_loader, device, epochs, lr):
                         preds.append(imp_i[y0:y1, x0:x1].mean())
 
                 pred_t = torch.stack(preds).reshape(n_ty_i, n_tx_i)
-                gt_i = gt_scores[i, :n_ty_i, :n_tx_i]
+                gt_i = gt_scores_list[i].to(device)
                 losses.append(F.mse_loss(pred_t, gt_i))
 
             loss = torch.stack(losses).mean()
@@ -256,10 +286,10 @@ def evaluate_fdr(model, eval_loader, device):
         _, _, Hf, Wf = imp.shape
 
         for i in range(images.size(0)):
-            n_ty_i = int(batch["n_ty"][i])
-            n_tx_i = int(batch["n_tx"][i])
+            n_ty_i = batch["n_ty"][i]
+            n_tx_i = batch["n_tx"][i]
             imp_i = imp[i, 0].cpu().numpy()
-            gt_i = gt_scores[i, :n_ty_i, :n_tx_i].numpy()
+            gt_i = gt_scores[i].numpy()
 
             preds = np.zeros((n_ty_i, n_tx_i), dtype=np.float32)
             for ty in range(n_ty_i):
@@ -428,11 +458,12 @@ def main():
             train_ds = CachedFDRDataset(train_items, cache_dir)
             train_loader = DataLoader(train_ds, batch_size=args.batch_size,
                                       shuffle=True, num_workers=args.num_workers,
-                                      pin_memory=True, drop_last=False)
+                                      pin_memory=True, drop_last=False,
+                                      collate_fn=pad_collate)
             eval_ds = CachedFDRDataset(eval_images, cache_dir)
             eval_loader = DataLoader(eval_ds, batch_size=args.batch_size,
                                      shuffle=False, num_workers=min(2, args.num_workers),
-                                     pin_memory=True)
+                                     pin_memory=True, collate_fn=pad_collate)
 
             # 训练 | Train
             model = FDRModel().to(device)
