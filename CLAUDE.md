@@ -41,9 +41,11 @@ logger.log_info("phase", "Stage B complete", step=step)
 
 Every file, class, function, and non-obvious logic block must have Chinese + English bilingual comments.
 
-### 3. Test-Driven
+### 3. Test-Covered
 
-Each module: write tests first, then implementation. Tests must verify logging output.
+Core library modules should have tests verifying shape, value range, and edge cases.
+Current coverage: logging (16), metrics (13), losses (7), backbone (pending), decoder (4), spatial_router (5).
+Experiment scripts (tools/) are validated via dry-run, not unit tests.
 
 ### 4. Review Each Module
 
@@ -61,7 +63,7 @@ adatile/
 ├── backbone/        ✅ FastSAMBackbone (hook P4/P8, eval-mode enforced, freeze control)
 ├── config/          ✅ ExperimentConfig + ExperimentRecorder + generate_exp_id()
 ├── metrics/         ✅ compute_miou, compute_dice, FPSMeter, count_params
-├── decoder/         ✅ LinearProbe, FusionProbe, LightDecoder
+├── decoder/         ✅ LightDecoder (binary + multi-class), LinearProbe, FusionProbe
 ├── datasets/
 │   ├── base.py              ✅ BaseSegDataset
 │   ├── mass_buildings.py    ✅ MassBuildings tile dataset
@@ -69,7 +71,7 @@ adatile/
 │   └── isaid_tiles.py       ✅ FastISAIDTileDataset (pre-cut 1024×1024 tiles)
 ├── sparse/
 │   └── spatial_router.py    ✅ ForegroundDensityRouter, DensityHead, EdgeHead, TinyCNNRouter
-├── losses/           ⬜ Loss functions (skeleton only)
+├── losses/           ✅ FocalLoss, DiceLoss, CombinedLoss (extracted from train_b04.py)
 └── utils/
     └── seed.py       ✅ Unified set_seed() with cuDNN deterministic
 

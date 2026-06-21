@@ -197,9 +197,9 @@ class FastSAMBackbone(nn.Module):
                 # 直接调用底层 sequential model 的 forward
                 # Directly call underlying sequential model's forward
                 self.model.model.model(x)
-            except Exception:
-                # 如果直接调用失败，尝试通过 model.predict
-                # If direct call fails, try through model.predict
+            except (TypeError, AttributeError, RuntimeError) as e:
+                # Fallback: YOLO model API may require different call signature | API fallback
+                self.model.model(x)
                 self.model.model(x)
 
         # 分析各层输出的步长 | Analyze strides of each layer's output

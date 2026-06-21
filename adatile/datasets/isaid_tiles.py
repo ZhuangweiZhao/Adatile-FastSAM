@@ -84,14 +84,20 @@ class FastISAIDTileDataset(Dataset):
             mask_np = cv2.imread(str(self._mask_dir / fname), cv2.IMREAD_UNCHANGED)
             if mask_np is None:
                 raise ValueError(f"Corrupted mask: {fname}")
-        except Exception:
-            # 损坏文件 → 跳过, 随机选另一个 | Corrupted file → skip, pick another
+        except (IOError, OSError, ValueError):
+            # Corrupted file -> skip, with bounded retries | Bounded retries to prevent infinite recursion
             logger.log_info("data/skip_corrupted",
                             f"Skipping corrupted tile: {fname}, trying next")
+            if not hasattr(self, "_skip_count"):
+                self._skip_count = 0
+            self._skip_count += 1
+            if self._skip_count > min(100, len(self._tiles)):
+                raise RuntimeError(
+                    f"Too many corrupted tiles ({self._skip_count}). "
+                    f"Check data integrity or cv2/PIL installation."
+                )
             new_idx = (index + 1) % len(self._tiles)
             return self.__getitem__(new_idx)
-
-        img_t = torch.from_numpy(img_np).permute(2, 0, 1)  # [3, H, W]
 
         if self.semantic:
             # 类别 ID 0-15 → int64 标签 | Category IDs 0-15 → int64 labels

@@ -26,6 +26,7 @@ from adatile.datasets.isaid_tiles import FastISAIDTileDataset
 from adatile.backbone import FastSAMBackbone
 from adatile.logging import get_logger
 from adatile.logging.backends import ConsoleBackend, FileBackend
+from adatile.decoder.light_decoder import LightDecoder
 
 from PIL import Image
 import matplotlib
@@ -36,61 +37,6 @@ import matplotlib.pyplot as plt
 COLOR_MAP = [(255,0,0),(0,255,0),(0,0,255),(255,255,0),(255,0,255),
              (0,255,255),(128,0,0),(0,128,0),(0,0,128),(128,128,0),
              (128,0,128),(0,128,128),(255,128,0),(255,0,128),(128,255,0)]
-
-
-class LightDecoder(nn.Module):
-    """轻量解码器: P4 特征 → 分割掩码 | Lightweight decoder: P4 features → segmentation mask.
-
-    结构 | Structure:
-        P4 [B,1280,H/16,W/16] → Conv(1280→256→128) → Upsample×2
-        → Conv(128→64) → Upsample×2 → Conv(64→32) → Upsample
-        → Conv(32→num_classes) → [B,N,H,W]
-
-    Args:
-        in_channels: P4 特征通道数 | P4 feature channels (default 1280)
-        num_classes: 输出类别数 | Output classes
-    """
-    def __init__(self, in_channels=1280, num_classes=16):
-        super().__init__()
-        # Stage 1: 降维 + 特征提取 | Channel reduction + feature extraction
-        self.stage1 = nn.Sequential(
-            nn.Conv2d(in_channels, 256, 1, bias=False), nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(256, 128, 3, padding=1, bias=False), nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-        )
-        # Stage 2: 上采样后 128→64 | After upsample: 128→64
-        self.stage2 = nn.Sequential(
-            nn.Conv2d(128, 64, 3, padding=1, bias=False), nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-        )
-        # Stage 3: 上采样后 64→32 | After upsample: 64→32
-        self.stage3 = nn.Sequential(
-            nn.Conv2d(64, 32, 3, padding=1, bias=False), nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-        )
-        # Head: 1×1 逐像素分类 | 1×1 per-pixel classification
-        self.head = nn.Conv2d(32, num_classes, 1, bias=True)
-
-    def forward(self, p4, target_size=None):
-        """前向传播 | Forward pass.
-
-        Args:
-            p4: P4 特征 [B, 1280, H/16, W/16]
-            target_size: 可选目标输出尺寸 (H, W)
-
-        Returns:
-            logits: [B, num_classes, H, W]
-        """
-        x = self.stage1(p4)                                                     # 降维
-        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)  # 2× up
-        x = self.stage2(x)
-        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)  # 2× up
-        x = self.stage3(x)
-        x = self.head(x)
-        if target_size is not None:
-            x = F.interpolate(x, size=target_size, mode="bilinear", align_corners=False)
-        return x
 
 
 def train_eval(decoder, backbone, loader, epochs, device, binary, num_classes, log):
@@ -126,7 +72,7 @@ def train_eval(decoder, backbone, loader, epochs, device, binary, num_classes, l
                 tgt = (tgt > 0).long()
 
             feats = backbone(img)
-            logit = decoder(feats["p4"], target_size=tgt.shape[1:])
+            logit = decoder(feats, target_size=tgt.shape[1:])
 
             ce = F.cross_entropy(logit, tgt, ignore_index=255, reduction="none")
             loss = ((1 - torch.exp(-ce)) ** 5.0 * ce).mean()
@@ -147,7 +93,7 @@ def train_eval(decoder, backbone, loader, epochs, device, binary, num_classes, l
                     tgt = batch["mask"].to(device)
                     if binary: tgt = (tgt > 0).long()
                     feats = backbone(img)
-                    logit = decoder(feats["p4"], target_size=tgt.shape[1:])
+                    logit = decoder(feats, target_size=tgt.shape[1:])
                     pred = logit.argmax(dim=1)
                     probs = F.softmax(logit, dim=1)
 
@@ -211,7 +157,7 @@ def viz_pred(model, backbone, loader, output_path, device, binary, log):
         tgt_disp = (tgt > 0).long() if binary else tgt  # 二分类模式下只区分 FG/BG | Binary mode: FG/BG only
 
         feats = backbone(img)
-        logit = model(feats["p4"], target_size=tgt.shape[1:])
+        logit = model(feats, target_size=tgt.shape[1:])
         pred = logit.argmax(dim=1)[0].cpu().numpy()
         gt = tgt_disp[0].cpu().numpy()
         img_np = img[0].cpu().numpy().transpose(1, 2, 0)

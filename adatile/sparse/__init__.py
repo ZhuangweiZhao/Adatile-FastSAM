@@ -1,2 +1,26 @@
-# 骨架包：稀疏感知模块 | Skeleton package: sparse perception module
-"""adatile.sparse — 稀疏感知模块 (Ada-SPM) | Sparse perception module (Ada-SPM)."""
+"""
+adatile.sparse ? Spatial Sparsity Modules (Paper B).
+
+Exports:
+    DensityHead              ? Foreground density prediction head (~75K)
+    EdgeHead                 ? Edge-aware head (ablation only)
+    ForegroundDensityRouter  ? FDR mainline architecture
+    DualStreamRouter         ? Density + Edge fusion (ablation only)
+    TinyCNNRouter            ? Ultra-lightweight lower bound
+"""
+
+from adatile.sparse.spatial_router import (
+    DensityHead,
+    DualStreamRouter,
+    EdgeHead,
+    ForegroundDensityRouter,
+    TinyCNNRouter,
+)
+
+__all__ = [
+    "DensityHead",
+    "DualStreamRouter",
+    "EdgeHead",
+    "ForegroundDensityRouter",
+    "TinyCNNRouter",
+]

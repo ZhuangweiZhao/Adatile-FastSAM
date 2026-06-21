@@ -234,11 +234,13 @@ class FileBackend(LogBackend):
             return
         # 步骤1：等待队列中所有项目被处理（排空）
         # Step 1: wait for all queued items to be processed
-        self._queue.join()
-        # 步骤2：发送停止哨兵 | Step 2: send stop sentinel
-        self._running = False
+        # Step 1: send stop sentinel FIRST to wake writer from blocking get()
+        # (avoids deadlock: writer blocked on get() while close() blocks on join())
         self._queue.put(None)
-        # 步骤3：等待后台线程退出 | Step 3: wait for background thread to finish
+        # Step 2: wait for all items (including sentinel) to be processed
+        self._queue.join()
+        # Step 3: mark stopped
+        self._running = False
         if self._thread is not None:
             self._thread.join(timeout=10.0)
         # 步骤4：关闭文件句柄 | Step 4: close the file handle

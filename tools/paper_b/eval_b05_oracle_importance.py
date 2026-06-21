@@ -48,47 +48,12 @@ from adatile.logging import get_logger
 from adatile.logging.backends import ConsoleBackend, FileBackend
 from adatile.utils.seed import set_seed
 from adatile.backbone import FastSAMBackbone
+from adatile.decoder.light_decoder import LightDecoder
 
 TILE_SIZE = 1024
 NUM_CLASSES = 15
 NUM_OUT_CH = 16
 K_VALUES = [10, 20, 30, 40, 50, 70, 100]
-
-# ═══════════════════════════════════════════════════════════════════
-# LightDecoder (与 train_b04.py 内联版一致)
-# ═══════════════════════════════════════════════════════════════════
-
-class LightDecoder(nn.Module):
-    """FastSAM P4 → 16类分割 (mirrors train_b04.py)."""
-    def __init__(self, in_channels=1280, num_classes=16):
-        super().__init__()
-        self.stage1 = nn.Sequential(
-            nn.Conv2d(in_channels, 256, 1, bias=False), nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(256, 128, 3, padding=1, bias=False), nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-        )
-        self.stage2 = nn.Sequential(
-            nn.Conv2d(128, 64, 3, padding=1, bias=False), nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-        )
-        self.stage3 = nn.Sequential(
-            nn.Conv2d(64, 32, 3, padding=1, bias=False), nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-        )
-        self.head = nn.Conv2d(32, num_classes, 1, bias=True)
-
-    def forward(self, p4, target_size=None):
-        x = self.stage1(p4)
-        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
-        x = self.stage2(x)
-        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
-        x = self.stage3(x)
-        x = self.head(x)
-        if target_size is not None:
-            x = F.interpolate(x, size=target_size, mode="bilinear", align_corners=False)
-        return x
-
 
 # ═══════════════════════════════════════════════════════════════════
 # 语义掩码渲染
@@ -155,7 +120,7 @@ def extract_tiles_from_image(img_np, gt_mask, backbone, decoder, device):
             # Per-tile decoder forward (单独跑 → 算 IoU)
             tile_batch = tile_t.unsqueeze(0).to(device)
             feats = backbone(tile_batch)
-            logit = decoder(feats["p4"], target_size=(TILE_SIZE, TILE_SIZE))
+            logit = decoder(feats, target_size=(TILE_SIZE, TILE_SIZE))
             pred_tile = logit.argmax(dim=1).cpu().numpy()[0]
             gt_tile = gt_mask[y0:y0+th, x0:x0+tw]
 

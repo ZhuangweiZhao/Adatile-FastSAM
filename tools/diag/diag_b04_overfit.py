@@ -26,6 +26,7 @@ from adatile.datasets.isaid_tiles import FastISAIDTileDataset
 from adatile.backbone import FastSAMBackbone
 from adatile.logging import get_logger
 from adatile.logging.backends import ConsoleBackend
+from adatile.decoder.light_decoder import LightDecoder
 
 logger = get_logger("b04_diag")
 logger.add_backend(ConsoleBackend())
@@ -38,65 +39,6 @@ except ImportError:
 
 NUM_OUT_CH = 16  # 输出通道数 (含背景) | Output channels (including background)
 NUM_CLASSES = 15  # 前景类别数 | Foreground classes count
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Decoder (与 B-04 完全一致) | Decoder (identical to B-04)
-# ═══════════════════════════════════════════════════════════════════
-
-class LightDecoder(nn.Module):
-    """轻量解码器: P4 特征 → 分割掩码 | Lightweight decoder: P4 features → segmentation mask.
-
-    结构 | Structure:
-        P4 [B,1280,H/16,W/16] → Conv(1280→256→128) → Upsample×2
-        → Conv(128→64) → Upsample×2 → Conv(64→32) → Upsample
-        → Conv(32→num_classes) → [B,N,H,W]
-
-    Args:
-        in_channels: P4 特征通道数 | P4 feature channels (default 1280 for FastSAM-x)
-        num_classes: 输出类别数 (含背景) | Output classes including background
-    """
-    def __init__(self, in_channels=1280, num_classes=16):
-        super().__init__()
-        # Stage 1: 降维 1280→256→128 | Channel reduction 1280→256→128
-        self.stage1 = nn.Sequential(
-            nn.Conv2d(in_channels, 256, 1, bias=False),
-            nn.BatchNorm2d(256), nn.ReLU(inplace=True),
-            nn.Conv2d(256, 128, 3, padding=1, bias=False),
-            nn.BatchNorm2d(128), nn.ReLU(inplace=True),
-        )
-        # Stage 2: 上采样 + 128→64 | Upsample + 128→64
-        self.stage2_conv = nn.Sequential(
-            nn.Conv2d(128, 64, 3, padding=1, bias=False),
-            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
-        )
-        # Stage 3: 上采样 + 64→32 | Upsample + 64→32
-        self.stage3_conv = nn.Sequential(
-            nn.Conv2d(64, 32, 3, padding=1, bias=False),
-            nn.BatchNorm2d(32), nn.ReLU(inplace=True),
-        )
-        # Head: 32→num_classes, 1×1 逐像素分类 | 1×1 per-pixel classification
-        self.head = nn.Conv2d(32, num_classes, 1, bias=True)
-
-    def forward(self, p4, target_size=None):
-        """前向传播: P4 特征 → 分割 logits | Forward: P4 features → segmentation logits.
-
-        Args:
-            p4: P4 特征图 [B, 1280, H/16, W/16] | P4 feature map
-            target_size: 可选的目标输出尺寸 (H, W) | Optional target output size
-
-        Returns:
-            logits: [B, num_classes, H, W]
-        """
-        x = self.stage1(p4)                     # 降维 | Channel reduction
-        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)  # 2× up
-        x = self.stage2_conv(x)                  # 128→64
-        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)  # 2× up
-        x = self.stage3_conv(x)                  # 64→32
-        x = self.head(x)                         # 32→num_classes
-        if target_size is not None:
-            x = F.interpolate(x, size=target_size, mode="bilinear", align_corners=False)
-        return x
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -122,7 +64,7 @@ def visualize(model, backbone, loader, output_dir, device, n=5):
         tgt = batch["mask"][:1].to(device)
 
         feats = backbone(img)
-        logit = model(feats["p4"], target_size=tgt.shape[1:])
+        logit = model(feats, target_size=tgt.shape[1:])
         pred = logit.argmax(dim=1)[0].cpu().numpy()
         gt = tgt[0].cpu().numpy()
         img_np = img[0].cpu().numpy().transpose(1, 2, 0)
@@ -228,7 +170,7 @@ def overfit_test(args, device):
             img = batch["image"].to(device)
             tgt = batch["mask"].to(device)
             feats = backbone(img)
-            logit = decoder(feats["p4"], target_size=tgt.shape[1:])
+            logit = decoder(feats, target_size=tgt.shape[1:])
 
             # Focal Loss (γ=5.0): 针对极端不均衡 | For extreme class imbalance
             ce = F.cross_entropy(logit, tgt, ignore_index=255, reduction="none")
@@ -249,7 +191,7 @@ def overfit_test(args, device):
                     img = batch["image"].to(device)
                     tgt = batch["mask"].to(device)
                     feats = backbone(img)
-                    logit = decoder(feats["p4"], target_size=tgt.shape[1:])
+                    logit = decoder(feats, target_size=tgt.shape[1:])
                     pred = logit.argmax(dim=1)
                     bg_ratio += (pred == 0).float().mean().item()
                     # Per-class IoU: 只统计前景类 | Only foreground classes

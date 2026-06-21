@@ -54,48 +54,13 @@ from adatile.logging import get_logger
 from adatile.logging.backends import ConsoleBackend, FileBackend
 from adatile.utils.seed import set_seed
 from adatile.backbone import FastSAMBackbone
+from adatile.decoder.light_decoder import LightDecoder
 
 NUM_CLASSES = 15
 NUM_OUT_CH = 16
 K_VALUES = [10, 20, 30, 40, 50, 70, 100]
 DEFAULT_TILE_SIZES = [256, 384, 512, 768, 1024]
 STRIDE = 32  # FastSAM stride
-
-
-# ═══════════════════════════════════════════════════════════════
-# LightDecoder
-# ═══════════════════════════════════════════════════════════════
-
-class LightDecoder(nn.Module):
-    """FastSAM P4 → 16-class, mirrors train_b04.py."""
-    def __init__(self, in_channels=1280, num_classes=16):
-        super().__init__()
-        self.stage1 = nn.Sequential(
-            nn.Conv2d(in_channels, 256, 1, bias=False), nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(256, 128, 3, padding=1, bias=False), nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-        )
-        self.stage2 = nn.Sequential(
-            nn.Conv2d(128, 64, 3, padding=1, bias=False), nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-        )
-        self.stage3 = nn.Sequential(
-            nn.Conv2d(64, 32, 3, padding=1, bias=False), nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-        )
-        self.head = nn.Conv2d(32, num_classes, 1, bias=True)
-
-    def forward(self, p4, target_size=None):
-        x = self.stage1(p4)
-        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
-        x = self.stage2(x)
-        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
-        x = self.stage3(x)
-        x = self.head(x)
-        if target_size is not None:
-            x = F.interpolate(x, size=target_size, mode="bilinear", align_corners=False)
-        return x
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -188,7 +153,7 @@ def analyze_one_image(img_np, gt_full, tile_size, backbone, decoder, device):
             ).permute(2, 0, 1).unsqueeze(0).to(device)
 
             feats = backbone(tile_t)
-            logit = decoder(feats["p4"], target_size=(pad_h, pad_w))
+            logit = decoder(feats, target_size=(pad_h, pad_w))
             pred_full = logit.argmax(dim=1).cpu().numpy()[0]  # [pad_h, pad_w]
             pred_tile = pred_full[:th, :tw]  # crop back to actual tile
 

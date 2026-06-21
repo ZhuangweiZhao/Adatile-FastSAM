@@ -41,6 +41,9 @@ from adatile.logging.backends import ConsoleBackend, FileBackend
 from adatile.utils.seed import set_seed
 from adatile.backbone import FastSAMBackbone
 from adatile.datasets.isaid_tiles import FastISAIDTileDataset
+from adatile.utils.render import render_semantic_mask
+from tools.train.fdr_predictor import FDRPredictor
+from adatile.decoder.light_decoder import LightDecoder
 
 TILE_SIZE = 1024
 NUM_CLASSES = 15
@@ -49,27 +52,6 @@ RARE_CLASSES = {12: 5, 14: 5, 15: 5}  # pool/soccer/plane ×5 oversample
 MAX_DECODE_BATCH = 16  # max tiles in one decode batch (OOM guard)
 
 
-def _render_semantic_mask(annotations: list, h: int, w: int) -> np.ndarray:
-    """渲染语义掩码 [H,W] uint8 | Render semantic mask.
-    直接使用 ann["category_id"]（映射已在预处理中完成 | mapping done in preprocessing）."""
-    import cv2
-    sem = np.zeros((h, w), dtype=np.uint8)
-    for ann in annotations:
-        cat_id = ann.get("category_id", 0)
-        if cat_id <= 0: continue
-        seg = ann.get("segmentation", [])
-        if not seg:
-            bbox = ann.get("bbox", [0,0,0,0])
-            sem[max(0,int(bbox[1])):min(h,int(bbox[1]+bbox[3])),
-                max(0,int(bbox[0])):min(w,int(bbox[0]+bbox[2]))] = cat_id
-            continue
-        if isinstance(seg, dict): continue
-        for poly in (seg if isinstance(seg[0], list) else [seg]):
-            pts = np.array(poly, dtype=np.int32).reshape(-1,1,2)
-            pts[:,:,0] = np.clip(pts[:,:,0], 0, w-1)
-            pts[:,:,1] = np.clip(pts[:,:,1], 0, h-1)
-            cv2.fillPoly(sem, [pts], cat_id)
-    return sem
 
 
 def parse_args():
@@ -104,170 +86,6 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42,
                    help="随机种子 | Random seed")
     return p.parse_args()
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Light Decoder (渐进上采样, Exp1 验证有效)
-# ═══════════════════════════════════════════════════════════════════
-
-class LightDecoder(nn.Module):
-    """
-    FastSAM P4 → 三步渐进上采样 → 16类分割 | FastSAM P4 → three-step progressive upsampling → 16-class segmentation.
-
-    P4 [B,1280,H/16,W/16] → Conv 1280→64 → Upsample×2 → Conv 64→64 → Upsample×2
-    → Conv 64→32 → Upsample×2 → Conv 32→32 → Upsample → Conv 32→C.
-
-    ~800K 参数, 设计用于大尺寸 tile (1024×1024) 的快速推理。
-    ~800K params, designed for fast inference on large tiles (1024×1024).
-    """
-
-    def __init__(self, in_channels=1280, num_classes=16):
-        """初始化渐进上采样解码器 | Initialize progressive upsampling decoder."""
-        super().__init__()
-        self.stage1 = nn.Sequential(
-            nn.Conv2d(in_channels, 256, 1, bias=False), nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(256, 128, 3, padding=1, bias=False), nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-        )
-        self.stage2 = nn.Sequential(
-            nn.Conv2d(128, 64, 3, padding=1, bias=False), nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-        )
-        self.stage3 = nn.Sequential(
-            nn.Conv2d(64, 32, 3, padding=1, bias=False), nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-        )
-        self.head = nn.Conv2d(32, num_classes, 1, bias=True)
-
-    def forward(self, p4, target_size=None):
-        """前向传播: 三步上采样 → 分割 logits | Forward: three-step upsample → segmentation logits."""
-        # Stage 1: 1280→256→128, 上采样 ×2 | 1280→256→128, upsample ×2
-        x = self.stage1(p4)
-        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
-        # Stage 2: 128→64, 上采样 ×2 | 128→64, upsample ×2
-        x = self.stage2(x)
-        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
-        # Stage 3: 64→32, 上采样 ×2 → head | 64→32, upsample ×2 → head
-        x = self.stage3(x)
-        x = self.head(x)
-        # 最终上采样到目标分辨率 | Final upsample to target resolution
-        if target_size is not None:
-            x = F.interpolate(x, size=target_size, mode="bilinear", align_corners=False)
-        return x
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Tile Dataset (FG>5% 过滤 + 稀有类过采样)
-# ═══════════════════════════════════════════════════════════════════
-
-def build_train_dataset(tile_root, log):
-    """构建训练数据集：FG>5% 过滤 + 稀有类过采样 | Build training dataset: FG>5% filter + rare class oversampling.
-
-    两步处理 | Two-step processing:
-    1. FG>5% 过滤: 丢弃前景占比 ≤5% 的 tile (主要是 BG 为主的 tile)
-       FG>5% filter: discard tiles with ≤5% foreground (mostly BG-dominated tiles)
-    2. 稀有类过采样: pool/soccer/plane 等少数类 ×5 复制
-       Rare class oversampling: pool/soccer/plane ×5 replication
-    """
-    from PIL import Image
-
-    ds = FastISAIDTileDataset(tile_root, split="train", semantic=True)
-    log("b04/data", f"All train tiles: {len(ds)}")
-
-    # 过滤 FG>5% | Filter FG>5%
-    fg5_tiles, fg5_class_info = [], []
-    for fname in tqdm(ds._tiles, desc="  Filter FG>5%"):
-        mask = np.array(Image.open(ds._mask_dir / fname))
-        fg_r = (mask > 0).sum() / mask.size
-        if fg_r > 0.05:
-            fg5_tiles.append(fname)
-            # 记录包含哪些稀有类 | Track which rare classes present
-            has_rare = [c for c in RARE_CLASSES if (mask == c).sum() > 0]
-            fg5_class_info.append(has_rare)
-
-    log("b04/data",
-        f"FG>5% tiles: {len(fg5_tiles)} ({len(fg5_tiles)/len(ds)*100:.1f}%)")
-
-    # 稀有类过采样 | Rare class oversampling
-    for c, factor in RARE_CLASSES.items():
-        tiles_with_c = [(t, info) for t, info in zip(fg5_tiles, fg5_class_info)
-                        if c in info]
-        n_orig = len(tiles_with_c)
-        for _ in range(n_orig * (factor - 1)):
-            fg5_tiles.append(tiles_with_c[_ % n_orig][0])
-        log("b04/data",
-            f"  Class{c}: {n_orig} tiles → {n_orig * factor} (×{factor})")
-
-    ds._tiles = fg5_tiles
-    log("b04/data", f"Final train tiles: {len(ds)} (with oversampling)")
-    return ds
-
-
-# ═══════════════════════════════════════════════════════════════════
-# FDR (B-03 主线)
-# ═══════════════════════════════════════════════════════════════════
-
-class FDRPredictor(nn.Module):
-    """
-    FDR (Foreground Density Router) | 前景密度路由器.
-
-    冻结 MV3 backbone → DensityHead → 输出 tile 重要性分数。
-    训练目标：预测每个 tile 的 fg_ratio (前景像素占比)。
-    Frozen MV3 backbone → DensityHead → outputs tile importance scores.
-    Training target: predict fg_ratio (foreground pixel fraction) per tile.
-    """
-
-    def __init__(self):
-        """初始化 FDR: 冻结 MV3 + 可训练 DensityHead | Init FDR: frozen MV3 + trainable DensityHead."""
-        super().__init__()
-        import torchvision.models as models
-        mnet = models.mobilenet_v3_small(weights="DEFAULT")
-        self.backbone = mnet.features
-        for p in self.backbone.parameters():
-            p.requires_grad = False
-        from adatile.sparse.spatial_router import DensityHead
-        self.density_head = DensityHead(576, 128)
-
-    def forward(self, x):
-        """前向传播：backbone → density head → 重要性图 | Forward: backbone → density head → importance map."""
-        return self.density_head(self.backbone(x))
-
-    @torch.no_grad()
-    def predict_tile_scores(self, img_np, device):
-        """预测每张图像上所有 tile 的重要性分数 | Predict importance scores for all tiles on an image.
-
-        流程 | Flow:
-        1. 缩放图像到固定尺寸 → 前向 → 得到重要性图
-           Resize image to fixed size → forward → get importance map
-        2. 将重要性图按 tile grid 分块 → 每块取均值作为 tile score
-           Divide importance map by tile grid → per-tile mean = score
-        """
-        from PIL import Image
-        H, W = img_np.shape[:2]
-        scale = 2048 / max(H, W)
-        nH, nW = int(H*scale), int(W*scale)
-        img_r = np.array(Image.fromarray(img_np).resize((nW, nH), Image.BILINEAR))
-        ph, pw = (32-nH%32)%32, (32-nW%32)%32
-        if ph>0 or pw>0:
-            img_r = np.pad(img_r, ((0,ph),(0,pw),(0,0)), mode="constant")
-        img_t = torch.from_numpy(img_r.astype(np.float32)/255.0)
-        img_t = img_t.permute(2,0,1).unsqueeze(0).to(device)
-        imp = self.forward(img_t)
-        hp, wp = imp.shape[2], imp.shape[3]
-        n_ty = (H+TILE_SIZE-1)//TILE_SIZE
-        n_tx = (W+TILE_SIZE-1)//TILE_SIZE
-        scores = np.zeros((n_ty, n_tx), dtype=np.float32)
-        for ty in range(n_ty):
-            for tx in range(n_tx):
-                y0 = int(ty*TILE_SIZE*scale/2048*hp)
-                y1 = int(min(ty*TILE_SIZE+TILE_SIZE, H)*scale/2048*hp)
-                x0 = int(tx*TILE_SIZE*scale/2048*wp)
-                x1 = int(min(tx*TILE_SIZE+TILE_SIZE, W)*scale/2048*wp)
-                y0, y1 = max(0,min(y0,hp-1)), max(y0+1,min(y1,hp))
-                x0, x1 = max(0,min(x0,wp-1)), max(x0+1,min(x1,wp))
-                scores[ty,tx] = float(imp[0,0,y0:y1,x0:x1].mean())
-        return scores
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -330,7 +148,7 @@ def train_decoder(args, device, log):
             img = batch["image"].to(device)
             tgt = batch["mask"].to(device)
             feats = backbone(img)
-            logit = decoder(feats["p4"], target_size=tgt.shape[1:])
+            logit = decoder(feats, target_size=tgt.shape[1:])
 
             # Focal γ=5.0 + Dice 组合损失 | Focal γ=5.0 + Dice combined loss
             # Focal: 对难例加权，缓解类别不平衡 | Focal: hard-example weighting for class imbalance
@@ -373,7 +191,7 @@ def train_decoder(args, device, log):
                     img = batch["image"].to(device)
                     tgt = batch["mask"].to(device)
                     feats = backbone(img)
-                    logit = decoder(feats["p4"], target_size=tgt.shape[1:])
+                    logit = decoder(feats, target_size=tgt.shape[1:])
                     pred = logit.argmax(dim=1)
                     for c in range(1, NUM_OUT_CH):
                         pc = (pred == c); tc = (tgt == c)
@@ -484,7 +302,7 @@ def train_fdr(args, device, log):
             from PIL import Image
             img = np.array(Image.open(img_path).convert("RGB"))
             H, W = img.shape[:2]
-            mask = _render_semantic_mask(anns, H, W)
+            mask = render_semantic_mask(anns, H, W)
 
             scale = args.image_size / max(H, W)
             nH, nW = int(H*scale), int(W*scale)
@@ -589,7 +407,7 @@ def evaluate_dynamic(args, fdr, decoder, backbone, device, log):
         from PIL import Image
         img_np = np.array(Image.open(img_path).convert("RGB"))
         H, W = img_np.shape[:2]
-        gt_mask = _render_semantic_mask(anns, H, W)
+        gt_mask = render_semantic_mask(anns, H, W)
 
         # FDR 预测 tile 重要性 | FDR predicts tile importance
         tile_scores = fdr.predict_tile_scores(img_np, device)
@@ -637,7 +455,7 @@ def evaluate_dynamic(args, fdr, decoder, backbone, device, log):
                     torch.cuda.synchronize()
                     t0 = time.perf_counter()
                     feats = backbone(batch)
-                    logits = decoder(feats["p4"], target_size=(TILE_SIZE, TILE_SIZE))
+                    logits = decoder(feats, target_size=(TILE_SIZE, TILE_SIZE))
                     preds = logits.argmax(dim=1).cpu().numpy()
                     torch.cuda.synchronize()
                     t_dec_total += time.perf_counter() - t0

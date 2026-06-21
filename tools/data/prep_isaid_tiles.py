@@ -76,68 +76,6 @@ def parse_args():
                    help="只检查不执行 | Only check, don't execute")
     return p.parse_args()
 
-
-def render_semantic_mask(annotations: list, h: int, w: int) -> np.ndarray:
-    """
-    渲染语义掩码 [H, W] uint8 (值 0-15) | Render semantic mask.
-
-    直接使用 ann["category_id"]。映射已在 prep_isaid.py fix_annotations() 中完成。
-    Uses ann["category_id"] directly. Mapping is done by prep_isaid.py fix_annotations().
-
-    优化: 使用 cv2.fillPoly, 避免 PIL 逐多边形开销。
-    Optimized: uses cv2.fillPoly, avoids PIL per-polygon overhead.
-    """
-    sem = np.zeros((h, w), dtype=np.uint8)
-    try:
-        import cv2
-        _has_cv2 = True
-    except ImportError:
-        _has_cv2 = False
-
-    for ann in annotations:
-        # 直接使用 category_id, 不再二次映射。
-        # prep_isaid.py fix_annotations() 已将原始 ID 映射为 ISAID ID (0-15)。
-        # Use category_id directly, no double-mapping.
-        # prep_isaid.py fix_annotations() already mapped original → ISAID ID (0-15).
-        cat_id = ann.get("category_id", 0)
-        if cat_id <= 0 or cat_id > 15:
-            continue
-
-        seg = ann.get("segmentation", [])
-        if not seg:
-            bbox = ann.get("bbox", [0, 0, 0, 0])
-            x, y, bw, bh = bbox
-            x1, y1 = max(0, int(x)), max(0, int(y))
-            x2, y2 = min(w, int(x + bw)), min(h, int(y + bh))
-            sem[y1:y2, x1:x2] = cat_id
-            continue
-        if isinstance(seg, dict):
-            continue
-
-        polys = seg if isinstance(seg[0], list) else [seg]
-        for poly in polys:
-            pts = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
-            pts[:, :, 0] = np.clip(pts[:, :, 0], 0, w - 1)
-            pts[:, :, 1] = np.clip(pts[:, :, 1], 0, h - 1)
-
-            if _has_cv2:
-                cv2.fillPoly(sem, [pts], cat_id)
-            else:
-                # PIL fallback (slower)
-                from PIL import Image, ImageDraw
-                mask_pil = Image.new("L", (w, h), 0)
-                ImageDraw.Draw(mask_pil).polygon(
-                    [(int(p[0]), int(p[1])) for p in pts.reshape(-1, 2)],
-                    fill=cat_id)
-                sem = np.where(np.array(mask_pil) > 0, cat_id, sem)
-
-    return sem
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Step 1: 生成全图语义掩码 | Generate full-image semantic masks
-# ═══════════════════════════════════════════════════════════════════
-
 def _step1_worker(args_tuple: tuple) -> dict:
     """单图 worker: 渲染 + 保存全图 mask (独立进程) | Single-image worker: render + save full-image mask (separate process)."""
     from PIL import Image
@@ -475,3 +413,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+from adatile.utils.render import render_semantic_mask

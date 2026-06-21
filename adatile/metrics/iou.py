@@ -69,7 +69,7 @@ def compute_miou(
     target_labels = _normalize_mask_values(target_labels)
 
     # ── 逐类别计算 IoU | Per-class IoU ──
-    ious: dict[str, float] = {}
+    per_class: list[dict] = []
     total_iou = 0.0
     valid_classes = 0
 
@@ -90,21 +90,20 @@ def compute_miou(
         union = (pred_cls | target_cls).sum().float()
 
         if union > 0:
-            iou = (intersection + eps) / (union + eps)
+            iou_val = (intersection + eps) / (union + eps)
         else:
             # 该类别在 pred 和 target 中都不存在 → 跳过
             # Class not present in pred or target → skip
             continue
 
-        ious[f"iou_cls_{cls_idx}"] = iou.item()
-        total_iou += iou.item()
+        per_class.append({"class": cls_idx, "iou": iou_val.item()})
+        total_iou += iou_val.item()
         valid_classes += 1
 
     # 平均 IoU | Mean IoU
     miou = total_iou / max(valid_classes, 1)
-    ious["miou"] = miou
 
-    return ious
+    return {"miou": miou, "per_class": per_class}
 
 
 def _normalize_mask_values(mask: torch.Tensor) -> torch.Tensor:

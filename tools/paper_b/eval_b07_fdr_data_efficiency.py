@@ -132,38 +132,51 @@ class CachedFDRDataset(Dataset):
 
     def __getitem__(self, idx):
         from PIL import Image
-        img_id, img_path, _anns = self.items[idx]
+        img_id, img_path, anns = self.items[idx]
 
         img = np.array(Image.open(img_path).convert("RGB"))
         H, W = img.shape[:2]
 
-        # Resize
+        # Resize image
         scale = self.target_size / max(H, W)
         nH, nW = int(H * scale), int(W * scale)
         img_r = np.array(Image.fromarray(img).resize((nW, nH), Image.BILINEAR))
 
-        # Pad to 32
+        # Render + resize mask to same coordinate space
+        from adatile.utils.render import render_semantic_mask
+        mask = render_semantic_mask(anns, H, W)
+        mask_r = np.array(Image.fromarray(mask).resize((nW, nH), Image.NEAREST))
+
+        # Pad to stride
         ph = (self.stride - nH % self.stride) % self.stride
         pw = (self.stride - nW % self.stride) % self.stride
         if ph > 0 or pw > 0:
             img_r = np.pad(img_r, ((0, ph), (0, pw), (0, 0)), mode="constant")
+            mask_r = np.pad(mask_r, ((0, ph), (0, pw)), mode="constant", constant_values=255)
+
+        # Compute GT tile scores from RESIZED mask (same coordinate space as model input)
+        pH, pW = img_r.shape[:2]
+        n_ty = (pH + TILE_SIZE - 1) // TILE_SIZE
+        n_tx = (pW + TILE_SIZE - 1) // TILE_SIZE
+        gt_scores = np.zeros((n_ty, n_tx), dtype=np.float32)
+        for ty in range(n_ty):
+            for tx in range(n_tx):
+                y0, y1 = ty * TILE_SIZE, min(ty * TILE_SIZE + TILE_SIZE, pH)
+                x0, x1 = tx * TILE_SIZE, min(tx * TILE_SIZE + TILE_SIZE, pW)
+                tm = mask_r[y0:y1, x0:x1]
+                valid = (tm != 255).sum()
+                fg = ((tm > 0) & (tm != 255)).sum()
+                gt_scores[ty, tx] = fg / max(valid, 1)
 
         img_t = torch.from_numpy(img_r.astype(np.float32) / 255.0)
         img_t = img_t.permute(2, 0, 1)
 
-        cached = np.load(self.cache_dir / f"{img_id}.npz")
-        gt_scores = torch.from_numpy(cached["gt_scores"])
-        n_ty, n_tx = int(cached["n_ty"]), int(cached["n_tx"])
-
         return {
             "image": img_t,
-            "gt_scores": gt_scores,
+            "gt_scores": torch.from_numpy(gt_scores),
             "n_ty": n_ty,
             "n_tx": n_tx,
         }
-
-
-# ═══════════════════════════════════════════════════
 # Collate: pad images in batch to same size
 # ═══════════════════════════════════════════════════
 
@@ -572,11 +585,13 @@ def main():
 
     # ── 4. FDR-SES | 数据效率评分 ──
     sr_100 = all_results[100]["sr_mean"]
-    sr_5 = all_results[5]["sr_mean"]
-    fdr_ses = sr_5 / max(sr_100, 1e-8)
+    # Use smallest fraction available for SES
+    min_fraction = min(data_fractions)
+    sr_min = all_results[min_fraction]["sr_mean"]
+    fdr_ses = sr_min / max(sr_100, 1e-8)
 
     logger.log_info("b07/ses",
-                    f"FDR-SES = r(5%)/r(100%) = {sr_5:.4f}/{sr_100:.4f} = {fdr_ses:.3f}")
+                    f"FDR-SES = r({min_fraction}%)/r(100%) = {sr_min:.4f}/{sr_100:.4f} = {fdr_ses:.3f}")
     logger.log_info("b07/ses",
                     f"→ 5% data retains {fdr_ses*100:.1f}% of full-data ranking quality")
 

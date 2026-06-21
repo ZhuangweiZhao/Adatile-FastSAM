@@ -189,41 +189,45 @@ class ForegroundDensityRouter(nn.Module):
         self, importance_map: torch.Tensor, n_ty: int, n_tx: int
     ) -> torch.Tensor:
         """
-        重要性图 → tile 分数 (平均池化) | Importance map → tile scores (average pool).
+        Importance map => tile scores (average pool).
+
+        Vectorized via F.adaptive_avg_pool2d (2026-06-21).
+        Replaces O(B * n_ty * n_tx) Python loop with single GPU kernel.
         """
-        B, _, hp, wp = importance_map.shape
-        scores = []
-        for b in range(B):
-            for ty in range(n_ty):
-                for tx in range(n_tx):
-                    y0 = ty * self.tile_size_feat
-                    y1 = min(y0 + self.tile_size_feat, hp)
-                    x0 = tx * self.tile_size_feat
-                    x1 = min(x0 + self.tile_size_feat, wp)
-                    if y1 > y0 and x1 > x0:
-                        scores.append(
-                            importance_map[b, 0, y0:y1, x0:x1].mean()
-                        )
-        return torch.stack(scores) if scores else torch.zeros(0)
+        # F.adaptive_avg_pool2d to (n_ty, n_tx) handles edge tiles + batch-vectorized
+        scores = F.adaptive_avg_pool2d(
+            importance_map, (n_ty, n_tx)
+        )  # [B, 1, n_ty, n_tx]
+        return scores.flatten()  # [B * n_ty * n_tx]
 
     def select_tiles(
         self, importance_map: torch.Tensor, n_ty: int, n_tx: int, k: float = 0.4
     ) -> torch.Tensor:
         """
-        Top-K tile 硬选择 (推理用) | Hard Top-K tile selection (for inference).
+        Top-K tile hard selection (for inference).
 
-        返回 mask [B, n_ty, n_tx] bool.
+        Vectorized via adaptive_avg_pool2d + batched topk (2026-06-21).
+        Returns mask [B, n_ty, n_tx] bool.
         """
-        scores = self.tile_scores(importance_map, n_ty, n_tx)
         B = importance_map.shape[0]
         n_total = n_ty * n_tx
-        scores_2d = scores.reshape(B, n_ty, n_tx)
         n_keep = max(1, int(n_total * k))
-        mask = torch.zeros(B, n_ty, n_tx, dtype=torch.bool, device=scores.device)
-        for b in range(B):
-            _, top_idx = torch.topk(scores_2d[b].flatten(), n_keep)
-            mask[b, top_idx // n_tx, top_idx % n_tx] = True
+
+        # Vectorized tile scores => [B, 1, n_ty, n_tx]
+        scores = F.adaptive_avg_pool2d(
+            importance_map, (n_ty, n_tx)
+        )  # [B, 1, n_ty, n_tx]
+
+        # Batched topk: scores [B, n_total] => indices [B, n_keep]
+        scores_flat = scores.flatten(1)  # [B, n_total]
+        _, top_idx = torch.topk(scores_flat, n_keep, dim=1)  # [B, n_keep]
+
+        # Scatter into boolean mask [B, n_ty, n_tx]
+        mask = torch.zeros(B, n_total, dtype=torch.bool, device=scores.device)
+        mask.scatter_(1, top_idx, True)
+        mask = mask.reshape(B, n_ty, n_tx)
         return mask
+
 
 
 # ═══════════════════════════════════════════════════════════════════
