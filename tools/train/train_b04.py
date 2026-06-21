@@ -84,6 +84,10 @@ def parse_args():
                    help="Decoder 训练轮数 | Decoder training epochs")
     p.add_argument("--fdr-epochs", type=int, default=20,
                    help="FDR 训练轮数 | FDR training epochs")
+    p.add_argument("--skip-decoder", action="store_true",
+                   help="跳过 Decoder 训练，直接加载 checkpoint | Skip decoder training")
+    p.add_argument("--decoder-ckpt", type=str, default=None,
+                   help="Decoder 权重 .pt 路径 | Decoder checkpoint path")
     p.add_argument("--lr", type=float, default=1e-3,
                    help="学习率 | Learning rate")
     p.add_argument("--batch-size", type=int, default=8,
@@ -711,8 +715,15 @@ def main():
 
     log("b04/start", f"B-04 Dynamic Tile Selection | device={device}")
 
-    # Step 1: Train Decoder | 训练解码器
-    decoder, backbone, dec_miou = train_decoder(args, device, log)
+    # Step 1: Train Decoder (or load checkpoint) | 训练解码器（或加载权重）
+    if args.skip_decoder and args.decoder_ckpt:
+        backbone = FastSAMBackbone(freeze_backbone=True).eval()
+        decoder = LightDecoder(1280, NUM_OUT_CH).to(device)
+        decoder.load_state_dict(torch.load(args.decoder_ckpt, map_location=device))
+        dec_miou = 0.4817  # E20 best from b04_v3
+        log("b04/start", f"Loaded decoder from {args.decoder_ckpt} | 已加载解码器权重")
+    else:
+        decoder, backbone, dec_miou = train_decoder(args, device, log)
 
     # Step 2: Train FDR | 训练 FDR
     fdr = train_fdr(args, device, log)
