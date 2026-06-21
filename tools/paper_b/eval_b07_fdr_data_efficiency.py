@@ -24,7 +24,7 @@ B-02.5 已证明类别无关。B-07 回答第三个维度：数据效率。
         --output-dir runs/b07_fdr_efficiency
 """
 
-import sys, argparse, json, datetime
+import sys, argparse, json, datetime, time
 from pathlib import Path
 from collections import defaultdict
 import numpy as np
@@ -232,8 +232,6 @@ def train_fdr(model, train_loader, eval_loader, device, epochs, lr,
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-6)
     best_loss, best_state = float("inf"), None
     epoch_metrics = []
-
-    from scipy.stats import spearmanr as sr_func
 
     for epoch in range(1, epochs + 1):
         t0 = time.perf_counter()
@@ -484,7 +482,6 @@ def main():
     build_cache(train_pool + eval_images, cache_dir)
 
     # ── 3. Per data% × seed: train + eval | 逐比例训练评估 ──
-    import time as time_module
     total_runs = len(data_fractions) * args.seeds
     run_idx = 0
     all_results = {}
@@ -503,7 +500,7 @@ def main():
             seed = base_seed + seed_idx
             set_seed(seed)
             tag = f"b07/{tag_d}/S{seed_idx}"
-            t_start = time_module.perf_counter()
+            t_start = time.perf_counter()
 
             # 日志: run header | Log: run header
             logger.log_info("b07/run_start",
@@ -544,7 +541,7 @@ def main():
             sr, fg40 = evaluate_fdr(model, eval_loader, device)
             sr_list.append(sr)
             fg_list.append(fg40)
-            dt = time_module.perf_counter() - t_start
+            dt = time.perf_counter() - t_start
 
             logger.log_info("b07/run_done",
                             f"Run {run_idx}/{total_runs} done | "
