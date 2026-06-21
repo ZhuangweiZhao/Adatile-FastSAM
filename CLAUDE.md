@@ -74,16 +74,17 @@ adatile/
     └── seed.py       ✅ Unified set_seed() with cuDNN deterministic
 
 tools/
-├── Data preprocessing:
+├── data/                            # Data preprocessing
 │   ├── prep_isaid.py                iSAID COCO → category-id masks (Step 0)
 │   ├── prep_isaid_tiles.py          Full pipeline: render mask → cut tiles → metadata
-│   └── prep_cityscapes.py           Cityscapes → tile format
+│   ├── prep_cityscapes.py           Cityscapes → tile format
+│   └── fix_labels.py                Repair tool: fix category ID mapping in instances JSON
 │
-├── Training:
-│   ├── train_isaid_multiclass.py    iSAID multi-class training entry point
-│   └── test_isaid_loader.py         Dataset loader validation
+├── train/                           # Training entry points
+│   ├── train_isaid_mc.py            iSAID multi-class training entry point
+│   └── train_b04.py                 B-04 end-to-end: FDR + Decoder training
 │
-├── Paper A experiments (main branch):
+├── paper_a/                         # Paper A experiments (main branch)
 │   ├── eval_e007b_proto_vs_embedding.py   Proto vs Embedding fair comparison
 │   ├── eval_e008_spm_sparsity.py          SPM sparsity validation (A/B/C)
 │   ├── eval_e009_spm_router.py            Learned vs Fixed Router
@@ -94,20 +95,26 @@ tools/
 │   ├── eval_e011t_tile_ablation.py        Tile size ablation (256-2048)
 │   └── eval_e011u_proto_capacity.py       Proto count scanning (2-64)
 │
-├── Paper B experiments (paper-b branch):
+├── paper_b/                         # Paper B experiments (paper-b branch)
 │   ├── eval_b00_tile_size_sensitivity.py   Spatial Sparsity: 7 tile sizes, empty/meaningful/FG-capture
 │   ├── eval_b01_oracle_topk.py             Oracle Top-K: FG retention upper bound, SSI definition
 │   ├── eval_b01_spatial_baseline.py        Tile foreground distribution analysis
 │   ├── eval_b02_learnability.py            Learnability: can MV3 predict tile importance? (r=0.889)
 │   ├── eval_b02_5_generalization.py        Generalization: category-agnostic? cross-dataset? (3 exps)
-│   ├── eval_b03_router_architecture.py     FDR vs Edge ablation: R0/R1/R2/R3, Density≠Edge proof
-│   └── eval_b04_dynamic_tile_selection.py  End-to-end: FDR → Top-K → Decoder → Segmentation
+│   └── eval_b03_router_architecture.py     FDR vs Edge ablation: R0/R1/R2/R3, Density≠Edge proof
 │
-└── Diagnostics (paper-b branch):
-    ├── diag_b04_tiles.py               Tile dataset: mask values, fg_ratio, class distribution
-    ├── diag_b04_overfit.py             Overfit test (20 tiles × 100 epoch) + 5-panel visualization
-    ├── diag_b04_exp12.py               Exp1 (FG>5% multi-class) + Exp2 (binary FG/BG)
-    └── diag_class_stats.py             COCO GT stats + tile stats + cross-validation + anomaly detection
+├── diag/                            # Diagnostics (paper-b branch)
+│   ├── diag_b04_tiles.py               Tile dataset: mask values, fg_ratio, class distribution
+│   ├── diag_b04_overfit.py             Overfit test (20 tiles × 100 epoch) + 5-panel visualization
+│   ├── diag_b04_exp12.py               Exp1 (FG>5% multi-class) + Exp2 (binary FG/BG)
+│   ├── diag_class_stats.py             COCO GT stats + tile stats + cross-validation + anomaly detection
+│   ├── diag_check_labels.py            Quick train/val label space consistency check
+│   ├── diag_trace_labels.py            Single-instance mapping chain trace (JSON→mask→tile)
+│   └── test_loader.py                  Dataset loader validation
+│
+└── viz/                             # Visualization
+    ├── viz_paper_a_p6.py               P6 feature visualization for Paper A
+    └── viz_paper_a_router.py           Router behavior visualization for Paper A
 ```
 
 ## Key Lessons from v1 (MUST follow)
@@ -160,14 +167,14 @@ P4 [B,1280,H/16,W/16] → Conv(1280→64) → Upsample×2 → Conv(64→64) → 
 **Critical B-04 findings:**
 - **FG>5% filter**: Training on FG>1% tiles caused FG-mIoU=0.0005 (34% tiles still BG-dominated). FG>5% filter (12% meaningful) → FG-mIoU=0.801.
 - **Focal γ=5.0 + Dice**: For extreme class imbalance in remote sensing.
-- **Rare class oversampling**: pool/soccer/plane ×5 (identified via `diag_class_stats.py`).
+- **Rare class oversampling**: pool/soccer/plane ×5 (identified via `tools/diag/diag_class_stats.py`).
 
 ## Data Pipeline
 
 ```
 iSAID COCO JSON                    Cityscapes
       │                                │
-prep_isaid.py (render masks)    prep_cityscapes.py
+prep_isaid.py (fix annotations)  prep_cityscapes.py
       │                                │
 prep_isaid_tiles.py ───────────────────┘
   ├── Step 1: render_semantic_mask() → masks_full/
@@ -177,6 +184,12 @@ prep_isaid_tiles.py ───────────────────┘
 FastISAIDTileDataset(root_dir, split, semantic=bool)
   → {"image": [3,1024,1024], "mask": [1024,1024], "image_id": str}
 ```
+
+## Label Mapping (Critical)
+
+**Mapping only happens ONCE in `prep_isaid.py`.** All downstream code uses `ann["category_id"]` directly.
+
+Shared module: `adatile/utils/label_mapping.py` — `build_mapping()`, `ISAID_CATEGORIES`, `get_category_id()`. See module docstring for details.
 
 ## Known Issues & Workarounds
 
@@ -207,7 +220,11 @@ If `prep_isaid_tiles.py --steps 2,3` skips Step 1, tile masks are all `unique=[0
 
 ### Decoder FG-mIoU stuck near 0
 
-Root cause: training on tiles with FG>1% — 34% are still BG-dominated. Fix: FG>5% filter → 12% meaningful tiles. Diagnosis: `diag_b04_exp12.py`.
+Root cause: training on tiles with FG>1% — 34% are still BG-dominated. Fix: FG>5% filter → 12% meaningful tiles. Diagnosis: `tools/diag/diag_b04_exp12.py`.
+
+### Category label mismatch between train/val
+
+iSAID train and val use different original category_id numbering. `prep_isaid.py` now uses per-split name-based mapping (`adatile/utils/label_mapping.py`). Diagnosis: `tools/diag/diag_trace_labels.py`.
 
 ### FileBackend data loss on crash
 
@@ -225,24 +242,37 @@ pytest tests/ -v
 # Lint
 ruff check adatile/
 
-# Tile preprocessing (full pipeline)
-python tools/prep_isaid_tiles.py --src-root data/iSAID_processed --tile-root data/iSAID_tiles --steps 1,2,3 --tile-size 1024 --max-images 0
+# Data preprocessing (full pipeline from scratch)
+python tools/data/prep_isaid.py                         # Step 0: fix COCO JSON annotations
+python tools/data/prep_isaid_tiles.py \                 # Steps 1-3: render masks → cut tiles → metadata
+    --src-root data/iSAID_processed \
+    --dst-root data/iSAID_tiles \
+    --steps 1,2,3 --splits train,val
+
+# Label validation
+python tools/diag/diag_check_labels.py --tile-root data/iSAID_tiles
+python tools/diag/diag_trace_labels.py --data-root data
 
 # Dataset diagnostics
-python tools/diag_class_stats.py --isaid-root data/iSAID_processed --tile-root data/iSAID_tiles
-python tools/diag_b04_tiles.py --tile-root data/iSAID_tiles
+python tools/diag/diag_class_stats.py --isaid-root data/iSAID_processed --tile-root data/iSAID_tiles
+python tools/diag/diag_b04_tiles.py --tile-root data/iSAID_tiles
 
 # Overfit test (verify decoder can learn)
-python tools/diag_b04_overfit.py --tile-root data/iSAID_tiles
+python tools/diag/diag_b04_overfit.py --tile-root data/iSAID_tiles
+
+# Paper B experiments
+python tools/paper_b/eval_b00_tile_size_sensitivity.py
+python tools/paper_b/eval_b01_oracle_topk.py
+python tools/paper_b/eval_b02_learnability.py
 
 # B-04 end-to-end (local test)
-python tools/eval_b04_dynamic_tile_selection.py --decoder-epochs 10 --fdr-epochs 5 --batch-size 4
+python tools/train/train_b04.py --decoder-epochs 10 --fdr-epochs 5 --batch-size 4
 
 # B-04 full run (cloud server, RTX 5090)
-nohup python tools/eval_b04_dynamic_tile_selection.py \\
-    --src-root /root/autodl-tmp/iSAID_processed \\
-    --tile-root /root/autodl-tmp/iSAID_tiles \\
-    --decoder-epochs 50 --fdr-epochs 20 --batch-size 8 \\
+nohup python tools/train/train_b04.py \
+    --src-root /root/autodl-tmp/iSAID_processed \
+    --tile-root /root/autodl-tmp/iSAID_tiles \
+    --decoder-epochs 50 --fdr-epochs 20 --batch-size 8 \
     > /root/autodl-tmp/b04.log 2>&1 &
 ```
 
