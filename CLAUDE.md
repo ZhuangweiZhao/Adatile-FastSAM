@@ -6,19 +6,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **AdaTile-FastSAM**: Adaptive Sparse FastSAM for Few-Shot High-Resolution Instance Segmentation.
 
-**Two-Paper Strategy (2026-06-19):**
+**Two-Paper Strategy (2026-06-21):**
 - **Paper A** (Proto Sparsity / Learned Sparse Proto Routing): Archived on `main`. Evidence chain E007→E011-U complete. ICIP/CCIG target.
-- **Paper B** (Dual Sparsity / Spatial Sparsity / AdaTile): Active on `paper-b`. Observation → Oracle → Learnability → Method pipeline.
+- **Paper B** (Dual Sparsity / Spatial Sparsity / AdaTile): Active on `paper-b`. Theory chain B-00→B-03 CLOSED. B-04 end-to-end integration in progress.
 
 **Core innovations:**
-1. **Ada-SPM** — density-supervised sparse perception module: learns importance maps → Top-K tile selection
-2. **Decoupled Sparse Training** — decoder always receives full features; SPM trained via GT-driven losses in parallel
+1. **Ada-SPM** — density-supervised sparse perception module: learns importance maps → Top-K tile selection (Paper A)
+2. **Foreground Density Router (FDR)** — 75K params, Pareto optimal spatial router: learns objectness/density, not edges or class semantics (Paper B)
+3. **Decoupled Sparse Training** — decoder always receives full features; SPM/Router trained via GT-driven losses in parallel
 
 ## Git Branches
 
 ```
 main      → Paper A archive (all E-series experiments)
-paper-b   → Paper B active development (B-series experiments)
+paper-b   → Paper B active development (B-series experiments, B-04 in progress)
 ```
 
 ## Development Rules
@@ -33,6 +34,8 @@ logger = get_logger("module_name")
 logger.log_metric("iou", 0.85, step=step, tags=["few-shot"])
 logger.log_info("phase", "Stage B complete", step=step)
 ```
+
+**FileBackend is crash-safe**: `buffer_size=1`, `flush_interval=1.0` — every record flushed to disk immediately.
 
 ### 2. Bilingual Comments (中英文注释)
 
@@ -64,34 +67,47 @@ adatile/
 │   ├── mass_buildings.py    ✅ MassBuildings tile dataset
 │   ├── isaid.py             ✅ iSAID COCO dataset (full-image)
 │   └── isaid_tiles.py       ✅ FastISAIDTileDataset (pre-cut 1024×1024 tiles)
-├── sparse/           ⬜ Ada-SPM
-├── losses/           ⬜ Loss functions
+├── sparse/
+│   └── spatial_router.py    ✅ ForegroundDensityRouter, DensityHead, EdgeHead, TinyCNNRouter
+├── losses/           ⬜ Loss functions (skeleton only)
 └── utils/
     └── seed.py       ✅ Unified set_seed() with cuDNN deterministic
 
 tools/
-├── prep_isaid.py            iSAID COCO → category-id masks (Step 0)
-├── prep_isaid_tiles.py      Full pipeline: render mask → cut tiles → metadata
-├── prep_cityscapes.py       Cityscapes → tile format
-├── train_isaid_multiclass.py iSAID multi-class training entry point
-├── test_isaid_loader.py     Dataset loader validation
+├── Data preprocessing:
+│   ├── prep_isaid.py                iSAID COCO → category-id masks (Step 0)
+│   ├── prep_isaid_tiles.py          Full pipeline: render mask → cut tiles → metadata
+│   └── prep_cityscapes.py           Cityscapes → tile format
+│
+├── Training:
+│   ├── train_isaid_multiclass.py    iSAID multi-class training entry point
+│   └── test_isaid_loader.py         Dataset loader validation
 │
 ├── Paper A experiments (main branch):
-│   eval_e007b_proto_vs_embedding.py   Proto vs Embedding fair comparison
-│   eval_e008_spm_sparsity.py          SPM sparsity validation (A/B/C)
-│   eval_e009_spm_router.py            Learned vs Fixed Router
-│   eval_e009d_proto_usage.py          Effective Proto count analysis
-│   eval_e009_verify.py                Router verification
-│   eval_e010_isaid_mc.py              iSAID multi-class Proto vs Embedding
-│   eval_e011_spm_isaid.py             SPM on iSAID
-│   eval_e011t_tile_ablation.py        Tile size ablation (256-2048)
-│   eval_e011u_proto_capacity.py       Proto count scanning (2-64)
+│   ├── eval_e007b_proto_vs_embedding.py   Proto vs Embedding fair comparison
+│   ├── eval_e008_spm_sparsity.py          SPM sparsity validation (A/B/C)
+│   ├── eval_e009_spm_router.py            Learned vs Fixed Router
+│   ├── eval_e009d_proto_usage.py          Effective Proto count analysis
+│   ├── eval_e009_verify.py                Router verification
+│   ├── eval_e010_isaid_mc.py              iSAID multi-class Proto vs Embedding
+│   ├── eval_e011_spm_isaid.py             SPM on iSAID
+│   ├── eval_e011t_tile_ablation.py        Tile size ablation (256-2048)
+│   └── eval_e011u_proto_capacity.py       Proto count scanning (2-64)
 │
-└── Paper B experiments (paper-b branch):
-    eval_b00_tile_size_sensitivity.py   Spatial Sparsity: tile size vs empty ratio
-    eval_b01_oracle_topk.py             Oracle Top-K: FG retention upper bound
-    eval_b01_spatial_baseline.py        Tile foreground distribution analysis
-    eval_b02_learnability.py            Learnability: can MobileNetV3 predict tile importance?
+├── Paper B experiments (paper-b branch):
+│   ├── eval_b00_tile_size_sensitivity.py   Spatial Sparsity: 7 tile sizes, empty/meaningful/FG-capture
+│   ├── eval_b01_oracle_topk.py             Oracle Top-K: FG retention upper bound, SSI definition
+│   ├── eval_b01_spatial_baseline.py        Tile foreground distribution analysis
+│   ├── eval_b02_learnability.py            Learnability: can MV3 predict tile importance? (r=0.889)
+│   ├── eval_b02_5_generalization.py        Generalization: category-agnostic? cross-dataset? (3 exps)
+│   ├── eval_b03_router_architecture.py     FDR vs Edge ablation: R0/R1/R2/R3, Density≠Edge proof
+│   └── eval_b04_dynamic_tile_selection.py  End-to-end: FDR → Top-K → Decoder → Segmentation
+│
+└── Diagnostics (paper-b branch):
+    ├── diag_b04_tiles.py               Tile dataset: mask values, fg_ratio, class distribution
+    ├── diag_b04_overfit.py             Overfit test (20 tiles × 100 epoch) + 5-panel visualization
+    ├── diag_b04_exp12.py               Exp1 (FG>5% multi-class) + Exp2 (binary FG/BG)
+    └── diag_class_stats.py             COCO GT stats + tile stats + cross-validation + anomaly detection
 ```
 
 ## Key Lessons from v1 (MUST follow)
@@ -102,6 +118,65 @@ tools/
 4. **SPM three pillars**: GT density focal + Top-K BCE + budget loss. Missing any → importance collapse.
 5. **Episodic training**: Baseline MUST also use episodic training for fair comparison.
 6. **Dice GT broadcast**: `unsqueeze(0)` with batch>1 → `[1,B,H,W]` broadcast explosion.
+
+## Paper B Architecture
+
+```
+Paper B evidence chain (COMPLETE):
+
+B-00: Tile Size Sensitivity       → Spatial Sparsity EXISTS. All scales — 60% empty at 1024px.
+B-01: Oracle Top-K                 → Upper bound: Top40% tiles → 96.5% FG, IDG=2.41×. Defines SSI.
+B-02: Learnability                 → Importance IS LEARNABLE: Spearman r=0.889 (MV3 backbone).
+B-02.5: Generalization             → Category-AGNOSTIC (holdout r=0.651), cross-dataset possible.
+B-03: Router Architecture          → FDR 75K ≈ R0 1.48M (Δr=−0.038). Edge ≠ Importance (+0.009 only).
+B-04: End-to-End Integration       → FDR → Top-K → Decoder → Segmentation (IN PROGRESS)
+```
+
+**Paper B Laws (from B-00):**
+1. **Spatial Sparsity**: All scales are sparse — even 2048×2048 has 49.9% empty tiles
+2. **Foreground Concentration**: Top 17-48% tiles capture 95% FG (monotonic with tile size)
+3. **Scale-Sparsity Trade-off**: Larger tile → lower sparsity, higher FG capture needed
+
+**Spatial Sparsity Index (SSI):**
+- SSI = Oracle Top40% FG retention. Pre-experiment, zero-cost criterion.
+- SSI > 70 → Router applicable (object-centric: iSAID, DOTA, xView)
+- SSI < 50 → Router meaningless (land-cover: LoveDA, Potsdam)
+
+**Foreground Density Router (FDR) — Paper B core module:**
+```
+Image → Frozen MV3 backbone → Feature Map → DensityHead (75K) → Importance Map → Top-K tiles
+```
+- Supervised by: `fg_ratio` (foreground density per tile) — NOT edges, NOT class labels
+- Learns: objectness / instance density, category-agnostic
+- `adatile/sparse/spatial_router.py` — `ForegroundDensityRouter`, `DensityHead`, `EdgeHead` (ablation only), `TinyCNNRouter` (lower-bound)
+
+**B-04 LightDecoder (for binary segmentation):**
+```
+P4 [B,1280,H/16,W/16] → Conv(1280→64) → Upsample×2 → Conv(64→64) → Upsample×2
+                      → Conv(64→32) → Upsample×2 → Conv(32→32) → Upsample → Conv(32→1)
+```
+~800K params. See `adatile/decoder/light_decoder.py`.
+
+**Critical B-04 findings:**
+- **FG>5% filter**: Training on FG>1% tiles caused FG-mIoU=0.0005 (34% tiles still BG-dominated). FG>5% filter (12% meaningful) → FG-mIoU=0.801.
+- **Focal γ=5.0 + Dice**: For extreme class imbalance in remote sensing.
+- **Rare class oversampling**: pool/soccer/plane ×5 (identified via `diag_class_stats.py`).
+
+## Data Pipeline
+
+```
+iSAID COCO JSON                    Cityscapes
+      │                                │
+prep_isaid.py (render masks)    prep_cityscapes.py
+      │                                │
+prep_isaid_tiles.py ───────────────────┘
+  ├── Step 1: render_semantic_mask() → masks_full/
+  ├── Step 2: cut 1024×1024 tiles → images/ + masks/
+  └── Step 3: metadata JSON → metadata/{split}.json
+      │
+FastISAIDTileDataset(root_dir, split, semantic=bool)
+  → {"image": [3,1024,1024], "mask": [1024,1024], "image_id": str}
+```
 
 ## Known Issues & Workarounds
 
@@ -126,38 +201,17 @@ pad_w = (32 - W % 32) % 32
 
 Full-size iSAID images (4000×4000+) cause OOM on GPUs < 12GB. Use `--max-image-size 2048` or `--device cpu`.
 
-## Paper B Architecture
+### Tile preprocessing: all masks zero
 
-```
-Paper B evidence chain:
+If `prep_isaid_tiles.py --steps 2,3` skips Step 1, tile masks are all `unique=[0]`. Always run `--steps 1,2,3` or ensure `masks_full/` already exists.
 
-B-00: Tile Size Sensitivity    → Spatial Sparsity exists (60% tiles empty at 1024px)
-B-01: Oracle Top-K              → Upper bound (Top40% tiles → 96.5% FG retained, IDG=2.41x)
-B-02: Learnability Study        → Can model learn tile importance?
-        ↓ (if LEARNABLE)
-B-03: DTR Network               → Full Dual-Tile-Router implementation
-```
+### Decoder FG-mIoU stuck near 0
 
-**Paper B Laws (from B-00):**
-1. **Spatial Sparsity**: All scales are sparse — even 2048×2048 has 49.9% empty tiles
-2. **Foreground Concentration**: Top 17-48% tiles capture 95% FG (monotonic with tile size)
-3. **Scale-Sparsity Trade-off**: Larger tile → lower sparsity, higher FG capture needed
+Root cause: training on tiles with FG>1% — 34% are still BG-dominated. Fix: FG>5% filter → 12% meaningful tiles. Diagnosis: `diag_b04_exp12.py`.
 
-## Data Pipeline
+### FileBackend data loss on crash
 
-```
-iSAID COCO JSON                    Cityscapes
-      │                                │
-prep_isaid.py (render masks)    prep_cityscapes.py
-      │                                │
-prep_isaid_tiles.py ───────────────────┘
-  ├── Step 1: render_semantic_mask() → masks_full/
-  ├── Step 2: cut 1024×1024 tiles → images/ + masks/
-  └── Step 3: metadata JSON → metadata/{split}.json
-      │
-FastISAIDTileDataset(root_dir, split, semantic=bool)
-  → {"image": [3,1024,1024], "mask": [1024,1024], "image_id": str}
-```
+Fixed: `buffer_size=1`, `flush_interval=1.0` globally in `adatile/logging/backends.py`. Every record immediately written.
 
 ## Common Commands
 
@@ -170,11 +224,35 @@ pytest tests/ -v
 
 # Lint
 ruff check adatile/
+
+# Tile preprocessing (full pipeline)
+python tools/prep_isaid_tiles.py --src-root data/iSAID_processed --tile-root data/iSAID_tiles --steps 1,2,3 --tile-size 1024 --max-images 0
+
+# Dataset diagnostics
+python tools/diag_class_stats.py --isaid-root data/iSAID_processed --tile-root data/iSAID_tiles
+python tools/diag_b04_tiles.py --tile-root data/iSAID_tiles
+
+# Overfit test (verify decoder can learn)
+python tools/diag_b04_overfit.py --tile-root data/iSAID_tiles
+
+# B-04 end-to-end (local test)
+python tools/eval_b04_dynamic_tile_selection.py --decoder-epochs 10 --fdr-epochs 5 --batch-size 4
+
+# B-04 full run (cloud server, RTX 5090)
+nohup python tools/eval_b04_dynamic_tile_selection.py \\
+    --src-root /root/autodl-tmp/iSAID_processed \\
+    --tile-root /root/autodl-tmp/iSAID_tiles \\
+    --decoder-epochs 50 --fdr-epochs 20 --batch-size 8 \\
+    > /root/autodl-tmp/b04.log 2>&1 &
 ```
 
 ## Persistent Memory
 
 Project memory stored at `C:\Users\20871\.claude\projects\E--A-postgraduate-stude-AdaTile-FastSAM\memory\`. Key files:
-- `two-paper-strategy.md` — Paper A/B split rationale
+- `two-paper-strategy.md` — Paper A/B split rationale and publication targets
+- `paper-b-evidence-chain.md` — Paper B complete theory chain: B-00→B-03 finalized
+- `spatial-sparsity-index.md` — SSI definition, criterion values, dataset applicability
 - `paper-a-final.md` — Paper A archive with file index and completion status
-- Various v1 lessons and bug records (decoder-gradient, dice-broadcast, importance-collapse, etc.)
+- `publication-strategy.md` — Journal selection, reviewer attack points, scoring
+- `paper-positioning.md` — Related work analysis, overlap, differentiation
+- Various v1 lessons (decoder-gradient, dice-broadcast, importance-collapse, etc.)

@@ -92,8 +92,12 @@ def render_semantic_mask(annotations: list, h: int, w: int) -> np.ndarray:
         _has_cv2 = False
 
     for ann in annotations:
-        cat_id = ACTUAL_TO_CODE_ID.get(ann.get("category_id", 0), 0)
-        if cat_id <= 0:
+        # 直接使用 category_id, 不再二次映射。
+        # prep_isaid.py fix_annotations() 已将原始 ID 映射为 ISAID ID (0-15)。
+        # Use category_id directly, no double-mapping.
+        # prep_isaid.py fix_annotations() already mapped original → ISAID ID (0-15).
+        cat_id = ann.get("category_id", 0)
+        if cat_id <= 0 or cat_id > 15:
             continue
 
         seg = ann.get("segmentation", [])
