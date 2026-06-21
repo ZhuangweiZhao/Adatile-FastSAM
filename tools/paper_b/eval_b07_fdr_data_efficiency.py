@@ -217,12 +217,26 @@ def build_cache(image_items, cache_dir):
 # FDR Training (single run)
 # ═══════════════════════════════════════════════════
 
-def train_fdr(model, train_loader, device, epochs, lr):
+def train_fdr(model, train_loader, eval_loader, device, epochs, lr,
+              logger, tag_prefix, log_every=5):
+    """
+    训练 FDR + per-epoch 日志 + eval 跟踪。
+    Trains FDR with per-epoch logging + eval tracking.
+
+    Args:
+        logger: adatile logger instance
+        tag_prefix: 日志标签前缀 (e.g. "b07/D100/S0")
+        log_every: 每 N epoch 评估一次 Spearman r
+    """
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-6)
     best_loss, best_state = float("inf"), None
+    epoch_metrics = []
+
+    from scipy.stats import spearmanr as sr_func
 
     for epoch in range(1, epochs + 1):
+        t0 = time.perf_counter()
         model.train()
         total_loss, n = 0.0, 0
         for batch in train_loader:
@@ -259,13 +273,44 @@ def train_fdr(model, train_loader, device, epochs, lr):
 
         sch.step()
         avg_loss = total_loss / max(n, 1)
+        dt = time.perf_counter() - t0
+
         if avg_loss < best_loss:
             best_loss = avg_loss
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
 
+        # Per-epoch eval: Spearman r on eval set (每隔 log_every epoch)
+        sr_epoch = None
+        if eval_loader is not None and (epoch == 1 or epoch % log_every == 0
+                                         or epoch == epochs):
+            sr_epoch, fg40_epoch = evaluate_fdr(model, eval_loader, device)
+            logger.log_metric(f"{tag_prefix}/spearman", sr_epoch, step=epoch,
+                            tags=["b07", tag_prefix])
+
+        # Per-epoch 日志 | Per-epoch logging
+        epoch_rec = {
+            "epoch": epoch, "loss": round(avg_loss, 6),
+            "lr": round(sch.get_last_lr()[0], 8),
+            "time_s": round(dt, 2),
+        }
+        if sr_epoch is not None:
+            epoch_rec["spearman"] = round(sr_epoch, 4)
+        epoch_metrics.append(epoch_rec)
+
+        # 终端日志 (简洁) | Console log (concise)
+        extra = f" sr={sr_epoch:.4f}" if sr_epoch is not None else ""
+        logger.log_info(tag_prefix,
+                        f"E{epoch:2d}/{epochs} loss={avg_loss:.5f} "
+                        f"lr={sch.get_last_lr()[0]:.6f} "
+                        f"t={dt:.1f}s{extra}")
+
+    # 最终评估 | Final evaluation
     if best_state:
         model.load_state_dict(best_state)
-    return model, best_loss
+
+    logger.log_info(tag_prefix,
+                    f"Best loss={best_loss:.5f} | 最佳损失")
+    return model, best_loss, epoch_metrics
 
 
 # ═══════════════════════════════════════════════════
@@ -439,15 +484,34 @@ def main():
     build_cache(train_pool + eval_images, cache_dir)
 
     # ── 3. Per data% × seed: train + eval | 逐比例训练评估 ──
+    import time as time_module
+    total_runs = len(data_fractions) * args.seeds
+    run_idx = 0
     all_results = {}
+    eval_ds = CachedFDRDataset(eval_images, cache_dir)
+    eval_loader = DataLoader(eval_ds, batch_size=args.batch_size,
+                             shuffle=False, num_workers=min(2, args.num_workers),
+                             pin_memory=True, collate_fn=pad_collate)
 
     for data_pct in data_fractions:
         sr_list, fg_list = [], []
         n_train = max(1, int(len(train_pool) * data_pct / 100))
+        tag_d = f"D{data_pct}"
 
         for seed_idx in range(args.seeds):
+            run_idx += 1
             seed = base_seed + seed_idx
             set_seed(seed)
+            tag = f"b07/{tag_d}/S{seed_idx}"
+            t_start = time_module.perf_counter()
+
+            # 日志: run header | Log: run header
+            logger.log_info("b07/run_start",
+                            f"\n{'─'*55}\n"
+                            f"  Run {run_idx}/{total_runs}: "
+                            f"Data={data_pct:>3}% ({n_train} imgs) "
+                            f"Seed={seed_idx+1}/{args.seeds}\n"
+                            f"  {'─'*55}")
 
             # 采样训练集 | Sample training set
             samp_rng = np.random.RandomState(seed)
@@ -460,25 +524,41 @@ def main():
                                       shuffle=True, num_workers=args.num_workers,
                                       pin_memory=True, drop_last=False,
                                       collate_fn=pad_collate)
-            eval_ds = CachedFDRDataset(eval_images, cache_dir)
-            eval_loader = DataLoader(eval_ds, batch_size=args.batch_size,
-                                     shuffle=False, num_workers=min(2, args.num_workers),
-                                     pin_memory=True, collate_fn=pad_collate)
 
             # 训练 | Train
             model = FDRModel().to(device)
             n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            model, best_loss = train_fdr(model, train_loader, device, args.epochs, args.lr)
+            logger.log_info(tag, f"FDR trainable params: {n_params:,} | n_images={n_train}")
+            model, best_loss, epoch_metrics = train_fdr(
+                model, train_loader, eval_loader, device,
+                args.epochs, args.lr, logger, tag, log_every=5
+            )
+
+            # 日志: epoch 指标 JSONL | Log: epoch metrics to JSONL
+            for em in epoch_metrics:
+                em.update({"data_pct": data_pct, "seed": seed,
+                           "n_train_images": n_train})
+                logger.log_info("b07/epoch", json.dumps(em))
 
             # 评估 | Evaluate
             sr, fg40 = evaluate_fdr(model, eval_loader, device)
             sr_list.append(sr)
             fg_list.append(fg40)
+            dt = time_module.perf_counter() - t_start
 
-            logger.log_info("b07/run",
+            logger.log_info("b07/run_done",
+                            f"Run {run_idx}/{total_runs} done | "
                             f"Data={data_pct:>3}% seed={seed_idx} "
-                            f"n_train={n_train} loss={best_loss:.5f} "
-                            f"Spearman={sr:.4f} FG@40={fg40*100:.1f}%")
+                            f"train={n_train} imgs | "
+                            f"loss={best_loss:.5f} "
+                            f"Spearman={sr:.4f} FG@40={fg40*100:.1f}% | "
+                            f"time={dt:.0f}s")
+            logger.log_metric("b07/spearman", sr,
+                            step=run_idx,
+                            tags=["b07", tag_d, f"S{seed_idx}"])
+            logger.log_metric("b07/fg_recall_40", fg40,
+                            step=run_idx,
+                            tags=["b07", tag_d, f"S{seed_idx}"])
 
         all_results[data_pct] = {
             "sr_mean": float(np.mean(sr_list)),
