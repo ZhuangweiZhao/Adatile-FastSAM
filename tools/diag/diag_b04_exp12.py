@@ -32,35 +32,60 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+# 颜色表: 15 个前景类别配色 | Color map: 15 foreground class colors
 COLOR_MAP = [(255,0,0),(0,255,0),(0,0,255),(255,255,0),(255,0,255),
              (0,255,255),(128,0,0),(0,128,0),(0,0,128),(128,128,0),
              (128,0,128),(0,128,128),(255,128,0),(255,0,128),(128,255,0)]
 
 
 class LightDecoder(nn.Module):
+    """轻量解码器: P4 特征 → 分割掩码 | Lightweight decoder: P4 features → segmentation mask.
+
+    结构 | Structure:
+        P4 [B,1280,H/16,W/16] → Conv(1280→256→128) → Upsample×2
+        → Conv(128→64) → Upsample×2 → Conv(64→32) → Upsample
+        → Conv(32→num_classes) → [B,N,H,W]
+
+    Args:
+        in_channels: P4 特征通道数 | P4 feature channels (default 1280)
+        num_classes: 输出类别数 | Output classes
+    """
     def __init__(self, in_channels=1280, num_classes=16):
         super().__init__()
+        # Stage 1: 降维 + 特征提取 | Channel reduction + feature extraction
         self.stage1 = nn.Sequential(
             nn.Conv2d(in_channels, 256, 1, bias=False), nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
             nn.Conv2d(256, 128, 3, padding=1, bias=False), nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
         )
+        # Stage 2: 上采样后 128→64 | After upsample: 128→64
         self.stage2 = nn.Sequential(
             nn.Conv2d(128, 64, 3, padding=1, bias=False), nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
         )
+        # Stage 3: 上采样后 64→32 | After upsample: 64→32
         self.stage3 = nn.Sequential(
             nn.Conv2d(64, 32, 3, padding=1, bias=False), nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
         )
+        # Head: 1×1 逐像素分类 | 1×1 per-pixel classification
         self.head = nn.Conv2d(32, num_classes, 1, bias=True)
 
     def forward(self, p4, target_size=None):
-        x = self.stage1(p4)
-        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        """前向传播 | Forward pass.
+
+        Args:
+            p4: P4 特征 [B, 1280, H/16, W/16]
+            target_size: 可选目标输出尺寸 (H, W)
+
+        Returns:
+            logits: [B, num_classes, H, W]
+        """
+        x = self.stage1(p4)                                                     # 降维
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)  # 2× up
         x = self.stage2(x)
-        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)  # 2× up
         x = self.stage3(x)
         x = self.head(x)
         if target_size is not None:
@@ -69,7 +94,24 @@ class LightDecoder(nn.Module):
 
 
 def train_eval(decoder, backbone, loader, epochs, device, binary, num_classes, log):
-    """训练 + 返回历史 + 最终 per-class IoU."""
+    """训练与评估循环 | Training and evaluation loop.
+
+    每 5 epoch 评估一次 per-class IoU，记录完整历史。
+    Evaluates per-class IoU every 5 epochs, records full history.
+
+    Args:
+        decoder: LightDecoder 模型 | LightDecoder model
+        backbone: 冻结的 FastSAM backbone | Frozen FastSAM backbone
+        loader: DataLoader
+        epochs: 训练 epoch 数 | Number of training epochs
+        device: cuda/cpu
+        binary: True → FG/BG 二分类 | True → FG/BG binary classification
+        num_classes: 输出通道数 | Number of output channels
+        log: 日志回调函数 | Logging callback function
+
+    Returns:
+        history: list of dict with keys [epoch, loss, miou, bg_pred, per_class_iou]
+    """
     opt = torch.optim.Adam(decoder.parameters(), lr=1e-3)
     history = []
 
@@ -149,22 +191,24 @@ def train_eval(decoder, backbone, loader, epochs, device, binary, num_classes, l
             decoder.train()
 
     # 最终 per-class 详情 | Final per-class details
-    _, _, _, _, final_per_cls = history[-1]["per_class_iou"], None, None, None, None
-    # Actually get the last one
     final_pc = history[-1]["per_class_iou"]
-    log("exp12/final_per_class", f"Final per-class IoU: {final_pc}")
+    log("exp12/final_per_class", f"Final per-class IoU | 最终各类别 IoU: {final_pc}")
 
     return history
 
 
 def viz_pred(model, backbone, loader, output_path, device, binary, log):
-    """保存拼接可视化 + 日志."""
+    """保存拼接可视化 (5 列对照图) + 日志 | Save composite visualization (5-column comparison) + log.
+
+    输出 5 列: 原图 | GT 掩码 | 预测掩码 | GT 叠加 | 预测叠加
+    Output 5 columns: Image | GT Mask | Pred Mask | GT Overlay | Pred Overlay
+    """
     model.eval()
     for i, batch in enumerate(loader):
-        if i >= 3: break
+        if i >= 3: break  # 最多 3 张 | Max 3 images
         img = batch["image"][:1].to(device)
         tgt = batch["mask"][:1].to(device)
-        tgt_disp = (tgt > 0).long() if binary else tgt
+        tgt_disp = (tgt > 0).long() if binary else tgt  # 二分类模式下只区分 FG/BG | Binary mode: FG/BG only
 
         feats = backbone(img)
         logit = model(feats["p4"], target_size=tgt.shape[1:])
@@ -172,14 +216,17 @@ def viz_pred(model, backbone, loader, output_path, device, binary, log):
         gt = tgt_disp[0].cpu().numpy()
         img_np = img[0].cpu().numpy().transpose(1, 2, 0)
 
+        # 上色: GT 和 Pred 各自着色 | Colorize: GT and Pred separately
         nc = 2 if binary else 16
         gt_c, pred_c = (np.zeros((*gt.shape, 3), dtype=np.uint8) for _ in range(2))
         for c in range(1, nc):
             gt_c[gt == c] = COLOR_MAP[c % len(COLOR_MAP)]
             pred_c[pred == c] = COLOR_MAP[c % len(COLOR_MAP)]
+        # 叠加: 50% 原图 + 50% 着色掩码 | Overlay: 50% original + 50% colorized mask
         gt_ov = img_np * 0.5 + gt_c.astype(np.float32) / 255.0 * 0.5
         pred_ov = img_np * 0.5 + pred_c.astype(np.float32) / 255.0 * 0.5
 
+        # 5 列子图 | 5-column subplot
         fig, axes = plt.subplots(1, 5, figsize=(22, 5))
         for ax, title, im in zip(axes,
                                   ["Image", "GT", "Pred", "GT Overlay", "Pred Overlay"],
@@ -315,7 +362,7 @@ def main():
     # 汇总 | Summary
     # ═══════════════════════════════════════════════════════════════
     log("exp12/summary", "=" * 60)
-    log("exp12/summary", "SUMMARY")
+    log("exp12/summary", "SUMMARY | 汇总")
     log("exp12/summary", "=" * 60)
 
     miou1, miou2 = h1["miou"], h2["miou"]
@@ -331,17 +378,17 @@ def main():
         log("exp12/verdict",
             f"✅ LOCALIZATION WORKS (Binary IoU={miou2:.3f}), "
             f"CLASS LEARNING FAILS (Multi-class={miou1:.3f}). "
-            f"Problem = class imbalance, NOT feature resolution.")
+            f"Problem = class imbalance, NOT feature resolution. | 问题 = 类别不均衡，非特征分辨率")
     elif miou2 > 0.6 and miou1 >= 0.3:
         log("exp12/verdict",
             f"✅ BOTH work. FG>5% filter + Focal γ=5.0 fix the issue. "
-            f"Train B-04 with FG>5% filter.")
+            f"Train B-04 with FG>5% filter. | 两者均正常，用 FG>5% 过滤训练 B-04")
     elif miou2 < 0.3:
         log("exp12/verdict",
-            f"❌ EVEN BINARY fails ({miou2:.3f}). Decoder or feature is fundamentally broken.")
+            f"❌ EVEN BINARY fails ({miou2:.3f}). Decoder or feature is fundamentally broken. | 二分类都失败，Decoder 或特征根本有问题")
     else:
         log("exp12/verdict",
-            f"⚠️ Mixed: binary={miou2:.3f} multi={miou1:.3f}. Need further diagnosis.")
+            f"⚠️ Mixed: binary={miou2:.3f} multi={miou1:.3f}. Need further diagnosis. | 混合结果，需进一步诊断")
 
     # 画对比图
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))

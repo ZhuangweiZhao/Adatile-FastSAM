@@ -1,6 +1,6 @@
-# CLAUDE.md — AdaTile-FastSAM v2
+# AGENTS.md — AdaTile-FastSAM v2
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
 
 ## Project Overview
 
@@ -288,7 +288,7 @@ nohup python tools/train/train_b04.py \
 
 ## Persistent Memory
 
-Project memory stored at `C:\Users\20871\.claude\projects\E--A-postgraduate-stude-AdaTile-FastSAM\memory\`. Key files:
+Project memory stored at `C:\Users\20871\.Codex\projects\E--A-postgraduate-stude-AdaTile-FastSAM\memory\`. Key files:
 - `two-paper-strategy.md` — Paper A/B split rationale and publication targets
 - `paper-b-evidence-chain.md` — Paper B complete theory chain: B-00→B-03 finalized
 - `spatial-sparsity-index.md` — SSI definition, criterion values, dataset applicability

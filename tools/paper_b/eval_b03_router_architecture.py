@@ -80,19 +80,24 @@ class MV3BaselineRouter(nn.Module):
 
     def __init__(self):
         super().__init__()
+        # 使用预训练 MV3-Small 作为特征提取器 | Use pretrained MV3-Small as feature extractor
         mnet = models.mobilenet_v3_small(weights="DEFAULT")
-        self.backbone = mnet.features  # stride=32, 576ch
+        self.backbone = mnet.features  # stride=32, 576ch — 输出 H/32×W/32
+        # 简单卷积头: 576→256→64→1 | Simple Conv head: 576→256→64→1
         self.head = nn.Sequential(
             nn.Conv2d(576, 256, 3, padding=1, bias=False), nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
             nn.Conv2d(256, 64, 3, padding=1, bias=False), nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, 1, 1, bias=True), nn.Sigmoid(),
+            nn.Conv2d(64, 1, 1, bias=True),   # 1×1 → 单通道重要性图 | pointwise → single channel importance
+            nn.Sigmoid(),                      # [0,1] 得分 | [0,1] scores
         )
+        # 冻结 backbone: 只训练 Head | Freeze backbone: train Head only
         for p in self.backbone.parameters():
             p.requires_grad = False
 
     def forward(self, x):
+        # 返回字典格式 (与其他 Router 接口统一) | Return dict format (unified interface with other routers)
         return {"importance": self.head(self.backbone(x))}
 
 
@@ -101,20 +106,25 @@ class MV3BaselineRouter(nn.Module):
 # ═══════════════════════════════════════════════════════════════════
 
 def render_semantic_mask(annotations, h, w):
+    """渲染语义掩码 [H,W] uint8 (category_id values) | Render semantic mask."""
     import cv2
     sem = np.zeros((h, w), dtype=np.uint8)
+    # 遍历所有标注 | Iterate over all annotations
     for ann in annotations:
         cat_id = ann.get("category_id", 0)
-        if cat_id <= 0: continue
+        if cat_id <= 0: continue  # 跳过忽略/背景 | skip ignore/background
         seg = ann.get("segmentation", [])
         if not seg:
+            # 没有多边形, 使用 bbox 填充 | No polygon, use bbox fill
             bbox = ann.get("bbox", [0, 0, 0, 0])
             sem[max(0, int(bbox[1])):min(h, int(bbox[1]+bbox[3])),
                 max(0, int(bbox[0])):min(w, int(bbox[0]+bbox[2]))] = cat_id
             continue
-        if isinstance(seg, dict): continue
+        if isinstance(seg, dict): continue  # RLE 格式, 跳过 | RLE format, skip
+        # 多边形填充: 支持单多边形或多边形列表 | Polygon fill: single polygon or list
         for poly in (seg if isinstance(seg[0], list) else [seg]):
             pts = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
+            # 裁剪到图像边界 | Clip to image bounds
             pts[:, :, 0] = np.clip(pts[:, :, 0], 0, w-1)
             pts[:, :, 1] = np.clip(pts[:, :, 1], 0, h-1)
             cv2.fillPoly(sem, [pts], cat_id)
@@ -122,34 +132,42 @@ def render_semantic_mask(annotations, h, w):
 
 
 def _preprocess_worker(args_tuple):
+    """独立进程: 渲染 mask → resize → 保存到缓存 | Standalone process: render mask → resize → save to cache."""
     img_id, img_path, anns, image_size, cache_dir = args_tuple
     try:
         from PIL import Image
         img = np.array(Image.open(img_path).convert("RGB"))
         H, W = img.shape[:2]
+        # 渲染语义掩码 | Render semantic mask
         mask = render_semantic_mask(anns, H, W)
+        # Resize: 保持宽高比 | Keep aspect ratio
         scale = image_size / max(H, W)
         nH, nW = int(H*scale), int(W*scale)
         img = np.array(Image.fromarray(img).resize((nW, nH), Image.BILINEAR))
         mask = np.array(Image.fromarray(mask).resize((nW, nH), Image.NEAREST))
+        # Pad 到方形 | Pad to square
         ph, pw = image_size-nH, image_size-nW
         if ph>0 or pw>0:
             img = np.pad(img, ((0,ph),(0,pw),(0,0)), mode="constant")
             mask = np.pad(mask, ((0,ph),(0,pw)), mode="constant")
+        # 归一化 + CHW | Normalize + CHW
         img = np.transpose(img.astype(np.float32)/255.0, (2,0,1))
         H2, W2 = mask.shape
+        # 每个维度的 tile 数量 | Tile count per dimension
         n_ty, n_tx = (H2+TILE_SIZE-1)//TILE_SIZE, (W2+TILE_SIZE-1)//TILE_SIZE
-        ts = np.zeros((n_ty, n_tx), dtype=np.float32)
-        fp = np.zeros(n_ty*n_tx, dtype=np.int64)
+        ts = np.zeros((n_ty, n_tx), dtype=np.float32)  # fg_ratio 网格 | fg_ratio grid
+        fp = np.zeros(n_ty*n_tx, dtype=np.int64)       # 前景像素数 | FG pixel count
         idx = 0
+        # 双循环遍历所有 tile | Double loop over all tiles
         for ty in range(n_ty):
             for tx in range(n_tx):
+                # 计算 tile 边界 (处理边界不完全 tile) | Compute bounds (handle partial edge tiles)
                 y0, y1 = ty*TILE_SIZE, min(ty*TILE_SIZE+TILE_SIZE, H2)
                 x0, x1 = tx*TILE_SIZE, min(tx*TILE_SIZE+TILE_SIZE, W2)
                 tm = mask[y0:y1, x0:x1]
                 tp = (y1-y0)*(x1-x0)
-                fp[idx] = int((tm>0).sum())
-                ts[ty, tx] = fp[idx]/max(tp,1)
+                fp[idx] = int((tm>0).sum())             # FG 像素数 | FG pixel count
+                ts[ty, tx] = fp[idx]/max(tp,1)          # fg_ratio = FG/total
                 idx += 1
         out = os.path.join(cache_dir, f"{img_id}.npz")
         np.savez_compressed(out, image=img, tile_scores=ts, fg_pixels=fp,
@@ -160,12 +178,16 @@ def _preprocess_worker(args_tuple):
 
 
 class CachedDataset(Dataset):
+    """从磁盘 .npz 文件按需加载 | Loads from .npz files on-demand."""
     def __init__(self, paths): self.paths = paths
     def __len__(self): return len(self.paths)
     def __getitem__(self, idx):
+        # 延迟加载: 避免 DataLoader pickle 大数组 | Lazy load: avoid pickling large arrays
         d = np.load(self.paths[idx])
-        return (torch.from_numpy(d["image"]), torch.from_numpy(d["tile_scores"]),
-                torch.from_numpy(d["fg_pixels"]), int(d["n_ty"]), int(d["n_tx"]))
+        return (torch.from_numpy(d["image"]),         # [3,S,S] 归一化图像 | normalized image
+                torch.from_numpy(d["tile_scores"]),    # [n_ty,n_tx] GT fg_ratio | GT fg_ratio grid
+                torch.from_numpy(d["fg_pixels"]),      # [n_tiles] FG 像素数 | FG pixel count
+                int(d["n_ty"]), int(d["n_tx"]))        # tile 网格维度 | tile grid dims
 
 
 def preprocess_to_cache(images, cache_dir):
@@ -187,22 +209,27 @@ def preprocess_to_cache(images, cache_dir):
 # ═══════════════════════════════════════════════════════════════════
 
 def train_epoch(model, loader, opt, device):
+    """训练一个 epoch | Train one epoch."""
     model.train()
     total_loss, n = 0.0, 0
     for imgs, gt_scores, fg_px, n_ty_arr, n_tx_arr in tqdm(loader, desc="  Train", leave=False):
         imgs = imgs.to(device)
         B = imgs.shape[0]
+        # 前向传播 → 重要性图 | Forward → importance map
         outputs = model(imgs)
-        imp = outputs["importance"]
+        imp = outputs["importance"]  # [B,1,H/S,W/S]
         _, _, hp, wp = imp.shape
 
         batch_loss = 0.0
-        STRIDE = 32 if hp >= 32 else 16  # MV3 → stride 32, TinyCNN → stride 16
-        TILE_F = TILE_SIZE // STRIDE
+        # STRIDE 自适应: MV3/R0/R2/R3 → 32, TinyCNN/R1 → 16 | STRIDE adaptive: MV3-based → 32, TinyCNN → 16
+        STRIDE = 32 if hp >= 32 else 16
+        TILE_F = TILE_SIZE // STRIDE  # 每个 tile 对应的特征像素数 | feature pixels per tile
+        # 逐样本遍历 | Per-sample iteration
         for b in range(B):
             gt = gt_scores[b].to(device)
             n_ty, n_tx = int(n_ty_arr[b]), int(n_tx_arr[b])
             preds, gts = [], []
+            # 遍历所有 tile: 重要性图区域平均 → tile 得分 | Iterate tiles: avg importance → tile score
             for ty in range(min(n_ty, hp//TILE_F)):
                 for tx in range(min(n_tx, wp//TILE_F)):
                     y0, y1 = ty*TILE_F, min(ty*TILE_F+TILE_F, hp)
@@ -212,6 +239,7 @@ def train_epoch(model, loader, opt, device):
                         gts.append(gt[ty, tx])
             if preds:
                 batch_loss += F.mse_loss(torch.stack(preds), torch.stack(gts))
+        # 梯度更新 | Gradient update
         opt.zero_grad(); batch_loss.backward(); opt.step()
         total_loss += batch_loss.item(); n += 1
     return total_loss/max(n, 1)
@@ -219,17 +247,21 @@ def train_epoch(model, loader, opt, device):
 
 @torch.no_grad()
 def evaluate(model, loader, device):
+    """评估: 计算 Pearson/Spearman + Oracle vs Learned FG 保留率 | Evaluate: Pearson/Spearman + FG retention."""
     model.eval()
     all_pred, all_gt, all_fg = [], [], []
     for imgs, gt_scores, fg_px, n_ty_arr, n_tx_arr in tqdm(loader, desc="  Eval", leave=False):
         imgs = imgs.to(device)
         B = imgs.shape[0]
+        # 前向传播 → 重要性图 | Forward → importance map
         outputs = model(imgs)
         imp = outputs["importance"]
         _, _, hp, wp = imp.shape
+        # STRIDE 自适应 | STRIDE adaptive
         STRIDE = 32 if hp >= 32 else 16
         TILE_F = TILE_SIZE // STRIDE
 
+        # 逐样本收集预测/GT | Per-sample prediction/GT collection
         for b in range(B):
             gt = gt_scores[b].numpy(); fg = fg_px[b].numpy()
             n_ty, n_tx = int(n_ty_arr[b]), int(n_tx_arr[b])
@@ -244,10 +276,13 @@ def evaluate(model, loader, device):
                         all_fg.append(int(fg[idx]))
                         idx += 1
 
-    if len(all_pred) < 50: return None
+    if len(all_pred) < 50: return None  # 样本不足 | Insufficient samples
+
     pa, ga, fa = np.array(all_pred), np.array(all_gt), np.array(all_fg)
+    # 计算相关性 | Compute correlations
     from scipy.stats import pearsonr, spearmanr
     pr, _ = pearsonr(pa, ga); sr, _ = spearmanr(pa, ga)
+    # 按 GT/预测 排序 → FG 保留率 | Sort by GT/pred → FG retention
     oo = np.argsort(ga)[::-1]; lo = np.argsort(pa)[::-1]
     oracle_r, learned_r = {}, {}
     for k in [20, 30, 40, 50]:
@@ -259,21 +294,26 @@ def evaluate(model, loader, device):
 
 
 def run_exp(name, router, train_loader, eval_loader, args, device):
+    """运行单个 Router 实验 | Run a single router experiment."""
     logger.log_info("b03/exp", f"{'='*40}")
     logger.log_info("b03/exp", f"Training {name}...")
+    # 统计可训练参数量 | Count trainable parameters
     n_p = sum(p.numel() for p in router.parameters() if p.requires_grad)
     logger.log_info("b03/exp", f"  Trainable: {n_p:,}")
 
     router = router.to(device)
+    # Adam + CosineAnnealingLR | Adam optimizer + cosine annealing scheduler
     opt = torch.optim.Adam([p for p in router.parameters() if p.requires_grad], lr=args.lr)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=1e-6)
 
+    # 训练循环 | Training loop
     for epoch in range(1, args.epochs+1):
         loss = train_epoch(router, train_loader, opt, device)
         sch.step()
         if epoch%10==0 or epoch==1:
             logger.log_info("b03/exp", f"  {name} E{epoch}/{args.epochs} loss={loss:.4f}")
 
+    # 评估 + 结果输出 | Evaluate + log results
     results = evaluate(router, eval_loader, device)
     if results:
         sr = results["spearman_r"]
@@ -304,10 +344,11 @@ def main():
                     f"B-03 Router Architecture | routers={router_names} "
                     f"train={args.train_images} epochs={args.epochs}")
 
-    # ── Data ──
+    # ── Data: 加载 iSAID COCO → image 列表 | Load iSAID COCO → image list ──
     src_root = Path(args.src_root)
     with open(src_root/"train"/"annotations"/"instances_train.json") as f:
         coco = json.load(f)
+    # 建立 image_id → annotations 索引 | Build image_id → annotations index
     img_id_to_anns = {}
     for ann in coco["annotations"]:
         img_id_to_anns.setdefault(ann["image_id"], []).append(ann)
@@ -319,6 +360,7 @@ def main():
             all_images.append((img_info["file_name"], str(img_dir/img_info["file_name"]),
                               anns, IMAGE_SIZE))
 
+    # Train/eval 随机划分 | Random train/eval split
     np.random.seed(args.seed)
     perm = np.random.permutation(len(all_images))
     n_train = min(args.train_images, len(all_images)-30)
@@ -335,21 +377,24 @@ def main():
                              shuffle=False, num_workers=args.num_workers,
                              pin_memory=(device=="cuda"), persistent_workers=(args.num_workers>0))
 
-    # ── Router Ablation ──
+    # ── Router Ablation: 实例化各变体 → 训练 → 评估 | Instantiate each variant → train → evaluate ──
     all_results = []
 
     for rname in router_names:
         if rname == "R0":
+            # R0: MV3 backbone + Simple Conv Head — B-02 基线 | B-02 baseline
             router = MV3BaselineRouter()
         elif rname == "R1":
+            # R1: Tiny CNN (4×Conv) — 极轻量下界, 约 20K 参数 | Lower bound, ~20K params
             router = TinyCNNRouter()
         elif rname == "R2":
-            # 主线 FDR: MV3 backbone + ForegroundDensityRouter
+            # R2: 主线 FDR — MV3 backbone + ForegroundDensityRouter (密度预测) | Main line: density prediction
             mnet = models.mobilenet_v3_small(weights="DEFAULT")
             backbone = mnet.features
             for p in backbone.parameters(): p.requires_grad = False
             router = nn.Sequential(backbone, ForegroundDensityRouter(576, 128))
         elif rname == "R3":
+            # R3: DualStream — 消融验证, 边缘 Head 是否在密度之上有额外贡献 | Ablation: does edge add beyond density?
             mnet = models.mobilenet_v3_small(weights="DEFAULT")
             backbone = mnet.features
             for p in backbone.parameters(): p.requires_grad = False
@@ -360,7 +405,7 @@ def main():
         r = run_exp(rname, router, train_loader, eval_loader, args, device)
         if r: all_results.append(r)
 
-    # ── Summary ──
+    # ── Summary: 消融结果汇总表 | Summary: ablation results table ──
     logger.log_info("b03/summary", f"{'='*60}")
     logger.log_info("b03/summary", "B-03 Router Architecture Ablation — Summary")
     logger.log_info("b03/summary",
@@ -376,13 +421,14 @@ def main():
         logger.log_info("b03/summary",
                         f"  {r['name']:<6} {r['params']:>10,} {r['spearman_r']:>11.4f} {gap:>9.2f}% {role_map.get(r['name'],''):<20}")
 
-    # ── Plot ──
+    # ── Plot: 3 面板可视化 | Plot: 3-panel visualization ──
     if all_results:
         fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
         names = [r["name"] for r in all_results]
         srs = [r["spearman_r"] for r in all_results]
         colors = ["#3498DB", "#95A5A6", "#27AE60", "#E67E22"]
 
+        # Panel 1: Spearman r 柱状图 (排序质量) | Spearman r bar chart (ranking quality)
         ax = axes[0]
         ax.bar(names, srs, color=colors[:len(names)], edgecolor="white")
         ax.axhline(y=0.889, color="gray", ls="--", alpha=0.5, label="B-02 MV3 baseline")
@@ -390,6 +436,7 @@ def main():
         for i, (n, v) in enumerate(zip(names, srs)):
             ax.text(i, v+0.01, f"{v:.3f}", ha="center", fontsize=9, fontweight="bold")
 
+        # Panel 2: 参数量柱状图 (对数坐标) | Parameter count bar chart (log scale)
         ax = axes[1]
         params = [r["params"] for r in all_results]
         ax.bar(names, params, color=colors[:len(names)], edgecolor="white")
@@ -398,11 +445,13 @@ def main():
         for i, (n, v) in enumerate(zip(names, params)):
             ax.text(i, v*1.2, f"{v:,}", ha="center", fontsize=8)
 
+        # Panel 3: Oracle-Learned Gap (越小越好) | Oracle-Learned Gap (lower=better)
         ax = axes[2]
         gaps = [(r["oracle_retention"][40]-r["learned_retention"][40])*100 for r in all_results]
         ax.bar(names, gaps, color=colors[:len(names)], edgecolor="white")
         ax.set_ylabel("Top40 Gap (%)"); ax.set_title("Oracle-Learned Gap (lower=better)"); ax.grid(axis="y", alpha=0.2)
 
+        # 标注 R2 基线 (主线) | Mark R2 baseline (main line)
         r2_gap = next((g for n, g in zip(names, gaps) if n == "R2"), None)
         if r2_gap:
             ax.axhline(y=r2_gap, color="#27AE60", ls="--", alpha=0.4, lw=1)
@@ -413,7 +462,7 @@ def main():
         fig.savefig(output_dir/"router_ablation.png", dpi=150, bbox_inches="tight")
         plt.close(fig)
 
-    # ── Save ──
+    # ── 保存 JSON 结果 (可复现) | Save JSON results (reproducible) ──
     summary = {"experiment": "B-03 Router Architecture Ablation",
                "design_principle": "Density over Edge — supervised by fg_ratio, learns objectness",
                "timestamp": datetime.datetime.now().isoformat(), "config": vars(args),

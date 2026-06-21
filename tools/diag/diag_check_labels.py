@@ -22,6 +22,7 @@ from PIL import Image
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_PROJECT_ROOT))
 
+# iSAID 类别名称映射 | iSAID category name mapping
 ISAID_NAMES = {
     0: "bg", 1: "small_vehicle", 2: "large_vehicle", 3: "plane",
     4: "storage_tank", 5: "ship", 6: "harbor", 7: "ground_track",
@@ -31,13 +32,15 @@ ISAID_NAMES = {
 
 
 def main():
-    p = argparse.ArgumentParser()
+    """主入口: 快速检查 train/val label 一致性 | Main entry: quick check train/val label consistency."""
+    p = argparse.ArgumentParser(description="Quick train/val label space check | 快速 train/val 标签空间检查")
     p.add_argument("--tile-root", type=str, required=True)
     args = p.parse_args()
 
     root = Path(args.tile_root)
     random.seed(42)
 
+    # ═══ 逐 split 统计像素值分布 | Per-split pixel value distribution ═══
     for split in ["train", "val"]:
         mask_dir = root / "masks" / split
         if not mask_dir.exists():
@@ -49,8 +52,9 @@ def main():
         samples = random.sample(files, n_sample)
 
         # 统计所有出现过的像素值 + 每个值覆盖多少 tile
+        # Count all unique pixel values + how many tiles each value appears in
         value_counter = Counter()
-        value_tiles = Counter()  # 每个值出现在多少个 tile
+        value_tiles = Counter()  # 每个值出现在多少个 tile | tiles each value appears in
 
         for f in samples:
             m = np.array(Image.open(f))
@@ -58,7 +62,7 @@ def main():
                 value_counter[int(v)] += 1
                 value_tiles[int(v)] += 1
 
-        # 同时采样几个具体 tile 的 unique
+        # 展示样本 tile 详情 | Show sample tile details
         show_n = min(5, n_sample)
         print(f"\n{'='*60}")
         print(f"  [{split.upper()}] {len(files)} total tiles, sampled {n_sample}")
@@ -71,6 +75,7 @@ def main():
             names = [f"{v}({ISAID_NAMES.get(v, '?')})" for v in vals if v > 0]
             print(f"  {f.name}: values={vals} fg={fg_pct:.1f}% → {names}")
 
+        # 值分布汇总 | Value distribution summary
         print(f"\n  Value distribution across {n_sample} tiles:")
         print(f"  {'Val':<5} {'Name':<18} {'#Tiles':>8} {'Expected?':>10}")
         print(f"  {'-'*50}")
@@ -79,7 +84,7 @@ def main():
             flag = "" if v in ISAID_NAMES else " ⚠️ UNKNOWN"
             print(f"  {v:<5} {name:<18} {value_tiles[v]:>8}{flag}")
 
-    # ── 对比 | Comparison ──
+    # ═══ Train vs Val 对比 | Train vs Val Comparison ═══
     print(f"\n{'='*60}")
     print(f"  COMPARISON | 对比")
     print(f"{'='*60}")
@@ -92,7 +97,6 @@ def main():
         samples = random.sample(files, min(200, len(files)))
         for f in samples:
             m = np.array(Image.open(f))
-            train_vals if split == "train" else val_vals
             (train_vals if split == "train" else val_vals).update(np.unique(m).tolist())
 
     train_only = train_vals - val_vals
@@ -103,12 +107,15 @@ def main():
     print(f"  Train-only:     {sorted(train_only)}")
     print(f"  Val-only:       {sorted(val_only)}")
 
+    # 判定 | Verdict
     if train_only or val_only:
         print(f"\n  ❌ LABEL SPACE MISMATCH!")
         print(f"     Train and val have DIFFERENT pixel value sets.")
         print(f"     This is the root cause of val mIoU ≈ 0.")
+        print(f"     Train 和 Val 的像素值集合不同，这是 val mIoU≈0 的根本原因。")
     else:
         print(f"\n  ✅ Label space CONSISTENT between train and val.")
+        print(f"     Train 和 Val 标签空间一致。")
 
     # ── 时间戳检查 | Timestamp check ──
     print(f"\n{'='*60}")

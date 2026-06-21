@@ -61,15 +61,33 @@ def parse_args():
 
 
 class ProtoHead(nn.Module):
+    """
+    多类别 ProtoHead | Multi-Class Proto Head (同 E010/E011-T 架构).
+
+    P4 → Conv(1280→D)→ReLU → CosineSim(N protos) → Conv(N→C)→logit.
+    用于 E011-U: 扫描 N ∈ {2,4,8,16,32,64}, 分析 Proto 容量瓶颈。
+    """
+
     def __init__(self, in_channels=1280, embed_dim=128, n_protos=16, num_classes=15):
         super().__init__()
         self.n_protos = n_protos
+        # 特征投影 | Feature projection
         self.project = nn.Sequential(
             nn.Conv2d(in_channels, embed_dim, 1, bias=False), nn.ReLU(inplace=True))
+        # 可学习原型向量 | Learnable prototype vectors [N, D]
         self.prototypes = nn.Parameter(torch.randn(n_protos, embed_dim) * 0.1)
+        # 多类别分割头 | Multi-class segmentation head: N → C
         self.head = nn.Conv2d(n_protos, num_classes, 1, bias=True)
 
     def forward(self, p4, temperature=0.1):
+        """
+        前向传播 | Forward pass.
+
+        Returns:
+            embedding: [B, D, H, W] 低维嵌入
+            sim_maps:  [B, N, H, W] proto 相似度图
+            logit:     [B, C, H, W] 多类别 logit
+        """
         emb = self.project(p4)
         emb_n = F.normalize(emb, dim=1, p=2)
         p_n = F.normalize(self.prototypes, dim=1, p=2)
@@ -78,6 +96,15 @@ class ProtoHead(nn.Module):
 
 
 def train_proto(proto_head, backbone, train_ds, args, device):
+    """
+    训练 ProtoHead | Train ProtoHead.
+
+    使用多类别交叉熵 (ignore_index=255) 训练。
+    Validation 在 train subset 上快速评估 (节省全量 val 时间)。
+
+    Returns:
+        best_miou: 最佳验证 mIoU
+    """
     proto_head.train()
     opt = torch.optim.Adam(proto_head.parameters(), lr=args.lr)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -141,7 +168,19 @@ def train_proto(proto_head, backbone, train_ds, args, device):
 
 @torch.no_grad()
 def analyze_proto(proto_head, backbone, val_ds, device, args):
-    """分析 Proto 使用: mIoU, Eff N, BG count, entropy."""
+    """
+    分析 Proto 使用效率 | Analyze proto utilization efficiency.
+
+    Measures five dimensions:
+      - mIoU:          分割质量 | segmentation quality
+      - Eff N:         有效 Proto 数 (1/Σp_i², 逆 Herfindahl)
+      - n_bg:          背景主导 Proto 数 (>50% 像素分配到 class 0)
+      - n_active:      活跃 Proto 数 (总像素 >100)
+      - entropy:       平均 Proto 类别熵
+
+    Returns:
+        dict with keys: miou, eff_n, n_bg, n_active, entropy
+    """
     proto_head.eval()
     n_p = proto_head.n_protos
     proto_class = np.zeros((n_p, args.num_classes))
@@ -179,21 +218,26 @@ def analyze_proto(proto_head, backbone, val_ds, device, args):
 
     miou = float(np.mean(mious))
     row_sums = proto_class.sum(axis=1, keepdims=True) + 1e-8
-    pct = proto_class / row_sums
+    pct = proto_class / row_sums  # [N, C] 每个 Proto 的类别分布 | per-proto class distribution
 
-    # Eff N (1 / Σp_i²)
-    usage = proto_class.sum(axis=1)
-    usage_p = usage / (usage.sum() + 1e-8)
+    # 有效 Proto 数: 1 / Σp_i² (逆 Herfindahl-Hirschman 指数)
+    # Eff N: 1 / Σp_i² — inverse Herfindahl index. 衡量使用集中度.
+    # 值接近 N → 均匀使用; 值小 → 少数 Proto 主导.
+    usage = proto_class.sum(axis=1)  # 每个 Proto 的总像素 | total pixels per proto
+    usage_p = usage / (usage.sum() + 1e-8)  # 归一化使用率 | normalized usage ratio
     eff_n = 1.0 / (usage_p**2).sum()
 
+    # 背景主导 Proto: >50% 像素为背景 (class 0)
     n_bg = int((pct[:, 0] > 0.5).sum())
+    # 活跃 Proto: 总像素超过 100 (有统计意义)
     n_active = int((usage > 100).sum())
 
-    # Proto entropy
+    # Proto 类别熵 (越高 → Proto 越多样化)
+    # Proto category entropy (higher → more diverse per-proto class assignment)
     ents = []
     for p in range(n_p):
         dist = pct[p] + 1e-8; dist /= dist.sum()
-        ents.append(-(dist * np.log(dist)).sum())
+        ents.append(-(dist * np.log(dist)).sum())  # Shannon entropy
     active_ents = [e for p, e in enumerate(ents) if usage[p] > 100]
     ent_mean = float(np.mean(active_ents)) if active_ents else 0.0
 

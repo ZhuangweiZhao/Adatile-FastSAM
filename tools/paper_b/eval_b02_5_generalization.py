@@ -160,44 +160,52 @@ def render_semantic_mask(annotations: list, h: int, w: int) -> np.ndarray:
 
 
 def _preprocess_worker(args_tuple):
-    """预处理 worker: 渲染 mask → resize → 保存 .npz."""
+    """预处理 worker: 渲染 mask → resize → 保存 .npz | Preprocess worker: render mask → resize → save .npz."""
     img_id, img_path, anns, image_size, cache_dir = args_tuple
     try:
         from PIL import Image
         img = np.array(Image.open(img_path).convert("RGB"))
         H, W = img.shape[:2]
+        # 渲染语义分割掩码 | Render semantic mask
         mask = render_semantic_mask(anns, H, W)
 
+        # Resize: 保持宽高比缩放到固定尺寸 | Resize: keep aspect ratio, scale to fixed square
         scale = image_size / max(H, W)
         new_H, new_W = int(H * scale), int(W * scale)
         img = np.array(Image.fromarray(img).resize((new_W, new_H), Image.BILINEAR))
         mask = np.array(Image.fromarray(mask).resize((new_W, new_H), Image.NEAREST))
 
+        # Pad: 右侧/底部补零到方形 | Zero-pad to square
         pad_h, pad_w = image_size - new_H, image_size - new_W
         if pad_h > 0 or pad_w > 0:
             img = np.pad(img, ((0, pad_h), (0, pad_w), (0, 0)), mode="constant")
             mask = np.pad(mask, ((0, pad_h), (0, pad_w)), mode="constant")
 
+        # 归一化 + CHW 转换 | Normalize + CHW conversion
         img = img.astype(np.float32) / 255.0
         img = np.transpose(img, (2, 0, 1))
 
         H2, W2 = mask.shape
+        # 计算每个维度 tile 数量 | Compute tile counts per dimension
         n_ty = (H2 + TILE_SIZE - 1) // TILE_SIZE
         n_tx = (W2 + TILE_SIZE - 1) // TILE_SIZE
-        tile_scores = np.zeros((n_ty, n_tx), dtype=np.float32)
-        fg_pixels = np.zeros(n_ty * n_tx, dtype=np.int64)
-        # Per-class FG per tile | 每类前景像素
+        tile_scores = np.zeros((n_ty, n_tx), dtype=np.float32)  # fg_ratio 网格 | fg_ratio grid
+        fg_pixels = np.zeros(n_ty * n_tx, dtype=np.int64)       # 总 FG 像素 | total FG pixels
+        # Per-class FG per tile: 用于类别过滤评估 | For class-filtered evaluation
         class_fg = np.zeros((n_ty * n_tx, 16), dtype=np.int64)
         idx = 0
+        # 双循环遍历所有 tile | Double loop over all tiles
         for ty in range(n_ty):
             for tx in range(n_tx):
                 y0, y1 = ty * TILE_SIZE, min(ty * TILE_SIZE + TILE_SIZE, H2)
                 x0, x1 = tx * TILE_SIZE, min(tx * TILE_SIZE + TILE_SIZE, W2)
                 tile_mask = mask[y0:y1, x0:x1]
                 total_px = (y1 - y0) * (x1 - x0)
+                # 前景占比 = fg_pixels / total_pixels | FG ratio
                 fg_px = int((tile_mask > 0).sum())
                 tile_scores[ty, tx] = fg_px / max(total_px, 1)
                 fg_pixels[idx] = fg_px
+                # 统计每类 FG 像素 (class 1-15) | Count FG pixels per class
                 for c in range(1, 16):
                     class_fg[idx, c] = int((tile_mask == c).sum())
                 idx += 1
@@ -221,12 +229,13 @@ class CachedDataset(Dataset):
         return len(self.paths)
 
     def __getitem__(self, idx):
+        # 从 .npz 延迟加载: 避免 DataLoader pickle 大数组 | Lazy load from .npz: avoid pickling large arrays
         data = np.load(self.paths[idx])
-        return (torch.from_numpy(data["image"]),
-                torch.from_numpy(data["tile_scores"]),
-                torch.from_numpy(data["fg_pixels"]),
-                torch.from_numpy(data["class_fg"]),
-                int(data["n_ty"]), int(data["n_tx"]))
+        return (torch.from_numpy(data["image"]),         # [3,S,S] 归一化图像 | normalized image
+                torch.from_numpy(data["tile_scores"]),    # [n_ty,n_tx] GT fg_ratio 网格 | GT fg_ratio grid
+                torch.from_numpy(data["fg_pixels"]),      # [n_tiles] 前景像素数 | FG pixel count
+                torch.from_numpy(data["class_fg"]),       # [n_tiles,16] 每类 FG 像素 | per-class FG pixels
+                int(data["n_ty"]), int(data["n_tx"]))     # tile 网格尺寸 | tile grid dimensions
 
 
 def preprocess_to_cache(images: list, image_size: int, cache_dir: str) -> list[str]:
@@ -250,20 +259,23 @@ def preprocess_to_cache(images: list, image_size: int, cache_dir: str) -> list[s
 # ═══════════════════════════════════════════════════════════════════
 
 def train_epoch(model, loader, opt, device):
-    """训练一个 epoch."""
+    """训练一个 epoch | Train one epoch."""
     model.train()
     total_loss, n = 0.0, 0
     for imgs, gt_scores, fg_px, class_fg, n_ty_arr, n_tx_arr in tqdm(loader, desc="  Train", leave=False):
         imgs = imgs.to(device)
         B = imgs.shape[0]
+        # 前向传播: 图像 → 重要性图 | Forward: image → importance map
         imp_maps = model(imgs)
         _, _, hp, wp = imp_maps.shape
 
         batch_loss = 0.0
+        # 逐样本: 每个样本可能不同的 tile 数量 | Per-sample: varying tile counts per image
         for b in range(B):
             gt = gt_scores[b].to(device)
             n_ty, n_tx = int(n_ty_arr[b]), int(n_tx_arr[b])
             pred_list, gt_list = [], []
+            # 固定 stride=32: MV3 backbone 下采样 32× | Fixed stride=32: MV3 downsamples 32×
             for ty in range(min(n_ty, hp // 32)):
                 for tx in range(min(n_tx, wp // 32)):
                     y0, y1 = ty * 32, min(ty * 32 + 32, hp)
@@ -274,6 +286,7 @@ def train_epoch(model, loader, opt, device):
             if pred_list:
                 batch_loss += F.mse_loss(torch.stack(pred_list), torch.stack(gt_list))
 
+        # 梯度更新 | Gradient update
         opt.zero_grad()
         batch_loss.backward()
         opt.step()
@@ -294,13 +307,14 @@ def evaluate_model(model, loader, device, class_filter=None):
     for imgs, gt_scores, fg_px, class_fg, n_ty_arr, n_tx_arr in tqdm(loader, desc="  Eval", leave=False):
         imgs = imgs.to(device)
         B = imgs.shape[0]
+        # 前向传播 → 重要性图 | Forward → importance map
         imp_maps = model(imgs)
         _, _, hp, wp = imp_maps.shape
 
         for b in range(B):
             gt = gt_scores[b].numpy()
             fg = fg_px[b].numpy()
-            cf = class_fg[b].numpy()
+            cf = class_fg[b].numpy()  # 每类 FG 像素矩阵 | per-class FG pixel matrix
             n_ty, n_tx = int(n_ty_arr[b]), int(n_tx_arr[b])
 
             idx = 0
@@ -309,8 +323,9 @@ def evaluate_model(model, loader, device, class_filter=None):
                     y0, y1 = ty * 32, min(ty * 32 + 32, hp)
                     x0, x1 = tx * 32, min(tx * 32 + 32, wp)
                     if y1 > y0 and x1 > x0 and ty < gt.shape[0] and tx < gt.shape[1]:
-                        # 类别过滤 | Class filter
+                        # 类别过滤: 如果指定了 class_filter, 只保留包含目标类别的 tile | Class filter: if set, keep only tiles containing target classes
                         if class_filter is not None:
+                            # 检查 tile 是否包含至少一个指定类别的像素 | Check if tile contains at least one pixel of target classes
                             has_target_class = any(cf[idx, c] > 0 for c in class_filter)
                             if not has_target_class:
                                 idx += 1
@@ -327,13 +342,16 @@ def evaluate_model(model, loader, device, class_filter=None):
     gt_all = np.array(all_gt)
     fg_all = np.array(all_fg)
 
+    # 计算 Pearson (线性相关) 和 Spearman (排序相关) | Compute Pearson and Spearman correlation
     from scipy.stats import pearsonr, spearmanr
     pr, _ = pearsonr(pred_all, gt_all)
     sr, _ = spearmanr(pred_all, gt_all)
 
+    # 按真实密度/预测得分排序 → 计算 FG 保留率 | Sort by true density / predicted score → compute FG retention
     oracle_ord = np.argsort(gt_all)[::-1]
     learned_ord = np.argsort(pred_all)[::-1]
 
+    # 对每个 Top-K% 计算保留的 FG 占比 | For each Top-K%, compute fraction of FG retained
     oracle_r, learned_r = {}, {}
     for k in [20, 30, 40, 50]:
         n = max(1, int(len(gt_all) * k / 100))
@@ -348,14 +366,16 @@ def evaluate_model(model, loader, device, class_filter=None):
 
 
 def print_results(results, label, logger_tag):
-    """打印结果 (日志) | Print results (logged)."""
+    """打印结果到日志 | Print results to log."""
     if results is None:
         logger.log_info(logger_tag, f"{label}: INSUFFICIENT DATA")
         return
+    # 输出 Pearson/Spearman 相关性 + tile 数量 | Output correlation + tile count
     logger.log_info(logger_tag,
                     f"{label}: Pearson r={results['pearson_r']:.4f}  "
                     f"Spearman r={results['spearman_r']:.4f}  "
                     f"N={results['n_tiles']:,}")
+    # 输出 Top-K FG 保留率表格 | Output Top-K FG retention table
     logger.log_info(logger_tag,
                     f"  {'K%':<7} {'Oracle':>9} {'Learned':>9} {'Gap':>7}")
     for k in [20, 30, 40, 50]:
@@ -370,16 +390,18 @@ def print_results(results, label, logger_tag):
 # ═══════════════════════════════════════════════════════════════════
 
 def run_exp_a(args, all_images, cache_dir):
-    """iSAID train → iSAID val (同分布基线)."""
+    """iSAID train → iSAID val (同分布基线) | Same-distribution baseline."""
     logger.log_info("b02_5/expA", "=" * 50)
     logger.log_info("b02_5/expA", "Experiment A: iSAID → iSAID val (same-distribution)")
 
+    # Train/eval 随机划分 | Random train/eval split
     np.random.seed(args.seed)
     perm = np.random.permutation(len(all_images))
     n_train = min(args.train_images, len(all_images) - 30)
     train_imgs = [all_images[i] for i in perm[:n_train]]
     eval_imgs = [all_images[i] for i in perm[n_train:min(n_train + 50, len(all_images))]]
 
+    # 预处理 + 缓存 | Preprocess + cache
     train_cache = os.path.join(cache_dir, "A_train")
     eval_cache = os.path.join(cache_dir, "A_eval")
     train_paths = preprocess_to_cache(train_imgs, IMAGE_SIZE, train_cache)
@@ -388,6 +410,7 @@ def run_exp_a(args, all_images, cache_dir):
     train_ds = CachedDataset(train_paths)
     eval_ds = CachedDataset(eval_paths)
 
+    # DataLoader: 训练集 shuffle + pin_memory (GPU) | Train: shuffle + pin_memory for GPU
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers,
                               pin_memory=(args.device == "cuda"),
@@ -397,16 +420,19 @@ def run_exp_a(args, all_images, cache_dir):
                              pin_memory=(args.device == "cuda"),
                              persistent_workers=(args.num_workers > 0))
 
+    # 模型: MV3 backbone (frozen) + Conv Head (trainable)
     model = MobileNetSpatialRouter(pretrained=True).to(args.device)
     opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=1e-6)
 
+    # 训练循环 | Training loop
     for epoch in range(1, args.epochs + 1):
         loss = train_epoch(model, train_loader, opt, args.device)
         sch.step()
         if epoch % 5 == 0 or epoch == 1:
             logger.log_info("b02_5/expA", f"E{epoch}/{args.epochs} loss={loss:.4f}")
 
+    # 评估 + 输出 | Evaluate + print
     results = evaluate_model(model, eval_loader, args.device)
     print_results(results, "Exp A: same-dist", "b02_5/expA")
     return results, model
@@ -423,7 +449,7 @@ def run_exp_b(args, all_images, cache_dir):
                     f"Experiment B: Class Generalization "
                     f"(holdout {args.holdout_classes} classes)")
 
-    # 随机选择 hold-out 类别 | Randomly select hold-out classes
+    # 随机选择 hold-out 类别 (15 类中随机挑 N 类) | Randomly select hold-out classes from 15
     np.random.seed(args.seed)
     all_classes = list(range(1, 16))
     holdout_classes = sorted(np.random.choice(all_classes, size=args.holdout_classes,
@@ -436,8 +462,8 @@ def run_exp_b(args, all_images, cache_dir):
     logger.log_info("b02_5/expB",
                     f"Train classes: {train_classes}")
 
-    # 分组图片: 至少包含训练类 FG 的 → 训练, 主要包含 hold-out 类的 → 测试
-    # Group images: ones with train-class FG → train, holdout-dominant → test
+    # 分组图片: 图像级使用全部标注图 → tile 级过滤在评估时做
+    # Image-level: use all annotated images → tile-level filtering at evaluation
     np.random.seed(args.seed)
     perm = np.random.permutation(len(all_images))
 
@@ -450,11 +476,12 @@ def run_exp_b(args, all_images, cache_dir):
         if len(train_imgs) >= args.train_images:
             break
 
-    # 测试: 取后面的一些图
+    # 测试: 取后面的 50 张图 | Test: take next 50 images
     test_start = min(args.train_images + 30, len(all_images) - 20)
     for i in perm[test_start:test_start + 50]:
         test_imgs.append(all_images[i])
 
+    # 预处理 + 缓存 | Preprocess + cache
     train_cache = os.path.join(cache_dir, "B_train")
     test_cache = os.path.join(cache_dir, "B_test")
     train_paths = preprocess_to_cache(train_imgs, IMAGE_SIZE, train_cache)
@@ -472,27 +499,30 @@ def run_exp_b(args, all_images, cache_dir):
                              pin_memory=(args.device == "cuda"),
                              persistent_workers=(args.num_workers > 0))
 
+    # 模型 + 优化器 | Model + optimizer
     model = MobileNetSpatialRouter(pretrained=True).to(args.device)
     opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=1e-6)
 
+    # 训练循环 | Training loop
     for epoch in range(1, args.epochs + 1):
         loss = train_epoch(model, train_loader, opt, args.device)
         sch.step()
         if epoch % 5 == 0 or epoch == 1:
             logger.log_info("b02_5/expB", f"E{epoch}/{args.epochs} loss={loss:.4f}")
 
-    # ── 评估 (三类) | Evaluate (three ways) ──
+    # ── 三类评估: B1=全部, B2=仅 holdout 类, B3=仅训练类(对照) ──
+    # ── Three-way evaluation: B1=all tiles, B2=holdout only, B3=train classes (control) ──
     # B1: 全部 tile (与 B-02 相同) | All tiles (same as B-02)
     r_all = evaluate_model(model, test_loader, args.device, class_filter=None)
     print_results(r_all, "Exp B1: all tiles", "b02_5/expB")
 
-    # B2: 仅 hold-out 类 tile | Only tiles with holdout classes
+    # B2: 仅 hold-out 类 tile — 关键指标: 如果 r 仍高 → 类别无关 | Only holdout-class tiles — key: if r still high → category-agnostic
     r_holdout = evaluate_model(model, test_loader, args.device,
                                class_filter=holdout_classes)
     print_results(r_holdout, f"Exp B2: holdout classes {holdout_classes}", "b02_5/expB")
 
-    # B3: 仅训练类 tile (作为对照) | Only train-class tiles (control)
+    # B3: 仅训练类 tile (作为对照) — 期望 r 与 B-02 基线一致 | Only train-class tiles (control) — expect r similar to B-02 baseline
     r_train_cls = evaluate_model(model, test_loader, args.device,
                                  class_filter=train_classes)
     print_results(r_train_cls, "Exp B3: train classes (control)", "b02_5/expB")
@@ -514,6 +544,7 @@ def load_cityscapes_images(cityscapes_root: str) -> list:
     从 mask 计算 fg_ratio (0=bg, 1-18=前景, 255=ignore).
     """
     root = Path(cityscapes_root)
+    # Cityscapes tile 目录结构 | Cityscapes tile directory structure
     img_dir = root / "images" / "train"
     mask_dir = root / "masks" / "train"
 
@@ -523,6 +554,7 @@ def load_cityscapes_images(cityscapes_root: str) -> list:
                         f"Run prep_cityscapes.py first.")
         return []
 
+    # 匹配图像和 mask 文件 | Match image and mask files
     images = []
     for png in sorted(img_dir.glob("*.png")):
         mask_path = mask_dir / png.name
@@ -539,13 +571,15 @@ def _preprocess_cityscapes_worker(args_tuple):
         img = np.array(Image.open(img_path).convert("RGB"))
         H, W = img.shape[:2]
 
-        # 读 Cityscapes mask (trainId, 0=bg 1-18=class 255=ignore)
+        # 读 Cityscapes mask (trainId: 0=bg, 1-18=class, 255=ignore)
+        # Read Cityscapes mask
         mask_path = img_path.replace("images", "masks")
         mask = np.array(Image.open(mask_path))
 
-        # 255→0 (ignore→bg for fg_ratio calculation)
+        # 255→0: 将 ignore 标签视为背景 (fg_ratio 计算用) | Treat ignore label as background for fg_ratio
         mask_clean = np.where(mask == 255, 0, mask)
 
+        # Resize + Pad | Resize + pad
         scale = image_size / max(H, W)
         new_H, new_W = int(H * scale), int(W * scale)
         img = np.array(Image.fromarray(img).resize((new_W, new_H), Image.BILINEAR))
@@ -557,15 +591,17 @@ def _preprocess_cityscapes_worker(args_tuple):
             img = np.pad(img, ((0, pad_h), (0, pad_w), (0, 0)), mode="constant")
             mask_clean = np.pad(mask_clean, ((0, pad_h), (0, pad_w)), mode="constant")
 
+        # 归一化 + CHW 转换 | Normalize + CHW
         img = img.astype(np.float32) / 255.0
         img = np.transpose(img, (2, 0, 1))
 
+        # 计算 tile fg_ratio (Cityscapes: fg = classes 1-18) | Compute tile fg_ratio
         H2, W2 = mask_clean.shape
         n_ty = (H2 + TILE_SIZE - 1) // TILE_SIZE
         n_tx = (W2 + TILE_SIZE - 1) // TILE_SIZE
         tile_scores = np.zeros((n_ty, n_tx), dtype=np.float32)
         fg_pixels = np.zeros(n_ty * n_tx, dtype=np.int64)
-        class_fg = np.zeros((n_ty * n_tx, 20), dtype=np.int64)
+        class_fg = np.zeros((n_ty * n_tx, 20), dtype=np.int64)  # 0-19 classes
         idx = 0
         for ty in range(n_ty):
             for tx in range(n_tx):
@@ -598,6 +634,7 @@ def load_loveda_images(loveda_root: str) -> list:
     Mask 值: 0=bg, 1=background, 2=building, 3=road, 4=water, 5=barren, 6=forest, 7=agriculture
     """
     root = Path(loveda_root)
+    # LoveDA 目录结构 (Rural 场景) | LoveDA directory structure (Rural scene)
     img_dir = root / "Train" / "Train" / "Rural" / "images_png"
     mask_dir = root / "Train" / "Train" / "Rural" / "masks_png"
 
@@ -607,6 +644,7 @@ def load_loveda_images(loveda_root: str) -> list:
                         f"Expected: {img_dir} and {mask_dir}")
         return []
 
+    # 匹配图像和 mask 文件 | Match image and mask files
     images = []
     for png in sorted(img_dir.glob("*.png")):
         mask_path = mask_dir / png.name
@@ -619,6 +657,7 @@ def _preprocess_loveda_worker(args_tuple):
     """
     LoveDA 预处理 worker | LoveDA preprocessing worker.
     LoveDA 已经是 1024×1024, mask 是 uint8 class IDs.
+    LoveDA native images are 1024×1024, mask is uint8 class IDs.
     """
     img_id, img_path, _, image_size, cache_dir = args_tuple
 
@@ -627,32 +666,36 @@ def _preprocess_loveda_worker(args_tuple):
         img = np.array(Image.open(img_path).convert("RGB"))
         H, W = img.shape[:2]
 
-        # 读 LoveDA mask (uint8 class IDs, 0=bg 1-7=classes)
+        # 读 LoveDA mask (uint8 class IDs: 0=bg, 1-7=classes)
+        # Read LoveDA mask
         mask_path = img_path.replace("images_png", "masks_png")
         mask = np.array(Image.open(mask_path))
 
-        # Resize
+        # Resize 到固定尺寸 | Resize to fixed size
         scale = image_size / max(H, W)
         new_H, new_W = int(H * scale), int(W * scale)
         img = np.array(Image.fromarray(img).resize((new_W, new_H), Image.BILINEAR))
         mask = np.array(Image.fromarray(mask).resize((new_W, new_H), Image.NEAREST))
 
-        # Pad
+        # Pad 到方形 | Pad to square
         pad_h, pad_w = image_size - new_H, image_size - new_W
         if pad_h > 0 or pad_w > 0:
             img = np.pad(img, ((0, pad_h), (0, pad_w), (0, 0)), mode="constant")
             mask = np.pad(mask, ((0, pad_h), (0, pad_w)), mode="constant")
 
+        # 归一化 + CHW | Normalize + CHW
         img = img.astype(np.float32) / 255.0
         img = np.transpose(img, (2, 0, 1))
 
+        # 计算 tile fg_ratio (LoveDA: fg = classes 1-7) | Compute tile fg_ratio
         H2, W2 = mask.shape
         n_ty = (H2 + TILE_SIZE - 1) // TILE_SIZE
         n_tx = (W2 + TILE_SIZE - 1) // TILE_SIZE
         tile_scores = np.zeros((n_ty, n_tx), dtype=np.float32)
         fg_pixels = np.zeros(n_ty * n_tx, dtype=np.int64)
-        class_fg = np.zeros((n_ty * n_tx, 8), dtype=np.int64)  # 0-7 classes
+        class_fg = np.zeros((n_ty * n_tx, 8), dtype=np.int64)  # LoveDA: 0-7 classes
         idx = 0
+        # 遍历所有 tile | Iterate all tiles
         for ty in range(n_ty):
             for tx in range(n_tx):
                 y0, y1 = ty * TILE_SIZE, min(ty * TILE_SIZE + TILE_SIZE, H2)
@@ -675,8 +718,9 @@ def _preprocess_loveda_worker(args_tuple):
 
 def run_exp_c(args, isaid_all_images, cache_dir):
     """
-    iSAID → 跨数据集 (Cityscapes 或 LoveDA)
-    iSAID → cross-dataset (Cityscapes or LoveDA).
+    iSAID → 跨数据集 (Cityscapes 或 LoveDA) | iSAID → cross-dataset (Cityscapes or LoveDA).
+    训练: iSAID 航拍; 测试: Cityscapes/LoveDA (不同域/类别/分辨率).
+    Train: iSAID aerial; Test: Cityscapes/LoveDA (different domain/classes/resolution).
     """
     test_dataset = args.test_dataset
 
@@ -706,6 +750,7 @@ def run_exp_c(args, isaid_all_images, cache_dir):
     n_train = min(args.train_images, len(isaid_all_images) - 20)
     train_imgs = [isaid_all_images[i] for i in perm[:n_train]]
 
+    # 预处理 iSAID 训练数据 | Preprocess iSAID training data
     train_cache = os.path.join(cache_dir, "C_train_isaid")
     train_paths = preprocess_to_cache(train_imgs, IMAGE_SIZE, train_cache)
     train_ds = CachedDataset(train_paths)
@@ -714,7 +759,7 @@ def run_exp_c(args, isaid_all_images, cache_dir):
                               pin_memory=(args.device == "cuda"),
                               persistent_workers=(args.num_workers > 0))
 
-    # ── 预处理目标测试集 | Preprocess target test set ──
+    # ── 预处理目标测试集 (使用数据集专属的 worker) | Preprocess target test set (dataset-specific worker) ──
     test_cache = os.path.join(cache_dir, f"C_test_{test_dataset}")
     os.makedirs(test_cache, exist_ok=True)
     tasks = [(img_id, img_path, anns, IMAGE_SIZE, test_cache)
@@ -738,17 +783,19 @@ def run_exp_c(args, isaid_all_images, cache_dir):
                              pin_memory=(args.device == "cuda"),
                              persistent_workers=(args.num_workers > 0))
 
-    # ── 训练 + 测试 | Train + test ──
+    # ── 训练 (仅在 iSAID 上) + 跨域测试 | Train (iSAID only) + cross-domain test ──
     model = MobileNetSpatialRouter(pretrained=True).to(args.device)
     opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=1e-6)
 
+    # 训练循环: 只用 iSAID 训练 | Training loop: iSAID training only
     for epoch in range(1, args.epochs + 1):
         loss = train_epoch(model, train_loader, opt, args.device)
         sch.step()
         if epoch % 5 == 0 or epoch == 1:
             logger.log_info("b02_5/expC", f"E{epoch}/{args.epochs} loss={loss:.4f}")
 
+    # 在目标数据集上测试 (零样本迁移) | Test on target dataset (zero-shot transfer)
     results = evaluate_model(model, test_loader, args.device, class_filter=None)
     print_results(results, f"Exp C: iSAID → {test_dataset}", "b02_5/expC")
     return results, model
@@ -767,7 +814,7 @@ def main():
 
     cache_root = args.cache_dir or str(output_dir / "cache")
 
-    # ── 加载 iSAID COCO ──
+    # ── 加载 iSAID COCO 标注 | Load iSAID COCO annotations ──
     src_root = Path(args.src_root)
     ann_file = src_root / "train" / "annotations" / "instances_train.json"
     if not ann_file.exists():
@@ -777,6 +824,7 @@ def main():
     with open(ann_file) as f:
         coco = json.load(f)
 
+    # 建立 image_id → annotations 索引 | Build image_id → annotations index
     img_id_to_anns = {}
     for ann in coco["annotations"]:
         img_id_to_anns.setdefault(ann["image_id"], []).append(ann)
@@ -793,7 +841,7 @@ def main():
 
     logger.log_info("b02_5/data", f"iSAID images with annotations: {len(all_images)}")
 
-    # ── 运行实验 | Run experiments ──
+    # ── 运行实验: A=同分布, B=类别迁移, C=跨数据集 | Run experiments: A=same-dist, B=class gen, C=cross-dataset ──
     all_results = {}
 
     if args.exp in ("A", "ALL"):
@@ -809,7 +857,7 @@ def main():
         if r_c is not None:
             all_results["C_cross_dataset"] = r_c
 
-    # ── 汇总 | Summary ──
+    # ── 汇总所有实验结果 | Summarize all experiment results ──
     logger.log_info("b02_5/summary", "=" * 50)
     logger.log_info("b02_5/summary", "B-02.5 Generalization Study — Summary")
     logger.log_info("b02_5/summary", "=" * 50)
@@ -819,6 +867,7 @@ def main():
         if r is None:
             continue
         if isinstance(r, dict) and "spearman_r" in r:
+            # Exp A / Exp C 的简单结构 | Simple structure for Exp A / Exp C
             sr = r["spearman_r"]
             gap40 = (r["oracle_retention"][40] - r["learned_retention"][40]) * 100
             logger.log_info("b02_5/summary",
@@ -826,7 +875,7 @@ def main():
                             f"Top40 Gap={gap40:.2f}%  N={r['n_tiles']:,}")
             conclusion_lines.append((name, sr, gap40))
         elif isinstance(r, dict) and "holdout" in r:
-            # Exp B 的特殊结构 | Exp B nested structure
+            # Exp B 的特殊结构: all/holdout/train_cls 三个子结果 | Exp B nested: three sub-results
             for sub_name in ["all", "holdout", "train_cls"]:
                 if r.get(sub_name):
                     sr = r[sub_name]["spearman_r"]

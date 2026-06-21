@@ -38,10 +38,14 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="iSAID Data Preparation")
-    p.add_argument("--dota-root", type=str, default="data/DOTA")
-    p.add_argument("--isaid-root", type=str, default="data/iSAID")
-    p.add_argument("--output-root", type=str, default="data/iSAID_processed")
+    """解析命令行参数 | Parse command-line arguments."""
+    p = argparse.ArgumentParser(description="iSAID Data Preparation | iSAID 数据准备")
+    p.add_argument("--dota-root", type=str, default="data/DOTA",
+                   help="DOTA 原始数据目录 | DOTA raw data directory")
+    p.add_argument("--isaid-root", type=str, default="data/iSAID",
+                   help="iSAID 原始数据目录 | iSAID raw data directory")
+    p.add_argument("--output-root", type=str, default="data/iSAID_processed",
+                   help="处理后输出目录 | Processed output directory")
     p.add_argument("--skip-extract", action="store_true",
                    help="跳过 zip 解压 | Skip zip extraction")
     p.add_argument("--force", action="store_true",
@@ -256,7 +260,9 @@ def main():
     steps = []
     all_ok = True
 
-    # Step 1-2: Images
+    # Step 1-2: 图像提取/复制 | Images: extract or copy
+    # train/val 从 DOTA zip 提取 | train/val from DOTA zips
+    # test 直接从 iSAID 复制 | test copied directly from iSAID
     for label, src_zip_dir, dst_dir, is_copy in [
         ("Train images", dota / "train" / "images", out / "train", False),
         ("Val images",   dota / "val" / "images",   out / "val",   False),
@@ -287,7 +293,7 @@ def main():
             all_ok = False
         steps.append((f"[{status}] {label}", src_type, src_zip_dir, dst_dir, is_copy, need_n, total_n, exist_n))
 
-    # Step 3-4: Annotations
+    # Step 3-4: 标注修正 | Annotations: fix category IDs + height/width
     for label, src_json, dst_json, img_dir in [
         ("Train annotations",
          isaid / "TrainData" / "train" / "Annotations" / "iSAID_train.json",
@@ -335,6 +341,7 @@ def main():
         print(f"\n  {step_label} ({exist_n}/{total_n} exist, {need_n} to {step_type})")
 
         if step_type in ("extract", "copy"):
+            # 图像提取/复制 | Image extraction or copy
             if step_type == "extract" and not args.skip_extract:
                 result = extract_zips(src, dst, dry_run=False)
                 n = result.get("extracted", 0)
@@ -347,12 +354,13 @@ def main():
             if n > 0:
                 print(f"    → {step_type}ed {n} images")
         elif step_type == "json":
+            # JSON 标注修正 | JSON annotation fix (category mapping + height/width)
             result = fix_annotations(src, dst, extra, force=args.force)
             n = result.get("fixed_cat", 0) + result.get("fixed_hw", 0)
             total_new += n
             print(f"    → {result['msg']}")
 
-    # ── 最终摘要 | Final summary ──
+    # ── 最终摘要：验证每个 split 的完整性 | Final summary: verify completeness per split ──
     print(f"\n{'=' * 70}")
     print(f"  Final Summary | 最终状态:")
     print(f"  {'─'*50}")

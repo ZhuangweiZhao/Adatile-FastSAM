@@ -40,7 +40,14 @@ def parse_args():
 
 @torch.no_grad()
 def eval_on_dataset(spm_head, backbone, dataset, device, args):
-    """Evaluate Learned/Fixed/Full Dice on a dataset."""
+    """
+    在单个数据集上评估三种路由模式 | Evaluate three routing modes on one dataset.
+
+    Compares Learned (SPM Router), Fixed (|w·sim|), and Full (all protos) modes.
+
+    Returns:
+        dict with keys "learned", "fixed", "full", each → (mean, std) tuple.
+    """
     spm_head.eval()
     dice_learned, dice_fixed, dice_full = [], [], []
     k = args.router_k
@@ -97,6 +104,7 @@ def main():
     proto_head.load_state_dict(ckpt["proto_head"])
 
     # 从 checkpoint 推断 router_arch | Infer router_arch from checkpoint
+    # (checkpoint 保存时记录了架构类型, 用于精确重建 | arch type saved in checkpoint for exact reconstruction)
     router_arch = ckpt.get("router_arch", "conv3x3")
     spm_head = SPMHead(proto_head, n_protos=args.n_protos,
                         router_k=args.router_k,
@@ -106,21 +114,23 @@ def main():
     backbone = FastSAMBackbone(freeze_backbone=True)
     backbone.eval()
 
-    # Evaluate on all three splits
+    # 在三个数据集分割上评估 | Evaluate on all three data splits
     print(f"\n{'=' * 70}")
     print(f"  E009 Verification: Train / Val / Test")
     print(f"  Router K={args.router_k}")
+    print(f"  目的: 检查 Router 是否过拟合某一 split | Goal: check for overfitting to one split")
     print(f"  {'=' * 70}")
 
     for split in ["train", "val", "test"]:
         ds = MassachusettsBuildingsDataset(root_dir=args.data_root, split=split)
         results = eval_on_dataset(spm_head, backbone, ds, device, args)
 
+        # 提取三种模式的 Dice | Extract Dice for three routing modes
         l_mean, l_std = results["learned"]
         f_mean, f_std = results["fixed"]
         full_mean, full_std = results["full"]
-        delta = l_mean - f_mean
-        delta_full = l_mean - full_mean
+        delta = l_mean - f_mean          # Learned vs Fixed 差异 | Learned vs Fixed gap
+        delta_full = l_mean - full_mean  # Learned vs Full 差异 | Learned vs Full gap
 
         print(f"\n  [{split.upper():5s}] {len(ds):3d} images")
         print(f"    Full:    {full_mean:.4f} ± {full_std:.4f}")
@@ -128,11 +138,12 @@ def main():
         print(f"    Learned: {l_mean:.4f} ± {l_std:.4f}")
         print(f"    Δ(L-F):  {delta:+.4f}  |  Δ(L-Full): {delta_full:+.4f}")
 
+    # 过拟合诊断指南 | Overfitting diagnostic guide
     print(f"\n  {'=' * 70}")
     print(f"  解释 | Interpretation:")
-    print(f"    - Train/Val/Test 三者一致 → 真实提升")
-    print(f"    - Val 异常高但 Train/Test 正常 → 过拟合 val")
-    print(f"    - Train 异常高 → 过拟合 train (正常, router 在 train 上训练)")
+    print(f"    - Train/Val/Test 三者一致 → 真实提升 | consistent → real improvement")
+    print(f"    - Val 异常高但 Train/Test 正常 → 过拟合 val | val spike → overfitting to val")
+    print(f"    - Train 异常高 → 过拟合 train (正常, router 在 train 上训练) | expected — router trains on train")
     print(f"  {'=' * 70}")
 
 

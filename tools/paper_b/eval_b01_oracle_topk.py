@@ -69,11 +69,13 @@ def render_semantic_mask(annotations: list, h: int, w: int) -> np.ndarray:
     直接使用 ann["category_id"]（映射已在预处理中完成 | mapping done in preprocessing）."""
     import cv2
     sem = np.zeros((h, w), dtype=np.uint8)
+    # 遍历所有标注，逐实例渲染 | Iterate all annotations, render per instance
     for ann in annotations:
         cat_id = ann.get("category_id", 0)
         if cat_id <= 0:
             continue
         seg = ann.get("segmentation", [])
+        # 无分割区域 → 回退到 bbox 矩形填充 | No segmentation → fallback to bbox fill
         if not seg:
             bbox = ann.get("bbox", [0, 0, 0, 0])
             x, y, bw, bh = bbox
@@ -81,14 +83,17 @@ def render_semantic_mask(annotations: list, h: int, w: int) -> np.ndarray:
             x2, y2 = min(w, int(x + bw)), min(h, int(y + bh))
             sem[y1:y2, x1:x2] = cat_id
             continue
+        # RLE 格式暂不支持 | RLE format not yet supported
         if isinstance(seg, dict):
             continue
+        # 多边形渲染：统一包装为列表列表 | Polygon render: wrap into list-of-lists format
         polys = seg if isinstance(seg[0], list) else [seg]
         for poly in polys:
+            # 构建顶点数组并裁剪到图像边界 | Build vertex array and clip to image bounds
             pts = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
             pts[:, :, 0] = np.clip(pts[:, :, 0], 0, w - 1)
             pts[:, :, 1] = np.clip(pts[:, :, 1], 0, h - 1)
-            cv2.fillPoly(sem, [pts], cat_id)
+            cv2.fillPoly(sem, [pts], cat_id)  # OpenCV 多边形填充 | OpenCV polygon fill
     return sem
 
 
@@ -101,10 +106,11 @@ def _analyze_single_image(args_tuple: tuple) -> dict:
 
     sem = render_semantic_mask(anns, h, w)
 
+    # 虚拟切分 1024×1024 网格 | Virtual 1024×1024 grid cut
     tiles = []
     for y in range(0, h, ts):
         for x in range(0, w, ts):
-            th, tw = min(ts, h - y), min(ts, w - x)
+            th, tw = min(ts, h - y), min(ts, w - x)  # 边缘 tile 尺寸调整 | Boundary tile size clamp
             tile_mask = sem[y:y+th, x:x+tw]
 
             total_px = th * tw
@@ -112,7 +118,8 @@ def _analyze_single_image(args_tuple: tuple) -> dict:
             fg_px = int(fg_mask.sum())
             fg_ratio = fg_px / total_px
 
-            # 每类前景像素 | Per-class foreground pixels
+            # 每类前景像素统计 | Per-class foreground pixel counting
+            # 遍历 1..15 类，记录每类在该 tile 中的像素数（>0 才存储） | Iterate classes 1-15, store count if >0
             class_px = {}
             for c in range(1, NUM_CLASSES + 1):
                 cnt = int((tile_mask == c).sum())
@@ -198,22 +205,26 @@ def main():
     # Oracle Top-K 模拟 | Oracle Top-K Simulation
     # ═══════════════════════════════════════════════════════════════
 
+    # 全局累积前景（按重要性降序） | Global cumulative FG (sorted by importance descending)
     cum_fg = np.cumsum(px_arr[sorted_idx])
     total_fg = px_arr.sum()
 
-    # Per-class cumulative FG
+    # Per-class 累积前景曲线 | Per-class cumulative FG curves
+    # 对 1..15 类分别构建累积数组，用于后续 per-class retention 计算 | Build per-class cumsum for retention calc
     class_cum = {c: np.cumsum(
         np.array([t["class_pixels"].get(c, 0) for t in all_tiles],
                  dtype=np.int64)[sorted_idx]
     ) for c in range(1, NUM_CLASSES + 1)}
 
+    # ── Oracle Top-K 模拟 | Oracle Top-K simulation ──
+    # 对每个 K% 档位，模拟 Oracle 选择 Top-K tile 后的前景保留率 | For each K%, compute FG retention
     oracle_results = {}
     for k in K_VALUES:
-        n_keep = max(1, int(n_total * k / 100))
-        fg_captured = cum_fg[n_keep - 1] if n_keep > 0 else 0
-        fg_retention = fg_captured / (total_fg + 1e-8)
+        n_keep = max(1, int(n_total * k / 100))  # 保留的 tile 数量 | Number of tiles kept
+        fg_captured = cum_fg[n_keep - 1] if n_keep > 0 else 0  # 捕获的前景像素 | FG pixels captured
+        fg_retention = fg_captured / (total_fg + 1e-8)  # 保留率 | Retention rate
 
-        # Per-class retention
+        # Per-class 保留率计算 | Per-class retention calculation
         class_retention = {}
         for c in range(1, NUM_CLASSES + 1):
             total_c = total_class_pixels[c]
@@ -248,6 +259,7 @@ def main():
                         f"{(1-r['fg_retention'])*100:>9.2f}%")
 
     # ── 关键拐点 (日志) | Key inflection points (logged) ──
+    # 计算达到特定 FG 保留率需要的最小 tile 比例 | Compute min tile % needed for target retention
     milestones = [
         (90, "90% FG retained (minimal quality loss)"),
         (95, "95% FG retained (negligible quality loss)"),
@@ -255,6 +267,7 @@ def main():
     ]
     logger.log_info("b01/inflection", "Key Inflection Points:")
     for target_pct, desc in milestones:
+        # 二分查找：累积 FG 达到目标百分比的位置 | Binary search for cumulative FG threshold
         idx = np.searchsorted(cum_fg / (total_fg + 1e-8), target_pct / 100)
         n_needed = min(int(idx) + 1, n_total)
         tile_pct = n_needed / n_total * 100
@@ -271,7 +284,7 @@ def main():
     k_pcts = np.array(K_VALUES)
     fg_ret = np.array([oracle_results[k]["fg_retention"] * 100 for k in K_VALUES])
 
-    # (1) FG Retention Curve — 核心图 | Core plot
+    # ═══ (1) FG 保留率曲线 — 核心图 | Panel 1: FG Retention Curve — core result ═══
     ax = axes[0, 0]
     ax.fill_between(k_pcts, 0, fg_ret, alpha=0.2, color="#27AE60")
     ax.plot(k_pcts, fg_ret, "o-", color="#27AE60", linewidth=2.5, markersize=8)
@@ -298,7 +311,7 @@ def main():
     ax.set_xlim(0, 105)
     ax.set_ylim(0, 105)
 
-    # (2) 边际收益 | Marginal gain per 5% more tiles
+    # ═══ (2) 边际收益 | Panel 2: Marginal gain — diminishing returns visualization ═══
     ax = axes[0, 1]
     marginal_gain = np.diff(fg_ret)
     k_mid = (k_pcts[:-1] + k_pcts[1:]) / 2
@@ -315,7 +328,7 @@ def main():
                  f"(Diminishing returns after ~30-40%)", fontsize=10)
     ax.grid(axis="y", alpha=0.2)
 
-    # (3) FG Retention Table (heatmap style)
+    # ═══ (3) FG 保留率摘要表 | Panel 3: Summary table — key numbers at a glance ═══
     ax = axes[0, 2]
     ax.axis("off")
     ax.set_xlim(0, 10)
@@ -369,7 +382,7 @@ def main():
             ax.text(0.5, y_pos, line, fontsize=9,
                     fontfamily="monospace", va="top")
 
-    # (4) Per-class FG Retention Heatmap
+    # ═══ (4) Per-class FG 保留率热力图 | Panel 4: Per-class retention heatmap — fairness check ═══
     ax = axes[1, 0]
     # 取有前景的类别 | Get classes with foreground
     active_classes = [c for c in range(1, NUM_CLASSES + 1)
@@ -391,7 +404,7 @@ def main():
                  f"({n_active} active classes)", fontsize=10)
     plt.colorbar(im, ax=ax, label="FG Retained (%)", shrink=0.8)
 
-    # (5) 不同 FG 密度 tile 的累积贡献 | Cumulative contribution by tile density
+    # ═══ (5) FG 密度分箱贡献 | Panel 5: Density bin contribution — where FG actually lives ═══
     ax = axes[1, 1]
     density_bins = [(0, 0.01), (0.01, 0.05), (0.05, 0.1), (0.1, 0.2),
                     (0.2, 0.5), (0.5, 1.0)]
@@ -423,24 +436,24 @@ def main():
         ax.text(i, tc + max(bin_tile_counts) * 0.03, f"{tc:,}",
                 ha="center", fontsize=8, color="#2C3E50")
 
-    # (6) 浪费分析 | Waste analysis
+    # ═══ (6) 浪费分析 | Panel 6: Waste analysis — empty/sparse/bottom-half breakdown ═══
     ax = axes[1, 2]
     ax.axis("off")
     ax.set_xlim(0, 10)
     ax.set_ylim(0, 10)
 
-    # 计算浪费 | Compute waste
-    # 空 tile (fg<1%): 完全浪费
+    # 计算浪费 | Compute waste analysis statistics
+    # 空 tile (fg<1%): 完全浪费 — 包含极少量 FG 但占用大量计算 | Empty tiles: waste without benefit
     empty_mask = fg_arr < 0.01
     n_empty = empty_mask.sum()
     empty_fg_pct = px_arr[empty_mask].sum() / (total_fg + 1e-8) * 100
 
-    # 稀疏 tile (fg 1-5%): 部分浪费
+    # 稀疏 tile (fg 1-5%): 部分浪费 — 低密度前景，效率低 | Sparse tiles: marginal contribution, low efficiency
     sparse_mask = (fg_arr >= 0.01) & (fg_arr < 0.05)
     n_sparse = sparse_mask.sum()
     sparse_fg_pct = px_arr[sparse_mask].sum() / (total_fg + 1e-8) * 100
 
-    # Oracle 可跳过: 按 fg_ratio 排序后，bottom 50% 的 tile 只贡献了多少 FG
+    # Oracle 可跳过: 按 fg_ratio 降序后，后 50% tile 仅贡献了多少 FG | Bottom 50% by FG sorting
     bottom_half = sorted_idx[n_total // 2:]  # bottom 50% by fg
     bottom_fg = px_arr[bottom_half].sum()
     bottom_fg_pct = bottom_fg / (total_fg + 1e-8) * 100

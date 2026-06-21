@@ -76,12 +76,14 @@ def render_semantic_mask(annotations: list, h: int, w: int) -> np.ndarray:
     import cv2
     sem = np.zeros((h, w), dtype=np.uint8)
 
+    # 遍历所有标注，逐实例渲染 | Iterate all annotations, render per instance
     for ann in annotations:
         cat_id = ann.get("category_id", 0)
         if cat_id <= 0:
             continue
 
         seg = ann.get("segmentation", [])
+        # 无分割区域 → 回退到 bbox 矩形填充 | No segmentation → fallback to bbox fill
         if not seg:
             bbox = ann.get("bbox", [0, 0, 0, 0])
             x, y, bw, bh = bbox
@@ -89,15 +91,18 @@ def render_semantic_mask(annotations: list, h: int, w: int) -> np.ndarray:
             x2, y2 = min(w, int(x + bw)), min(h, int(y + bh))
             sem[y1:y2, x1:x2] = cat_id
             continue
+        # RLE 格式暂不支持 | RLE format not yet supported
         if isinstance(seg, dict):
             continue
 
+        # 多边形渲染：统一包装为列表列表 | Polygon render: wrap into list-of-lists format
         polys = seg if isinstance(seg[0], list) else [seg]
         for poly in polys:
+            # 构建顶点数组并裁剪到图像边界 | Build vertex array and clip to image bounds
             pts = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
             pts[:, :, 0] = np.clip(pts[:, :, 0], 0, w - 1)
             pts[:, :, 1] = np.clip(pts[:, :, 1], 0, h - 1)
-            cv2.fillPoly(sem, [pts], cat_id)
+            cv2.fillPoly(sem, [pts], cat_id)  # OpenCV 多边形填充 | OpenCV polygon fill
 
     return sem
 
@@ -114,16 +119,18 @@ def _analyze_single_image(args_tuple: tuple) -> dict:
 
     results = {"img_id": img_id, "h": h, "w": w, "tile_sizes": {}}
 
+    # 遍历所有 tile 尺寸，逐个做虚拟网格切分 | Iterate all tile sizes for virtual grid cut
     for ts in tile_sizes:
         fg_ratios = []
+        # 滑动窗口：y、x 方向各按步长 ts 切分 | Sliding window: stride = ts (no overlap)
         for y in range(0, h, ts):
             for x in range(0, w, ts):
-                th, tw = min(ts, h - y), min(ts, w - x)
+                th, tw = min(ts, h - y), min(ts, w - x)  # 处理边缘 tile | Handle boundary tiles
                 tile_mask = sem[y:y+th, x:x+tw]
 
                 total_px = th * tw
-                fg_px = int((tile_mask > 0).sum())
-                fg_ratio = fg_px / total_px if total_px > 0 else 0.0
+                fg_px = int((tile_mask > 0).sum())  # 前景像素数 | Foreground pixel count
+                fg_ratio = fg_px / total_px if total_px > 0 else 0.0  # 前景占比 | FG ratio
                 fg_ratios.append((fg_ratio, fg_px))
 
         results["tile_sizes"][ts] = fg_ratios
@@ -147,34 +154,37 @@ def compute_stats(all_tile_data: list, tile_sizes: list) -> dict:
                 all_fg_ratios.extend([rp[0] for rp in ratios_pixels])
                 all_fg_pixels.extend([rp[1] for rp in ratios_pixels])
 
+        # 将列表转为 numpy 数组 | Convert lists to numpy arrays
         fg_arr = np.array(all_fg_ratios)
         px_arr = np.array(all_fg_pixels)
         n_total = len(fg_arr)
 
         # 空/稀疏/有意义 比例 | Empty/sparse/meaningful ratios
+        # 三分类阈值: <1% 为空, 1-5% 为稀疏, ≥5% 为有意义 | Thresholds: <1% empty, 1-5% sparse, ≥5% meaningful
         empty_ratio = float((fg_arr < 0.01).mean())
         sparse_ratio = float(((fg_arr >= 0.01) & (fg_arr < 0.05)).mean())
         meaningful_ratio = float((fg_arr >= 0.05).mean())
 
         # Top-K 前景捕获曲线 | Top-K FG capture curve
-        sorted_idx = np.argsort(fg_arr)[::-1]
-        cum_fg = np.cumsum(px_arr[sorted_idx])
+        # 按 fg_ratio 降序排列 → 累积前景像素 → 归一化分数 | Sort descending → cumsum FG → normalize
+        sorted_idx = np.argsort(fg_arr)[::-1]  # 降序索引 | Descending indices
+        cum_fg = np.cumsum(px_arr[sorted_idx])  # 累积前景像素 | Cumulative FG pixels
         total_fg = px_arr.sum()
-        cum_fg_frac = cum_fg / (total_fg + 1e-8)
+        cum_fg_frac = cum_fg / (total_fg + 1e-8)  # 累积前景占比 | Cumulative FG fraction
 
-        # 捕获 90%, 95%, 99% 前景需要的 tile 比例
+        # 捕获 90%, 95%, 99% 前景需要的 tile 比例 | Tile % needed to capture 90/95/99% FG
         capture_rates = {}
         for target_pct in [90, 95, 99]:
-            idx = np.searchsorted(cum_fg_frac, target_pct / 100)
+            idx = np.searchsorted(cum_fg_frac, target_pct / 100)  # 二分查找拐点 | Binary search inflection
             n_needed = int(idx) + 1
-            tile_pct = n_needed / n_total * 100
+            tile_pct = n_needed / n_total * 100  # 换算为百分比 | Convert to percentage
             capture_rates[target_pct] = {
                 "tiles_needed": n_needed,
                 "tile_pct": tile_pct,
             }
 
         # 平均每个源图的 tile 数 | Average tiles per source image
-        # (用于估算计算量)
+        # (用于估算计算量 | For compute budget estimation)
         n_images = len(all_tile_data)
 
         stats[ts] = {
@@ -210,7 +220,7 @@ def main():
 
     # filename → image info | O(1) lookup
     fname_to_img = {img["file_name"]: img for img in coco["images"]}
-    # image_id → annotations
+    # image_id → annotations | 按图像 ID 分组标注，O(N_ann) 单次遍历 | Group by image_id, single pass
     img_id_to_anns = {}
     for ann in coco["annotations"]:
         img_id_to_anns.setdefault(ann["image_id"], []).append(ann)
@@ -222,6 +232,7 @@ def main():
     # ── 构建任务列表 | Build task list ──
     tasks = []
     img_dir = src_root / split / "images"
+    # 为每张图像构建一个工作单元：包含文件名、标注、尺寸、tile 尺寸列表 | One work unit per image
     for img_info in coco["images"]:
         fname = img_info["file_name"]
         img_id = img_info["id"]
@@ -296,7 +307,7 @@ def main():
     capture_95 = [stats[ts]["fg_capture"][95]["tile_pct"] for ts in tile_sizes]
     capture_99 = [stats[ts]["fg_capture"][99]["tile_pct"] for ts in tile_sizes]
 
-    # (1) 三分类堆叠柱状图 | Stacked bar: Empty / Sparse / Meaningful
+    # ═══ (1) 三分类堆叠柱状图 | Panel 1: Stacked bar — Empty/Sparse/Meaningful composition ═══
     ax = axes[0, 0]
     x = np.arange(len(tile_sizes))
     width = 0.6
@@ -317,7 +328,7 @@ def main():
     ax.set_ylim(0, 105)
     ax.grid(axis="y", alpha=0.2)
 
-    # (2) 总 Tile 数 | Total tile count
+    # ═══ (2) 总 Tile 数 | Panel 2: Total tile count — compute budget proxy ═══
     ax = axes[0, 1]
     n_tiles_vals = [stats[ts]["n_tiles"] for ts in tile_sizes]
     ax.bar(x, n_tiles_vals, width, color="#3498DB", edgecolor="white")
@@ -332,7 +343,7 @@ def main():
                 ha="center", fontsize=9, fontweight="bold")
     ax.grid(axis="y", alpha=0.2)
 
-    # (3) Empty Ratio 趋势线 | Empty ratio trend
+    # ═══ (3) Empty Ratio 趋势线 | Panel 3: Empty vs Meaningful trend lines ═══
     ax = axes[0, 2]
     ax.plot(ts_labels, empty_vals, "o-", color="#E74C3C", linewidth=2.5,
             markersize=10, label="Empty (<1% FG)")
@@ -351,7 +362,7 @@ def main():
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    # (4) FG Capture Rate 曲线 | FG capture rate curves
+    # ═══ (4) FG Capture Rate 曲线 | Panel 4: FG capture rate curves — sparsity upper bound ═══
     ax = axes[1, 0]
     ax.plot(ts_labels, capture_90, "D-", color="#3498DB", linewidth=2,
             markersize=9, label="90% FG Capture")
@@ -368,7 +379,7 @@ def main():
     ax.axhline(y=50, color="gray", linestyle="--", alpha=0.3, linewidth=0.8)
     ax.text(ts_labels[-1], 51, "50% tiles", fontsize=7, color="gray", ha="right")
 
-    # (5) 前景捕获累积曲线 (每个 tile size 一条) | Cumulative FG capture curves
+    # ═══ (5) 前景捕获累积曲线 | Panel 5: Cumulative FG capture — all tile sizes overlaid ═══
     ax = axes[1, 1]
     colors = plt.cm.viridis(np.linspace(0.1, 0.9, len(tile_sizes)))
     for ts, c in zip(tile_sizes, colors):
@@ -397,7 +408,7 @@ def main():
     ax.legend(fontsize=7, ncol=2)
     ax.grid(True, alpha=0.2)
 
-    # (6) 关键指标综合对比 | Key metrics summary (radar-like horizontal bars)
+    # ═══ (6) 关键指标综合对比 | Panel 6: Summary text panel — conclusions and sweet-spot analysis ═══
     ax = axes[1, 2]
     ax.axis("off")
     ax.set_xlim(0, 10)

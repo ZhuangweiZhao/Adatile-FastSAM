@@ -36,8 +36,8 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
 
-NUM_OUT_CH = 16
-NUM_CLASSES = 15
+NUM_OUT_CH = 16  # 输出通道数 (含背景) | Output channels (including background)
+NUM_CLASSES = 15  # 前景类别数 | Foreground classes count
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -45,31 +45,55 @@ NUM_CLASSES = 15
 # ═══════════════════════════════════════════════════════════════════
 
 class LightDecoder(nn.Module):
+    """轻量解码器: P4 特征 → 分割掩码 | Lightweight decoder: P4 features → segmentation mask.
+
+    结构 | Structure:
+        P4 [B,1280,H/16,W/16] → Conv(1280→256→128) → Upsample×2
+        → Conv(128→64) → Upsample×2 → Conv(64→32) → Upsample
+        → Conv(32→num_classes) → [B,N,H,W]
+
+    Args:
+        in_channels: P4 特征通道数 | P4 feature channels (default 1280 for FastSAM-x)
+        num_classes: 输出类别数 (含背景) | Output classes including background
+    """
     def __init__(self, in_channels=1280, num_classes=16):
         super().__init__()
+        # Stage 1: 降维 1280→256→128 | Channel reduction 1280→256→128
         self.stage1 = nn.Sequential(
             nn.Conv2d(in_channels, 256, 1, bias=False),
             nn.BatchNorm2d(256), nn.ReLU(inplace=True),
             nn.Conv2d(256, 128, 3, padding=1, bias=False),
             nn.BatchNorm2d(128), nn.ReLU(inplace=True),
         )
+        # Stage 2: 上采样 + 128→64 | Upsample + 128→64
         self.stage2_conv = nn.Sequential(
             nn.Conv2d(128, 64, 3, padding=1, bias=False),
             nn.BatchNorm2d(64), nn.ReLU(inplace=True),
         )
+        # Stage 3: 上采样 + 64→32 | Upsample + 64→32
         self.stage3_conv = nn.Sequential(
             nn.Conv2d(64, 32, 3, padding=1, bias=False),
             nn.BatchNorm2d(32), nn.ReLU(inplace=True),
         )
+        # Head: 32→num_classes, 1×1 逐像素分类 | 1×1 per-pixel classification
         self.head = nn.Conv2d(32, num_classes, 1, bias=True)
 
     def forward(self, p4, target_size=None):
-        x = self.stage1(p4)
-        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
-        x = self.stage2_conv(x)
-        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
-        x = self.stage3_conv(x)
-        x = self.head(x)
+        """前向传播: P4 特征 → 分割 logits | Forward: P4 features → segmentation logits.
+
+        Args:
+            p4: P4 特征图 [B, 1280, H/16, W/16] | P4 feature map
+            target_size: 可选的目标输出尺寸 (H, W) | Optional target output size
+
+        Returns:
+            logits: [B, num_classes, H, W]
+        """
+        x = self.stage1(p4)                     # 降维 | Channel reduction
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)  # 2× up
+        x = self.stage2_conv(x)                  # 128→64
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)  # 2× up
+        x = self.stage3_conv(x)                  # 64→32
+        x = self.head(x)                         # 32→num_classes
         if target_size is not None:
             x = F.interpolate(x, size=target_size, mode="bilinear", align_corners=False)
         return x
@@ -160,9 +184,16 @@ COLOR_MAP = [
 # ═══════════════════════════════════════════════════════════════════
 
 def overfit_test(args, device):
-    """20 tile × 100 epoch — 验证模型能力上限."""
+    """20 tile × 100 epoch 过拟合测试 — 验证模型能力上限 | Overfit test — verify model capacity upper bound.
+
+    如果 Decoder 无法过拟合 20 个 tile，说明架构本身有问题。
+    If the Decoder cannot overfit 20 tiles, the architecture itself is the problem.
+
+    Returns:
+        (decoder, backbone) trained models.
+    """
     logger.log_info("diag", "=" * 50)
-    logger.log_info("diag", "Overfit Test: 20 tiles × 100 epochs")
+    logger.log_info("diag", "Overfit Test: 20 tiles × 100 epochs | 过拟合测试: 20 tile × 100 epoch")
 
     train_ds = FastISAIDTileDataset(args.tile_root, split="train", semantic=True)
 
@@ -188,6 +219,7 @@ def overfit_test(args, device):
 
     opt = torch.optim.Adam(decoder.parameters(), lr=1e-3)
 
+    # ═══ 训练循环: 100 epoch | Training loop: 100 epochs ═══
     for epoch in range(1, 101):
         decoder.train()
         total_loss, n = 0.0, 0
@@ -198,6 +230,7 @@ def overfit_test(args, device):
             feats = backbone(img)
             logit = decoder(feats["p4"], target_size=tgt.shape[1:])
 
+            # Focal Loss (γ=5.0): 针对极端不均衡 | For extreme class imbalance
             ce = F.cross_entropy(logit, tgt, ignore_index=255, reduction="none")
             pt = torch.exp(-ce)
             focal_loss = ((1 - pt) ** 5.0 * ce).mean()
@@ -205,8 +238,9 @@ def overfit_test(args, device):
             opt.zero_grad(); loss.backward(); opt.step()
             total_loss += loss.item(); n += 1
 
+        # 每 20 epoch 或首轮评估 | Evaluate every 20 epochs or first epoch
         if epoch % 20 == 0 or epoch == 1:
-            # 计算 train IoU | Compute train IoU
+            # 计算 train FG-mIoU (忽略背景) | Compute train FG-mIoU (ignore background)
             decoder.eval()
             miou_v, valid = 0.0, 0
             bg_ratio = 0.0
@@ -218,6 +252,7 @@ def overfit_test(args, device):
                     logit = decoder(feats["p4"], target_size=tgt.shape[1:])
                     pred = logit.argmax(dim=1)
                     bg_ratio += (pred == 0).float().mean().item()
+                    # Per-class IoU: 只统计前景类 | Only foreground classes
                     for c in range(1, NUM_CLASSES + 1):
                         pc = (pred == c); tc = (tgt == c)
                         inter = (pc & tc).sum().float()
@@ -237,8 +272,8 @@ def overfit_test(args, device):
                             f"pred_unique={sorted(pred_vals)}")
             decoder.train()
 
+        # 最终诊断结论 | Final diagnostic verdict
         if epoch == 100:
-            # 最终 | Final
             if train_miou > 0.8:
                 verdict = "✅ DECODER CAPABLE — problem is in data/generalization, not architecture"
             elif train_miou > 0.3:
@@ -255,8 +290,9 @@ def overfit_test(args, device):
 # ═══════════════════════════════════════════════════════════════════
 
 def main():
+    """主入口: Overfit + 可视化 | Main entry: Overfit + Visualization."""
     import argparse
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description="B-04 Diagnostic: Overfit + Visualization | B-04 诊断: 过拟合 + 可视化")
     p.add_argument("--tile-root", type=str, default="/root/autodl-tmp/iSAID_tiles")
     p.add_argument("--output-dir", type=str, default="runs/b04_diag")
     p.add_argument("--device", type=str,
@@ -266,12 +302,14 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     device = args.device
+    logger.log_info("diag", f"Starting B-04 diagnostics | 启动 B-04 诊断. Device={device}, Output={output_dir}")
 
-    # ── 20 tile × 100 epoch overfit ──
+    # ═══ 20 tile × 100 epoch overfit | 过拟合测试 ═══
     decoder, backbone = overfit_test(args, device)
 
-    # ── 可视化 ──
+    # ═══ 可视化预测结果 | Visualize predictions ═══
     val_ds = FastISAIDTileDataset(args.tile_root, split="val", semantic=True)
+    # 选取验证集中有前景的 tile | Select val tiles with foreground
     fg_val_tiles = []
     for fname in val_ds._tiles:
         mask = np.array(Image.open(val_ds._mask_dir / fname))
@@ -283,7 +321,7 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=True)
     visualize(decoder, backbone, val_loader, output_dir, device, n=5)
 
-    logger.log_info("diag", f"Done. Check {output_dir}/")
+    logger.log_info("diag", f"Done | 完成. Check {output_dir}/")
 
 
 if __name__ == "__main__":

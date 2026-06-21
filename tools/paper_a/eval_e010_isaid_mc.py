@@ -153,16 +153,17 @@ def compute_metrics(pred: torch.Tensor, target: torch.Tensor,
     target: [B, H, W]
     """
     if pred.dim() == 4:
-        pred = pred.argmax(dim=1)
+        pred = pred.argmax(dim=1)  # [B, C, H, W] → [B, H, W]
 
     results = {}
     ious = []
+    # 逐类计算 IoU | Per-class IoU computation
     for c in range(num_classes):
         pred_c = (pred == c)
         target_c = (target == c)
         inter = (pred_c & target_c).sum().float()
         union = (pred_c | target_c).sum().float()
-        iou = (inter + 1e-8) / (union + 1e-8)
+        iou = (inter + 1e-8) / (union + 1e-8)  # 防止除零 | avoid division by zero
         ious.append(iou.item())
 
     results["miou"] = float(np.mean(ious))
@@ -230,17 +231,20 @@ def train_head(head, backbone, train_ds, val_ds, args, device, recorder,
         for idx in pbar:
             sample = train_ds[idx]
             image = sample["image"].unsqueeze(0).to(device)
-            target = sample["mask"].unsqueeze(0).to(device)
+            target = sample["mask"].unsqueeze(0).to(device)  # [1, H, W] class labels
 
             with torch.no_grad():
                 features = backbone(image)
             p4 = features["p4"]
 
+            # 前向 (Proto 或 Embedding) | Forward (Proto or Embedding)
             if is_proto:
                 _, _, logit = head(p4, temperature=args.temperature)
             else:
                 _, logit = head(p4)
 
+            # 上采样 + 多类别交叉熵 (ignore_index=255 跳过 void 标签)
+            # Upsample + multi-class CE (ignore_index=255 skips void labels)
             logit_up = F.interpolate(logit, size=target.shape[1:],
                                      mode="bilinear", align_corners=False)
             loss = F.cross_entropy(logit_up, target, ignore_index=255)
@@ -308,33 +312,42 @@ def train_head(head, backbone, train_ds, val_ds, args, device, recorder,
 def analyze_proto_semantics(proto_head, backbone, val_ds, device, num_classes):
     """
     分析每个 Proto 的类别倾向 | Analyze per-proto class affinity.
-    每个 proto 被分配到的像素中, 各类别占比。
+
+    对每个 proto，统计其被 winner-take-all 分配到的像素中各类别的占比。
+    For each proto, count what classes the pixels assigned to it belong to.
+
+    Returns:
+        proto_class_pct:    [N, C] 归一化类别占比 (行和为1) | normalized class proportions
+        proto_class_counts: [N, C] 原始计数 | raw counts
     """
     proto_head.eval()
     n_protos = proto_head.n_protos
     proto_class_counts = np.zeros((n_protos, num_classes))
 
+    # 采样最多 20 张验证图 | Sample at most 20 val images
     for idx in range(min(20, len(val_ds))):
         sample = val_ds[idx]
         image = sample["image"].unsqueeze(0).to(device)
-        target = sample["mask"].to(device)
+        target = sample["mask"].to(device)  # [H, W] class labels
 
         features = backbone(image)
+        # Winner-take-all 硬分配 | Winner-take-all hard assignment
         hard = proto_head.get_hard_assignment(features["p4"])  # [1, H/16, W/16]
 
-        # 上采样 target 到 P4 分辨率 | Downsample target to P4 resolution
+        # 下采样 target 到 P4 分辨率 | Downsample target to P4 resolution
         tgt_down = F.interpolate(
             target.unsqueeze(0).unsqueeze(0).float(),
             size=(hard.shape[1], hard.shape[2]), mode="nearest"
-        ).squeeze().long()
+        ).squeeze().long()  # [H_emb, W_emb]
 
+        # 累积每个 Proto 的类别计数 | Accumulate per-proto class counts
         for p in range(n_protos):
-            mask_p = (hard.squeeze(0) == p)
+            mask_p = (hard.squeeze(0) == p)  # 该 Proto 被选中的像素 | pixels assigned to proto p
             if mask_p.sum() > 0:
                 for c in range(num_classes):
                     proto_class_counts[p, c] += (tgt_down[mask_p] == c).sum().item()
 
-    # 归一化到 [0,1] | Normalize
+    # 归一化到 [0,1] | Normalize to proportions
     row_sums = proto_class_counts.sum(axis=1, keepdims=True) + 1e-8
     proto_class_pct = proto_class_counts / row_sums
     return proto_class_pct, proto_class_counts

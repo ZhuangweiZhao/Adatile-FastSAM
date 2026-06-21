@@ -254,7 +254,7 @@ def train_sparse(proto_head, backbone, train_ds, val_ds, args, device, recorder)
           f"lr={args.lr}, CosineLR)...")
 
     for epoch in range(1, args.epochs + 1):
-        # ── Train with Top-K ──
+        # ── 训练: 使用 Top-K 稀疏前向 | Train with Top-K sparse forward ──
         proto_head.train()
         total_loss = 0.0
         pbar = tqdm(range(len(train_ds)),
@@ -286,7 +286,7 @@ def train_sparse(proto_head, backbone, train_ds, val_ds, args, device, recorder)
             pbar.set_postfix({"loss": f"{total_loss/(idx+1):.4f}"})
         scheduler.step()
 
-        # ── Val with Top-K ──
+        # ── 验证: 全量 + 稀疏双轨对比 | Val: full + sparse dual-track comparison ──
         proto_head.eval()
         dices_full, dices_sparse = [], []
         with torch.no_grad():
@@ -399,14 +399,15 @@ def analyze_sparsity(proto_head, backbone, val_ds, device, args, ranking: str):
                 gm = gm.unsqueeze(0)
             dice_by_k[k].append(compute_dice(pred, gm).item())
 
-            # Energy: fraction of total |w*sim| captured by top-K
+            # 能量分数: Top-K 捕获的 |w·sim| 占总能量比例
+            # Energy fraction: |w·sim| captured by top-K vs total
             head_w = proto_head.head.weight.squeeze()  # [N]
-            sim_flat = sim_maps.squeeze(0).reshape(N, -1)  # [N, BHW]
+            sim_flat = sim_maps.squeeze(0).reshape(N, -1)  # [N, BHW] 展平空间 | flatten spatial
             importance = (sim_flat * head_w.unsqueeze(1)).abs()  # [N, BHW], |w*sim|
-            total_energy = importance.sum(dim=0) + 1e-8
-            topk_vals, _ = importance.topk(k, dim=0)
+            total_energy = importance.sum(dim=0) + 1e-8  # 每个像素的总能量 | total energy per pixel
+            topk_vals, _ = importance.topk(k, dim=0)  # 每个像素的 Top-K 能量 | top-K energy per pixel
             topk_energy = topk_vals.sum(dim=0)
-            energy_ratio = (topk_energy / total_energy).mean().item()
+            energy_ratio = (topk_energy / total_energy).mean().item()  # 平均能量占比 | mean energy fraction
             energy_by_k[k].append(energy_ratio)
 
     # ── Aggregate ──

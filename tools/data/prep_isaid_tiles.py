@@ -53,19 +53,27 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="iSAID Offline Tile Preprocessing")
-    p.add_argument("--src-root", type=str, default="data/iSAID_processed")
-    p.add_argument("--dst-root", type=str, default="data/iSAID_tiles")
-    p.add_argument("--tile-size", type=int, default=1024)
-    p.add_argument("--max-images", type=int, default=0)
-    p.add_argument("--splits", type=str, default="train,val,test")
-    p.add_argument("--workers", type=int, default=8)
+    """解析命令行参数 | Parse command-line arguments."""
+    p = argparse.ArgumentParser(description="iSAID Offline Tile Preprocessing | iSAID 离线瓦片预处理")
+    p.add_argument("--src-root", type=str, default="data/iSAID_processed",
+                   help="iSAID 处理后数据目录 | iSAID processed data directory")
+    p.add_argument("--dst-root", type=str, default="data/iSAID_tiles",
+                   help="瓦片输出目录 | Tile output directory")
+    p.add_argument("--tile-size", type=int, default=1024,
+                   help="瓦片尺寸 (像素) | Tile size in pixels")
+    p.add_argument("--max-images", type=int, default=0,
+                   help="最大处理图像数 (0=全部, 调试用) | Max images to process (0=all, for debugging)")
+    p.add_argument("--splits", type=str, default="train,val,test",
+                   help="处理的 split 列表 | Splits to process")
+    p.add_argument("--workers", type=int, default=8,
+                   help="并行进程数 | Number of parallel workers")
     p.add_argument("--format", type=str, default="png",
                    choices=["png", "jpg"],
                    help="Tile 图像格式 | Tile image format (jpg=faster+smaller)")
     p.add_argument("--steps", type=str, default="1,2,3",
                    help="执行步骤 | Steps to run: 1=mask, 2=tile, 3=metadata")
-    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--dry-run", action="store_true",
+                   help="只检查不执行 | Only check, don't execute")
     return p.parse_args()
 
 
@@ -131,7 +139,7 @@ def render_semantic_mask(annotations: list, h: int, w: int) -> np.ndarray:
 # ═══════════════════════════════════════════════════════════════════
 
 def _step1_worker(args_tuple: tuple) -> dict:
-    """单图 worker: 渲染 + 保存全图 mask (独立进程 | separate process)."""
+    """单图 worker: 渲染 + 保存全图 mask (独立进程) | Single-image worker: render + save full-image mask (separate process)."""
     from PIL import Image
     import cv2
 
@@ -154,9 +162,15 @@ def _step1_worker(args_tuple: tuple) -> dict:
 
 def step1_render_masks(src_root: Path, dst_root: Path, splits: list,
                        max_images: int, workers: int, dry_run: bool):
-    """Step 1: 生成全图语义掩码."""
+    """Step 1: 生成全图语义掩码 | Step 1: Render full-image semantic masks.
+
+    对每张原图，将 COCO 标注渲染为语义分割 mask，保存到 masks_full/ 目录。
+    后续切 tile 时直接读取 mask 不再重复渲染 COCO 多边形。
+    For each full image, render COCO annotations into a semantic mask under masks_full/.
+    Tile cutting reads the pre-rendered mask, avoiding re-rendering COCO polygons.
+    """
     print("\n" + "=" * 60)
-    print("  Step 1: Render Full-Image Semantic Masks")
+    print("  Step 1: Render Full-Image Semantic Masks | 生成全图语义掩码")
     print("=" * 60)
 
     for split in splits:
@@ -216,7 +230,7 @@ def step1_render_masks(src_root: Path, dst_root: Path, splits: list,
 # ═══════════════════════════════════════════════════════════════════
 
 def _step2_worker(args_tuple: tuple) -> dict:
-    """单图 worker: 加载图像+mask → 切 tile → 保存 (独立进程)."""
+    """单图 worker: 加载图像+mask → 切 tile → 保存 (独立进程) | Single-image worker: load image+mask → cut tiles → save (separate process)."""
     from PIL import Image
     import cv2
 
@@ -278,9 +292,15 @@ def _step2_worker(args_tuple: tuple) -> dict:
 def step2_cut_tiles(src_root: Path, dst_root: Path, splits: list,
                     max_images: int, workers: int, ts: int, img_fmt: str,
                     dry_run: bool):
-    """Step 2: 切 Tile."""
+    """Step 2: 将全图按固定尺寸切成 Tile | Step 2: Cut full images into fixed-size tiles.
+
+    对每张原图，按 grid 切分为 ts×ts 的 tile，边界不足补零。
+    使用 cv2.imwrite 保存 (比 PIL 快 1.5~3×)。
+    Cut each full image into ts×ts tiles on a grid; pad edges with zeros.
+    Saves via cv2.imwrite (1.5~3× faster than PIL).
+    """
     print("\n" + "=" * 60)
-    print(f"  Step 2: Cut Tiles ({ts}×{ts}, format={img_fmt})")
+    print(f"  Step 2: Cut Tiles ({ts}×{ts}, format={img_fmt}) | 切分瓦片")
     print("=" * 60)
 
     for split in splits:
@@ -328,9 +348,15 @@ def step2_cut_tiles(src_root: Path, dst_root: Path, splits: list,
 # ═══════════════════════════════════════════════════════════════════
 
 def step3_metadata(dst_root: Path, splits: list, max_images: int, dry_run: bool):
-    """Step 3: 生成 tile metadata JSON."""
+    """Step 3: 扫描每个 tile 生成元数据 JSON | Step 3: Scan each tile and generate metadata JSON.
+
+    为每个 tile 统计：fg_ratio, fg_pixels, class_distribution。
+    元数据用于训练时的 FG 过滤和稀有类过采样。
+    For each tile: fg_ratio, fg_pixels, class_distribution.
+    Metadata used for FG filtering and rare class oversampling during training.
+    """
     print("\n" + "=" * 60)
-    print("  Step 3: Generate Tile Metadata")
+    print("  Step 3: Generate Tile Metadata | 生成瓦片元数据")
     print("=" * 60)
 
     from PIL import Image
@@ -418,11 +444,11 @@ def main():
     try:
         import cv2
     except ImportError:
-        print("ERROR: cv2 not installed. Run: pip install opencv-python")
+        print("ERROR: cv2 not installed. Run: pip install opencv-python | cv2 未安装，请执行: pip install opencv-python")
         sys.exit(1)
 
     print("=" * 70)
-    print("  iSAID Offline Tile Preprocessing + Metadata")
+    print("  iSAID Offline Tile Preprocessing + Metadata | iSAID 离线瓦片预处理 + 元数据")
     print(f"  Source:  {src}")
     print(f"  Output:  {dst}")
     print(f"  Steps:   {steps}")
@@ -430,6 +456,7 @@ def main():
     print(f"  Format:  {args.format}")
     print("=" * 70)
 
+    # ── 按步骤执行 | Execute requested steps ──
     if 1 in steps:
         step1_render_masks(src, dst, splits, args.max_images,
                           args.workers, args.dry_run)
@@ -443,7 +470,7 @@ def main():
         step3_metadata(dst, splits, args.max_images, args.dry_run)
 
     if not args.dry_run:
-        print(f"\n  ✅ All steps done! Output: {dst}/")
+        print(f"\n  ✅ All steps done! Output: {dst}/ | 全部步骤完成！输出: {dst}/")
 
 
 if __name__ == "__main__":

@@ -99,22 +99,23 @@ def render_semantic_mask(annotations: list, h: int, w: int) -> np.ndarray:
 # ═══════════════════════════════════════════════════════════════════
 
 def _preprocess_worker(args_tuple):
-    """独立进程: 渲染 mask → resize → 保存到缓存目录."""
+    """独立进程: 渲染 mask → resize → 保存到缓存目录 | Standalone process: render mask → resize → save to cache."""
     img_id, img_path, anns, image_size, cache_dir = args_tuple
 
     try:
         from PIL import Image
         img = np.array(Image.open(img_path).convert("RGB"))
         H, W = img.shape[:2]
+        # 渲染语义分割掩码 (0=BG, 1-15=classes) | Render semantic mask
         mask = render_semantic_mask(anns, H, W)
 
-        # Resize
+        # Resize: 保持宽高比, 缩放到固定方形尺寸 | Resize: keep aspect ratio, scale to fixed square
         scale = image_size / max(H, W)
         new_H, new_W = int(H * scale), int(W * scale)
         img = np.array(Image.fromarray(img).resize((new_W, new_H), Image.BILINEAR))
         mask = np.array(Image.fromarray(mask).resize((new_W, new_H), Image.NEAREST))
 
-        # Pad to square
+        # Pad to square: 右侧/底部补零, 填充到方形 | Pad: zero-pad right/bottom edges to square
         pad_h = image_size - new_H
         pad_w = image_size - new_W
         if pad_h > 0 or pad_w > 0:
@@ -125,25 +126,29 @@ def _preprocess_worker(args_tuple):
         img = img.astype(np.float32) / 255.0
         img = np.transpose(img, (2, 0, 1))  # [3, S, S]
 
-        # GT tile scores + per-tile fg pixels | Compute GT
+        # GT tile scores + per-tile fg pixels | Compute GT: 遍历所有 tile 计算前景占比
         H2, W2 = mask.shape
+        # 每个维度上的 tile 数量 | Number of tiles in each dimension
         n_ty = (H2 + TILE_SIZE - 1) // TILE_SIZE
         n_tx = (W2 + TILE_SIZE - 1) // TILE_SIZE
-        tile_scores = np.zeros((n_ty, n_tx), dtype=np.float32)
-        fg_pixels = np.zeros(n_ty * n_tx, dtype=np.int64)
+        tile_scores = np.zeros((n_ty, n_tx), dtype=np.float32)  # fg_ratio 网格 | fg_ratio grid
+        fg_pixels = np.zeros(n_ty * n_tx, dtype=np.int64)       # 每个 tile 的前景像素数 | FG pixel count per tile
         idx = 0
+        # 双循环遍历所有 tile | Double loop over all tiles
         for ty in range(n_ty):
             for tx in range(n_tx):
+                # 计算 tile 边界 (处理边界不完全 tile) | Compute tile bounds (handle partial edge tiles)
                 y0, y1 = ty * TILE_SIZE, min(ty * TILE_SIZE + TILE_SIZE, H2)
                 x0, x1 = tx * TILE_SIZE, min(tx * TILE_SIZE + TILE_SIZE, W2)
                 tile_mask = mask[y0:y1, x0:x1]
                 total_px = (y1 - y0) * (x1 - x0)
+                # fg_ratio = 前景像素数 / 总像素数 | fg_ratio = FG pixels / total pixels
                 fg_px = int((tile_mask > 0).sum())
                 tile_scores[ty, tx] = fg_px / max(total_px, 1)
                 fg_pixels[idx] = fg_px
                 idx += 1
 
-        # 保存为 .npz (压缩) | Save as .npz (compressed)
+        # 保存为 .npz (压缩) | Save as .npz (compressed) — 包含图像和 GT tile 得分
         out_path = os.path.join(cache_dir, f"{img_id}.npz")
         np.savez_compressed(out_path, image=img, tile_scores=tile_scores,
                             fg_pixels=fg_pixels)
@@ -190,10 +195,11 @@ class CachedSpatialDataset(Dataset):
         return len(self.paths)
 
     def __getitem__(self, idx):
+        # 从磁盘 .npz 按需加载，避免 DataLoader pickle 大数组 | Lazy load from .npz to avoid pickling large arrays
         data = np.load(self.paths[idx])
-        img = torch.from_numpy(data["image"])           # [3, S, S] float32
-        scores = torch.from_numpy(data["tile_scores"])  # [n_ty, n_tx] float32
-        fg = torch.from_numpy(data["fg_pixels"])        # [n_tiles] int64
+        img = torch.from_numpy(data["image"])           # [3, S, S] float32 归一化图像 | normalized image
+        scores = torch.from_numpy(data["tile_scores"])  # [n_ty, n_tx] float32 GT fg_ratio 网格 | GT fg_ratio grid
+        fg = torch.from_numpy(data["fg_pixels"])        # [n_tiles] int64 每 tile 前景像素数 | FG pixel count per tile
         return img, scores, fg
 
 
@@ -206,9 +212,11 @@ class MobileNetSpatialRouter(nn.Module):
 
     def __init__(self, pretrained: bool = True):
         super().__init__()
+        # 使用预训练 MobileNetV3-Small 作为特征提取器 | Use pretrained MV3-Small as feature extractor
         mnet = models.mobilenet_v3_small(weights="DEFAULT" if pretrained else None)
-        self.backbone = mnet.features  # stride=32, 576 channels
+        self.backbone = mnet.features  # stride=32, 576 channels — 输出分辨率 H/32×W/32
 
+        # Head: 将 576 通道特征图 → 单通道重要性图 | Map 576-channel features → single-channel importance map
         self.head = nn.Sequential(
             nn.Conv2d(576, 256, 3, padding=1, bias=False),
             nn.BatchNorm2d(256),
@@ -216,13 +224,15 @@ class MobileNetSpatialRouter(nn.Module):
             nn.Conv2d(256, 64, 3, padding=1, bias=False),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, 1, 1, bias=True),
-            nn.Sigmoid(),
+            nn.Conv2d(64, 1, 1, bias=True),  # 1×1 卷积 → 单通道 | pointwise → single channel
+            nn.Sigmoid(),                     # 输出 [0,1] 重要性得分 | output [0,1] importance scores
         )
+        # 冻结 backbone: 只训练 Head 参数 | Freeze backbone: only train Head parameters
         for p in self.backbone.parameters():
             p.requires_grad = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Backbone 提取特征 → Head 预测重要性图 | Backbone extracts features → Head predicts importance map
         return self.head(self.backbone(x))  # [B, 576, H/32, W/32] → [B, 1, H/32, W/32]
 
 
@@ -231,24 +241,27 @@ class MobileNetSpatialRouter(nn.Module):
 # ═══════════════════════════════════════════════════════════════════
 
 def train_epoch(model, loader, opt, device):
-    """训练一个 epoch (批处理)."""
+    """训练一个 epoch (批处理) | Train one epoch with batch processing."""
     model.train()
     total_loss, n = 0.0, 0
 
     pbar = tqdm(loader, desc="  Train", leave=False)
     for imgs, gt_scores, fg_px in pbar:
-        imgs = imgs.to(device)  # [B, 3, S, S]
+        imgs = imgs.to(device)  # [B, 3, S, S] batch
         B = imgs.shape[0]
 
+        # 前向传播: 图像 → 重要性图 | Forward: image → importance map
         imp_maps = model(imgs)  # [B, 1, S/32, S/32]
         _, _, hp, wp = imp_maps.shape
 
         batch_loss = 0.0
+        # 逐样本: 每个样本可能有不同的 tile 数量 | Per-sample: each sample may have different tile counts
         for b in range(B):
             gt = gt_scores[b].to(device)
             n_ty, n_tx = gt.shape
 
             pred_list, gt_list = [], []
+            # 遍历所有 tile: 将重要性图区域平均 → tile 得分 | Iterate tiles: average importance map region → tile score
             for ty in range(n_ty):
                 for tx in range(n_tx):
                     y0, y1 = ty * TILE_FEAT, min(ty * TILE_FEAT + TILE_FEAT, hp)
@@ -260,6 +273,7 @@ def train_epoch(model, loader, opt, device):
             if pred_list:
                 batch_loss += F.mse_loss(torch.stack(pred_list), torch.stack(gt_list))
 
+        # 梯度更新: zero_grad → backward → step | Gradient update
         opt.zero_grad()
         batch_loss.backward()
         opt.step()
@@ -272,13 +286,14 @@ def train_epoch(model, loader, opt, device):
 
 @torch.no_grad()
 def evaluate_model(model, loader, device):
-    """收集所有 tile pred/gt → Oracle vs Learned."""
+    """收集所有 tile pred/gt → 计算 Pearson/Spearman 相关性 + Oracle vs Learned FG 保留率 | Collect all tile pred/gt → Pearson/Spearman + Oracle vs Learned FG retention."""
     model.eval()
     all_pred, all_gt, all_fg = [], [], []
 
     for imgs, gt_scores, fg_px in tqdm(loader, desc="  Eval", leave=False):
         imgs = imgs.to(device)
         B = imgs.shape[0]
+        # 前向传播 → 重要性图 | Forward → importance map
         imp_maps = model(imgs)
         _, _, hp, wp = imp_maps.shape
 
@@ -287,6 +302,7 @@ def evaluate_model(model, loader, device):
             fg = fg_px[b].numpy()
             n_ty, n_tx = gt.shape
             idx = 0
+            # 遍历所有 tile: 收集预测得分 → GT fg_ratio → 前景像素 | Iterate tiles: collect pred → GT fg_ratio → FG pixels
             for ty in range(n_ty):
                 for tx in range(n_tx):
                     y0, y1 = ty * TILE_FEAT, min(ty * TILE_FEAT + TILE_FEAT, hp)
@@ -301,13 +317,16 @@ def evaluate_model(model, loader, device):
     gt_all = np.array(all_gt)
     fg_all = np.array(all_fg)
 
+    # 计算 Pearson (线性相关) 和 Spearman (排序相关) | Compute Pearson (linear) and Spearman (rank) correlation
     from scipy.stats import pearsonr, spearmanr
     pr, _ = pearsonr(pred_all, gt_all)
     sr, _ = spearmanr(pred_all, gt_all)
 
-    oracle_ord = np.argsort(gt_all)[::-1]
-    learned_ord = np.argsort(pred_all)[::-1]
+    # 按 GT/预测 降序排列 → 计算 FG 保留率 | Sort by GT/pred descending → compute FG retention
+    oracle_ord = np.argsort(gt_all)[::-1]      # Oracle: 按真实密度排序 | sorted by true density
+    learned_ord = np.argsort(pred_all)[::-1]   # Learned: 按预测得分排序 | sorted by predicted score
 
+    # 对每个 Top-K% 计算保留的前景像素占比 | For each Top-K%, compute fraction of FG pixels retained
     oracle_r, learned_r = {}, {}
     for k in [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 60, 70, 80, 90, 100]:
         n = max(1, int(len(gt_all) * k / 100))
@@ -328,7 +347,7 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 缓存目录 | Cache directory
+    # 缓存目录: 预处理 .npz 存储位置 | Cache directory: where preprocessed .npz files are stored
     if args.cache_dir:
         cache_dir = args.cache_dir
     else:
@@ -339,16 +358,18 @@ def main():
                     f"epochs={args.epochs} batch={args.batch_size} "
                     f"size={args.image_size} device={device}")
 
-    # ── 加载 COCO ──
+    # ── 加载 iSAID COCO 标注 | Load iSAID COCO annotations ──
     src_root = Path(args.src_root)
     ann_file = src_root / "train" / "annotations" / "instances_train.json"
     with open(ann_file) as f:
         coco = json.load(f)
 
+    # 建立 image_id → annotations 索引 | Build image_id → annotations index
     img_id_to_anns = {}
     for ann in coco["annotations"]:
         img_id_to_anns.setdefault(ann["image_id"], []).append(ann)
 
+    # 收集所有有标注的图像 | Collect all images with annotations
     img_dir = src_root / "train" / "images"
     all_images = []
     for img_info in coco["images"]:
@@ -361,7 +382,7 @@ def main():
 
     logger.log_info("data", f"Total: {len(all_images)} images with annotations")
 
-    # ── Train/Eval split ──
+    # ── Train/Eval split: 随机划分训练/验证集 | Random train/eval split ──
     np.random.seed(args.seed)
     perm = np.random.permutation(len(all_images))
     n_train = min(args.train_images, len(all_images) - 30)
@@ -379,11 +400,13 @@ def main():
                     f"Batch: {args.batch_size} | Workers: {args.num_workers} | "
                     f"Cache: {cache_dir}")
 
+    # 多进程预处理: 图像 → .npz (包含归一化图像 + tile GT) | Multiprocess preprocess: image → .npz (with normalized image + tile GT)
     train_cache = os.path.join(cache_dir, "train")
     eval_cache = os.path.join(cache_dir, "eval")
     train_paths = preprocess_dataset(train_imgs, args.image_size, train_cache)
     eval_paths = preprocess_dataset(eval_imgs, args.image_size, eval_cache)
 
+    # CacheDataset + DataLoader: 多线程异步加载 | CacheDataset + DataLoader: async multi-worker loading
     train_ds = CachedSpatialDataset(train_paths)
     eval_ds = CachedSpatialDataset(eval_paths)
 
@@ -396,18 +419,19 @@ def main():
         num_workers=args.num_workers, pin_memory=(device == "cuda"),
         persistent_workers=(args.num_workers > 0), drop_last=False)
 
-    # ── 模型 (日志) | Model (logged) ──
+    # ── 模型: MobileNetV3-Small backbone (frozen) + Conv Head (trainable) | Model: MV3 backbone (frozen) + Conv Head (trainable) ──
     model = MobileNetSpatialRouter(pretrained=True).to(device)
     n_total = sum(p.numel() for p in model.parameters())
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.log_info("b02/model", f"Total={n_total:,} params, Trainable={n_trainable:,}")
 
+    # 优化器: Adam + CosineAnnealingLR | Optimizer: Adam + cosine annealing
     opt = torch.optim.Adam(
         [p for p in model.parameters() if p.requires_grad], lr=args.lr)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt, T_max=args.epochs, eta_min=1e-6)
 
-    # ── 训练 (日志) | Training (logged) ──
+    # ── 训练循环: epoch → train_epoch → 调度器步进 | Training loop: epoch → train_epoch → scheduler step ──
     logger.log_info("b02/train", f"Training {args.epochs} epochs...")
     all_losses = []
     for epoch in range(1, args.epochs + 1):
@@ -419,11 +443,11 @@ def main():
             logger.log_info("b02/train",
                             f"E{epoch:2d}/{args.epochs}  loss={avg_loss:.4f}")
 
-    # ── 评估 (日志) | Evaluation (logged) ──
+    # ── 评估: 在 hold-out 集上计算 Pearson/Spearman 和 FG 保留率 | Evaluate: compute Pearson/Spearman and FG retention on holdout set ──
     logger.log_info("b02/eval", "Evaluating on hold-out set...")
     results = evaluate_model(model, eval_loader, device)
 
-    # ── 结果 (日志) | Results (logged) ──
+    # ── 结果输出: Pearson/Spearman + Oracle vs Learned FG 保留率 | Results: Pearson/Spearman + Oracle vs Learned FG retention ──
     logger.log_info("b02/results",
                     f"Pearson r={results['pearson_r']:.4f}  "
                     f"Spearman r={results['spearman_r']:.4f}  "
@@ -435,39 +459,45 @@ def main():
         logger.log_info("b02/results",
                         f"  {k:>5}%  {o:>8.2f}%  {l:>8.2f}%  {o-l:>6.2f}%")
 
+    # 计算 IDEA Density Gain (IDG): FG 保留率 / 保留比例 | Compute IDG: FG retention / kept fraction
     oracle_idg = {k: results["oracle_retention"][k]/(k/100) for k in [20, 30, 40, 50]}
     learned_idg = {k: results["learned_retention"][k]/(k/100) for k in [20, 30, 40, 50]}
     logger.log_info("b02/idg",
                     f"Oracle Top40 IDG={oracle_idg[40]:.2f}x  "
                     f"Learned Top40 IDG={learned_idg[40]:.2f}x")
 
+    # 判定: Spearman r > 0.6 → Learnable, > 0.3 → Partially, else → Hard
     sr = results["spearman_r"]
     verdict = ("LEARNABLE" if sr > 0.6 else
                "PARTIALLY LEARNABLE" if sr > 0.3 else "HARD")
     logger.log_info("b02/verdict",
                     f"VERDICT: {verdict}  (Spearman r={sr:.4f})")
 
-    # ── Save & Plot ──
+    # ── 保存结果并生成6面板可视化图 | Save results & generate 6-panel visualization ──
+    # 面板布局: [FG保留率曲线, 训练曲线, Oracle-Learned差距, 文本摘要, IDG柱状图, 实验信息]
     fig, axes = plt.subplots(2, 3, figsize=(22, 13))
     ks = sorted(results["oracle_retention"].keys())
     ofg = [results["oracle_retention"][k]*100 for k in ks]
     lfg = [results["learned_retention"][k]*100 for k in ks]
 
+    # Panel (0,0): Oracle vs Learned FG Retention 曲线 | FG retention curves
     ax = axes[0, 0]
     ax.plot(ks, ofg, "o-", color="#E74C3C", lw=2.5, ms=7, label="Oracle")
     ax.plot(ks, lfg, "s-", color="#3498DB", lw=2.5, ms=7,
             label=f"Learned (r={sr:.3f})")
-    ax.fill_between(ks, lfg, ofg, alpha=0.08, color="gray")
-    ax.axvline(30, color="gray", ls="--", alpha=0.3)
-    ax.axvline(40, color="gray", ls="--", alpha=0.3)
+    ax.fill_between(ks, lfg, ofg, alpha=0.08, color="gray")  # Oracle-Learned 差距区域 | gap region
+    ax.axvline(30, color="gray", ls="--", alpha=0.3)  # 标记 Top30%
+    ax.axvline(40, color="gray", ls="--", alpha=0.3)  # 标记 Top40%
     ax.set(xlabel="Tiles Kept (%)", ylabel="FG Retained (%)",
            title="Oracle vs Learned FG Retention", xlim=(0, 105), ylim=(0, 105))
     ax.legend(fontsize=9); ax.grid(alpha=0.25)
 
+    # Panel (0,1): Training Loss 曲线 | Training loss curve
     ax = axes[0, 1]
     ax.plot(range(1, len(all_losses)+1), all_losses, "o-", color="#27AE60", lw=2)
     ax.set(xlabel="Epoch", ylabel="MSE", title="Training Loss"); ax.grid(alpha=0.2)
 
+    # Panel (0,2): Oracle - Learned Gap (差距) 柱状图 | Gap bar chart
     ax = axes[0, 2]
     gap = [o-l for o, l in zip(ofg, lfg)]
     ax.bar(ks, gap, width=3, color="#E67E22", edgecolor="white", alpha=0.8)
@@ -475,6 +505,7 @@ def main():
     ax.set(xlabel="Tiles Kept (%)", ylabel="Oracle - Learned Gap (%)",
            title=f"Gap (mean={np.mean(gap):.2f}%)"); ax.grid(axis="y", alpha=0.2)
 
+    # Panel (1,1): IDG 柱状图 (Oracle vs Learned at 20/30/40/50%) | IDG comparison
     ax = axes[1, 1]
     xp = np.arange(4); w = 0.3
     for i, k in enumerate([20, 30, 40, 50]):
@@ -487,6 +518,7 @@ def main():
            f"vs Learned={learned_idg[40]:.2f}x")
     ax.legend(fontsize=9); ax.grid(axis="y", alpha=0.2)
 
+    # Panel (1,0): 文本摘要 (Pearson/Spearman/N) | Text summary
     ax = axes[1, 0]
     ax.text(0.5, 0.5, f"Pearson r = {results['pearson_r']:.4f}\n"
             f"Spearman r = {results['spearman_r']:.4f}\n\n"
@@ -495,6 +527,7 @@ def main():
             transform=ax.transAxes, ha="center", va="center", fontsize=14)
     ax.axis("off")
 
+    # Panel (1,2): 实验配置信息 (文本面板) | Experiment info (text panel)
     ax = axes[1, 2]; ax.axis("off"); ax.set_xlim(0, 10); ax.set_ylim(0, 10)
     lines = [
         "B-02 Learnability", "="*30, "",
@@ -524,6 +557,8 @@ def main():
     fig.tight_layout()
     fig.savefig(output_dir / "learnability.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
+
+    # ── 保存 JSON 结果 (可复现) | Save JSON results (reproducible) ──
 
     summary = {
         "experiment": "B-02 Learnability Study",

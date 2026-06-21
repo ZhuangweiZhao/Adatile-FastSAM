@@ -245,10 +245,11 @@ def compute_val_silhouette(head, backbone, val_ds, device, n_samples: int = 5000
     """
     head.eval()
     scores = []
-    for idx in range(min(8, len(val_ds))):  # 8 张图足够 | 8 images enough
+    for idx in range(min(8, len(val_ds))):  # 8 张图足够估计 | 8 images enough for reliable estimate
         sample = val_ds[idx]
         image = sample["image"].unsqueeze(0).to(device)
         gt_mask = sample["masks"].to(device)
+        # 统一 mask 维度 | Normalize mask dimensions
         if gt_mask.dim() == 3:
             gt_mask = gt_mask.squeeze(0)
         elif gt_mask.dim() == 4:
@@ -292,9 +293,10 @@ def train_head(head, backbone, train_ds, val_ds, args, device, recorder,
 
     print(f"\n  [{head_name}] Training {args.epochs} epochs (lr={args.lr}, CosineLR)...")
     for epoch in range(1, args.epochs + 1):
-        # ── Train ──
+        # ── 训练阶段 | Training phase ──
         head.train()
         total_loss = 0.0
+        # 逐样本 episodic training | Per-sample episodic training (no batch accumulation)
         pbar = tqdm(range(len(train_ds)), desc=f"  [{head_name}] Epoch {epoch}/{args.epochs}",
                     leave=False)
         for idx in pbar:
@@ -315,6 +317,7 @@ def train_head(head, backbone, train_ds, val_ds, args, device, recorder,
             else:
                 _, logit = head(p4)
 
+            # 上采样 + BCE 损失 | Upsample + BCE loss
             logit_up = F.interpolate(logit, size=tuple(gt_mask.shape),
                                      mode="bilinear", align_corners=False)
             loss = F.binary_cross_entropy_with_logits(logit_up.squeeze(), gt_mask)
@@ -328,7 +331,7 @@ def train_head(head, backbone, train_ds, val_ds, args, device, recorder,
         avg_loss = total_loss / len(train_ds)
         loss_history.append(avg_loss)
 
-        # ── Val Dice ──
+        # ── 验证 Dice | Validation Dice ──
         head.eval()
         dices = []
         with torch.no_grad():
@@ -336,6 +339,7 @@ def train_head(head, backbone, train_ds, val_ds, args, device, recorder,
                 sample = val_ds[idx]
                 image = sample["image"].unsqueeze(0).to(device)
                 gt_mask = sample["masks"].to(device)
+                # 统一 mask 维度 | Normalize mask dimensions (handle various shapes)
                 if gt_mask.dim() == 3:
                     gt_mask = gt_mask.squeeze(0)
                 elif gt_mask.dim() == 4:
@@ -345,9 +349,12 @@ def train_head(head, backbone, train_ds, val_ds, args, device, recorder,
                     _, _, logit = head(features["p4"], temperature=args.temperature)
                 else:
                     _, logit = head(features["p4"])
+                # 上采样到 GT 分辨率 | Upsample to GT resolution
                 logit_up = F.interpolate(logit, size=tuple(gt_mask.shape),
                                          mode="bilinear", align_corners=False)
+                # 二值化预测 | Binarize prediction at threshold 0.5
                 pred = (torch.sigmoid(logit_up) > 0.5).float().squeeze(1)
+                # 确保 batch 维度 | Ensure batch dimension for compute_dice
                 if pred.dim() == 2:
                     pred = pred.unsqueeze(0)
                 if gt_mask.dim() == 2:

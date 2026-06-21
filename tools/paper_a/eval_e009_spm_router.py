@@ -213,15 +213,19 @@ class SPMHead(nn.Module):
             router_logits = self.router(embedding)  # [B, N, H, W]
 
             if self.training:
-                # Straight-Through Estimator
+                # 直通估计器 | Straight-Through Estimator (STE)
+                # 前向: 硬 Top-K (不可导), 反向: soft mask 的梯度 (可导)
+                # Forward: hard Top-K (non-differentiable), Backward: soft mask gradient
                 router_flat = router_logits.permute(0, 2, 3, 1).reshape(-1, N)
                 _, topk_idx = router_flat.topk(k, dim=1)
                 mask_hard_flat = torch.zeros_like(router_flat).scatter_(1, topk_idx, 1.0)
                 mask_hard = mask_hard_flat.reshape(B, H, W, N).permute(0, 3, 1, 2)
                 mask_soft = F.softmax(router_logits, dim=1)
+                # STE trick: mask = hard - soft.detach() + soft
+                # 前向等于 hard, 反向梯度通过 soft 回传
                 mask = mask_hard - mask_soft.detach() + mask_soft
             else:
-                # Hard Top-K at inference
+                # 推理时: 硬 Top-K (无需梯度) | Inference: hard Top-K (no gradients)
                 router_flat = router_logits.permute(0, 2, 3, 1).reshape(-1, N)
                 _, topk_idx = router_flat.topk(k, dim=1)
                 mask_flat = torch.zeros_like(router_flat).scatter_(1, topk_idx, 1.0)
@@ -257,7 +261,12 @@ class SPMHead(nn.Module):
 # ═══════════════════════════════════════════════════════════════════
 
 def train_stage1(proto_head, backbone, train_ds, val_ds, args, device, recorder):
-    """训练 ProtoHead (同 E007-B 配置)."""
+    """
+    Stage 1: 训练 ProtoHead (同 E007-B 配置) | Train ProtoHead (same E007-B config).
+
+    ProtoHead learns the full set of N prototypes with all N active.
+    Output: trained project, prototypes, and head — later frozen for Stage 2.
+    """
     proto_head.train()
     optimizer = torch.optim.Adam(proto_head.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -333,17 +342,24 @@ def train_stage1(proto_head, backbone, train_ds, val_ds, args, device, recorder)
 # ═══════════════════════════════════════════════════════════════════
 
 def train_stage2(spm_head, backbone, train_ds, val_ds, args, device, recorder):
-    """训练 Router (Proto Dictionary 已冻结)."""
+    """
+    Stage 2: 训练 Router (Proto Dictionary 已冻结) | Train Router only (frozen Proto).
+
+    Key design:
+      - Only router parameters receive gradients
+      - Entropy regularization prevents router from collapsing to a single proto
+      - BCE loss drives the router to select protos that aid segmentation
+    """
     spm_head.train()  # only router is trainable
 
-    # Only router params | 只优化 Router 参数
+    # 只优化 Router 参数 | Only optimize Router parameters
     optimizer = torch.optim.Adam(spm_head.router.parameters(), lr=args.lr_router)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs_s2, eta_min=args.lr_router * 0.01)
     best_dice, best_state = 0.0, None
 
     k = args.router_k
-    ew = args.entropy_weight
+    ew = args.entropy_weight  # 熵正则化权重 | entropy regularization weight
 
     print(f"  [S2] Training {args.epochs_s2} epochs "
           f"(Router K={k}/{args.n_protos}, lr={args.lr_router}, entropy_w={ew})...")
@@ -495,15 +511,17 @@ def compare_routing(spm_head, backbone, val_ds, device, args):
                     logit_k, _, _, router_logits = spm_head.forward_routed(
                         p4, temperature=args.temperature, mode=mode, k=k)
 
-                    # Agreement: Learned vs Fixed at router_k
+                    # 一致性分析: Learned Router 与 Fixed |w·sim| 的 Top-K 选择重合度
+                    # Agreement: Learned Router vs Fixed |w·sim| — how much do their Top-K selections overlap?
                     if (mode == "learned" and router_logits is not None
                             and k == args.router_k):
                         router_flat = router_logits.permute(0, 2, 3, 1).reshape(-1, args.n_protos)
-                        _, l_topk = router_flat.topk(k, dim=1)
+                        _, l_topk = router_flat.topk(k, dim=1)  # Learned 选择的 proto | learned choices
                         head_w = spm_head.proto_head.head.weight.squeeze()
                         sim_flat = sim_maps.permute(0, 2, 3, 1).reshape(-1, args.n_protos)
                         importance = (sim_flat * head_w.unsqueeze(0)).abs()
-                        _, f_topk = importance.topk(k, dim=1)
+                        _, f_topk = importance.topk(k, dim=1)  # Fixed 选择的 proto | fixed choices
+                        # 计算重合比例 | Compute overlap ratio
                         agree = sum(1 for i in range(l_topk.shape[0])
                                    for j in range(k) if l_topk[i, j] in f_topk[i])
                         agreement_vals.append(agree / (l_topk.shape[0] * k))

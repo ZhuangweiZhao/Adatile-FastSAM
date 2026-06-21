@@ -78,18 +78,35 @@ def parse_args():
 # ═══════════════════════════════════════════════════════════════════
 
 class ProtoHead(torch.nn.Module):
+    """
+    原型头 | Proto Head (同 E007-B 架构, 仅 N 可变).
+
+    P4 → Conv(1280→D)→ReLU → CosineSim(N protos) → Conv(N→1)→logit.
+    用于分析不同 N 下 Proto 的有效使用情况。
+    """
     def __init__(self, in_channels=1280, embed_dim=128, n_protos=8):
         super().__init__()
         self.embed_dim = embed_dim
         self.n_protos = n_protos
+        # 特征投影 | Feature projection: 1280 → D
         self.project = torch.nn.Sequential(
             torch.nn.Conv2d(in_channels, embed_dim, 1, bias=False),
             torch.nn.ReLU(inplace=True),
         )
+        # 可学习原型向量 | Learnable prototype vectors
         self.prototypes = torch.nn.Parameter(torch.randn(n_protos, embed_dim) * 0.1)
+        # 分割头 | Segmentation head: N → 1
         self.head = torch.nn.Conv2d(n_protos, 1, 1, bias=True)
 
     def forward(self, p4, temperature=0.1):
+        """
+        标准前向 | Standard forward pass.
+
+        Returns:
+            embedding: [B, D, H, W] 低维嵌入 | low-dim embedding
+            sim_maps:  [B, N, H, W] proto 相似度图 | proto similarity maps
+            logit:     [B, 1, H, W] 分割 logit | segmentation logit
+        """
         embedding = self.project(p4)
         emb_norm = F.normalize(embedding, dim=1, p=2)
         proto_norm = F.normalize(self.prototypes, dim=1, p=2)
@@ -106,10 +123,16 @@ class ProtoHead(torch.nn.Module):
         """
         统计 Proto 使用情况 | Compute per-proto usage statistics.
 
+        四个维度分析 Proto 利用效率 | Four dimensions of proto utilization analysis:
+          1. Winner frequency: 每个 proto 被 argmax 选中的频率
+          2. Energy fraction: 每个 proto 的 |w·sim| 能量占比 (head 加权的真实贡献)
+          3. Head weight norm: head 权重的绝对值 (模型对该 proto 的重视程度)
+          4. Inter-proto cosine: proto 间余弦相似度 (冗余度)
+
         Returns:
             winner_freq:    [N] — 每个 proto 是 winner 的频率
             energy_frac:    [N] — 每个 proto 的 |w·sim| 能量占比
-            head_norm:      [N] — 每个 proto 的 head weight 的 L2 范数
+            head_norm:      [N] — 每个 proto 的 head weight 的绝对值
             inter_cos:      [N,N] — proto 间 cosine similarity 矩阵
         """
         self.eval()
@@ -119,34 +142,40 @@ class ProtoHead(torch.nn.Module):
         total_pixels = 0
 
         with torch.no_grad():
+            # 采样最多 20 张验证图 | Sample at most 20 val images
             for idx in range(min(20, len(val_ds))):
                 sample = val_ds[idx]
                 image = sample["image"].unsqueeze(0).to(device)
                 with torch.no_grad():
                     features = backbone(image)
 
+                # Winner-take-all 分配 | Winner-take-all assignment
                 winner = self.get_winner_map(features["p4"], temperature)
                 embedding, sim_maps, _ = self.forward(features["p4"], temperature)
 
-                # Winner frequency
+                # 统计 winner 频率 | Accumulate winner frequency
                 for p in range(n_protos):
                     winner_counts[p] += (winner == p).sum().item()
                 total_pixels += winner.numel()
 
-                # Energy: |w·sim| per proto
+                # 能量统计: |w·sim| per proto (head 加权的真实贡献)
+                # Energy: |w·sim| per proto — head-weighted true contribution
                 head_w = self.head.weight.squeeze().detach()  # [N]
                 sim_flat = sim_maps.squeeze(0).reshape(n_protos, -1)  # [N, HW]
                 energy = (sim_flat * head_w.unsqueeze(1)).abs().sum(dim=1)  # [N]
                 energy_acc += energy.cpu().numpy()
 
+        # 归一化 | Normalize to fractions
         winner_freq = winner_counts / total_pixels
         energy_frac = energy_acc / (energy_acc.sum() + 1e-8)
 
-        # Head weight L2 norm
+        # Head weight 绝对值 (模型对各 Proto 的重视程度)
+        # Head weight magnitude — model's reliance on each proto
         head_w = self.head.weight.squeeze()
         head_norm = head_w.detach().abs().cpu().numpy()
 
-        # Proto 间 cosine similarity
+        # Proto 间余弦相似度矩阵 (衡量冗余度)
+        # Inter-proto cosine similarity matrix (redundancy measure)
         proto_n = F.normalize(self.prototypes.detach(), dim=1, p=2)
         inter_cos = (proto_n @ proto_n.T).cpu().numpy()
 
@@ -158,7 +187,21 @@ class ProtoHead(torch.nn.Module):
 # ═══════════════════════════════════════════════════════════════════
 
 def train_proto_head(proto_head, backbone, train_ds, val_ds, args, device, recorder):
-    """训练 ProtoHead (同 E007-B)."""
+    """
+    训练 ProtoHead (同 E007-B 配方) | Train ProtoHead (same E007-B recipe).
+
+    Args:
+        proto_head: ProtoHead instance (variable N)
+        backbone:   Frozen FastSAM backbone
+        train_ds:   Training dataset
+        val_ds:     Validation dataset
+        args:       CLI arguments
+        device:     torch device
+        recorder:   ExperimentRecorder instance
+
+    Returns:
+        best_dice:  Best validation Dice across all epochs
+    """
     proto_head.train()
     optimizer = torch.optim.Adam(proto_head.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -260,10 +303,11 @@ def plot_usage_analysis(results, output_path):
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    # (3) Dominance (top-1 energy fraction) vs N
+    # (3) 集中度 vs N | Dominance (top-1 energy fraction) vs N
     ax = axes[0, 2]
     dominance = [results[n]["energy_frac"][0] for n in n_values]
-    # Effective proto count: 1 / sum(p_i^2) (inverse Herfindahl)
+    # 有效 Proto 数: 1 / Σp_i² (逆 Herfindahl 指数, 衡量集中度)
+    # Effective proto count: 1 / sum(p_i^2) (inverse Herfindahl index)
     eff_n = []
     for n in n_values:
         ef = results[n]["energy_frac"]

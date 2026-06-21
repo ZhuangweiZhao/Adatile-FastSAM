@@ -45,20 +45,28 @@ logger = get_logger("e011t_tile")
 def parse_args():
     p = argparse.ArgumentParser(description="E011-T: Tile Size Ablation")
     p.add_argument("--tile-sizes", type=str, default="256,384,512,768,1024",
-                   help="待测试的 tile 尺寸列表")
+                   help="待测试的 tile 尺寸列表 | Comma-separated tile sizes to test")
     p.add_argument("--epochs", type=int, default=30,
                    help="每个尺寸的训练轮数 | epochs per tile size")
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--embed-dim", type=int, default=128)
-    p.add_argument("--n-protos", type=int, default=16)
-    p.add_argument("--num-classes", type=int, default=15)
-    p.add_argument("--temperature", type=float, default=0.1)
+    p.add_argument("--lr", type=float, default=1e-3,
+                   help="学习率 | learning rate")
+    p.add_argument("--embed-dim", type=int, default=128,
+                   help="嵌入维度 | embedding dimension D")
+    p.add_argument("--n-protos", type=int, default=16,
+                   help="原型数量 | number of prototypes")
+    p.add_argument("--num-classes", type=int, default=15,
+                   help="iSAID 类别数 | number of iSAID classes")
+    p.add_argument("--temperature", type=float, default=0.1,
+                   help="Softmax 温度 | softmax temperature")
     p.add_argument("--max-images", type=int, default=5,
-                   help="限制源图片数 (保证不同 tile size 看到相同图像内容)")
-    p.add_argument("--output-dir", type=str, default="runs")
+                   help="限制源图片数 (保证不同 tile size 看到相同图像内容) | "
+                        "limit source images for fair comparison across tile sizes")
+    p.add_argument("--output-dir", type=str, default="runs",
+                   help="输出目录 | output directory")
     p.add_argument("--device", type=str,
                    default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--seed", type=int, default=42,
+                   help="随机种子 | random seed for reproducibility")
     return p.parse_args()
 
 
@@ -193,18 +201,20 @@ def analyze_tile_size(model, backbone, val_ds, device, num_classes, n_protos,
     pct = proto_class / row_sums  # [N, C]
 
     # 背景主导 Proto 数 | Number of background-dominant protos
+    # 定义: 该类 Proto 分配到的像素中 >50% 属于背景 (class 0)
     n_bg = int((pct[:, 0] > 0.5).sum())
 
     # Proto 类别熵 | Proto category entropy
-    # 高熵 = Proto 负责多种类别 (好 → 多样性)
-    # 低熵 = Proto 坍缩到单一类别
+    # 高熵 = Proto 负责多种类别 (好 → 类别多样性高 | good → high class diversity)
+    # 低熵 = Proto 坍缩到单一类别 (差 → 没有学到有意义的表示 | collapse to single class)
     entropies = []
     for p in range(n_protos):
-        dist = pct[p] + 1e-8
+        dist = pct[p] + 1e-8  # 平滑 | smoothing
         dist = dist / dist.sum()
-        ent = -(dist * np.log(dist)).sum()
+        ent = -(dist * np.log(dist)).sum()  # Shannon entropy
         entropies.append(ent)
-    # 排除死 Proto (总像素数 < 100)
+    # 排除死 Proto (总像素数 < 100, 无统计意义)
+    # Exclude dead protos (total pixels < 100, statistically meaningless)
     active_ent = [e for p, e in enumerate(entropies) if proto_class[p].sum() > 100]
     proto_ent_mean = float(np.mean(active_ent)) if active_ent else 0.0
 
@@ -225,8 +235,19 @@ def train_proto(proto_head, backbone, train_ds, args, device, tile_size):
     """
     训练 ProtoHead (单 tile size) | Train ProtoHead for one tile size.
 
+    使用多类别交叉熵 (ignore_index=255) 训练。
+    Trained with multi-class CE loss (ignore_index=255 for void labels).
+
     Args:
-        tile_size: 当前 tile 尺寸 (仅用于日志标记)
+        proto_head: ProtoHead instance
+        backbone:   Frozen FastSAM backbone
+        train_ds:   Training dataset (tiles of this size)
+        args:       CLI arguments
+        device:     torch device
+        tile_size:  当前 tile 尺寸 (仅用于日志标记) | current tile size (for logging)
+
+    Returns:
+        proto_head: Trained ProtoHead (in-place).
     """
     proto_head.train()
     opt = torch.optim.Adam(proto_head.parameters(), lr=args.lr)
@@ -340,7 +361,14 @@ def main():
         # 按源图片数限制 | Limit by source image count (fair comparison)
         if args.max_images > 0:
             def _filter_by_images(tiles, n_images):
-                """保留前 N 张源图的全部 tile | Keep tiles from first N source images."""
+                """
+                保留前 N 张源图的全部 tile | Keep tiles from first N source images.
+
+                保证不同 tile size 看到相同的图像内容, 公平对比。
+                Ensures fair comparison: all tile sizes see same image content.
+
+                Tile 命名格式: "P0000_t003.png" → source image "P0000"
+                """
                 seen = set()
                 filtered = []
                 for t in tiles:

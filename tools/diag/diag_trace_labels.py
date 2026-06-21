@@ -35,15 +35,19 @@ from adatile.utils.label_mapping import _DEPRECATED_ACTUAL_TO_CODE_ID as ACTUAL_
 
 
 def trace(args):
-    """追踪 pipeline 各阶段的类别 ID | Trace category ID through pipeline stages."""
+    """追踪 pipeline 各阶段的类别 ID | Trace category ID through pipeline stages.
 
+    追踪链路 | Trace chain (4 stages):
+        ① 原始 iSAID JSON → ② prep_isaid.py 修正 → ③ masks_full 全图掩码 → ④ tile 掩码
+    """
     print("=" * 70)
     print("  SINGLE INSTANCE TRACE | 单实例类别 ID 追踪")
     print("=" * 70)
 
-    src_root = Path(args.data_root) / "iSAID_processed"
-    tile_root = Path(args.data_root) / "iSAID_tiles"
-    orig_root = Path(args.data_root) / "iSAID"
+    # 数据目录 | Data directories
+    src_root = Path(args.data_root) / "iSAID_processed"  # 预处理后的 COCO JSON
+    tile_root = Path(args.data_root) / "iSAID_tiles"      # tile 数据集
+    orig_root = Path(args.data_root) / "iSAID"            # 原始 iSAID 数据
 
     for split in ["train", "val"]:
         print(f"\n{'─'*70}")

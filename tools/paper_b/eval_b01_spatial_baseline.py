@@ -57,6 +57,7 @@ def main():
     fg_pixels = np.array([t["fg_pixels"] for t in tiles])
 
     # ── 统计 | Statistics ──
+    # 三分类计数：空 (<1%), 稀疏 (1-5%), 有意义 (≥5%) | Three-way classification: empty, sparse, meaningful
     empty = int((fg_ratios < 0.01).sum())
     sparse = int(((fg_ratios >= 0.01) & (fg_ratios < 0.05)).sum())
     meaningful = int((fg_ratios >= 0.05).sum())
@@ -72,18 +73,19 @@ def main():
 
     # ── Top-K tile selection simulation ──
     # 如果只处理 Top-K 的 tile (按 fg_ratio), 能捕获多少总前景像素?
-    sorted_idx = np.argsort(fg_ratios)[::-1]  # 降序
-    cum_fg = np.cumsum(fg_pixels[sorted_idx])
+    # If we only process Top-K tiles (by fg_ratio), how much total FG can we capture?
+    sorted_idx = np.argsort(fg_ratios)[::-1]  # 降序 | Descending (highest FG first)
+    cum_fg = np.cumsum(fg_pixels[sorted_idx])  # 累积前景像素 | Cumulative FG pixels
     total_fg = fg_pixels.sum()
-    cum_fg_frac = cum_fg / (total_fg + 1e-8)
+    cum_fg_frac = cum_fg / (total_fg + 1e-8)  # 归一化累积曲线 | Normalized cumulative curve
 
-    # 找关键拐点: 捕获 90%, 95%, 99% 前景需要多少 tile
+    # 找关键拐点: 捕获 90%, 95%, 99% 前景需要多少 tile | Find inflection: tiles needed for target FG%
     ks = [10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 99]
     thresholds = {}
     for k in ks:
-        idx = np.searchsorted(cum_fg_frac, k/100)
+        idx = np.searchsorted(cum_fg_frac, k/100)  # 二分查找累积阈值 | Binary search for threshold
         n_tiles = int(idx) + 1
-        tiles_pct = n_tiles / n_total * 100
+        tiles_pct = n_tiles / n_total * 100  # 换算为百分比 | Convert to percentage
         thresholds[k] = (n_tiles, tiles_pct)
 
     logger.log_info("b01/topk", "Top-K Tile Selection (by fg_ratio):")
@@ -93,10 +95,12 @@ def main():
         n, pct = thresholds[k]
         logger.log_info("b01/topk", f"  {k:>7}% FG   {n:>10,}   {pct:>9.1f}%")
 
-    # ── 可视化 | Visualization ──
+    # ═══════════════════════════════════════════════════════════════
+    # 可视化 | Visualization
+    # ═══════════════════════════════════════════════════════════════
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
-    # (1) fg_ratio 分布直方图
+    # ═══ (1) fg_ratio 分布直方图 | Panel 1: FG ratio histogram — tile density distribution ═══
     ax = axes[0]
     ax.hist(fg_ratios, bins=100, color="tab:blue", alpha=0.7, edgecolor="white")
     ax.axvline(x=0.01, color="red", linestyle="--", label="Empty (<1%)")
@@ -109,7 +113,7 @@ def main():
     ax.legend(fontsize=8)
     ax.set_yscale("log")
 
-    # (2) 累积前景覆盖 vs 处理 Tile 比例
+    # ═══ (2) 累积前景覆盖 vs 处理 Tile 比例 | Panel 2: Cumulative FG capture — budget vs reward ═══
     ax = axes[1]
     tile_pcts = np.linspace(0, 100, 200)
     n_tiles_at_pct = [max(1, int(n_total * p / 100)) for p in tile_pcts]
@@ -127,17 +131,17 @@ def main():
     ax.set_title("Cumulative FG Capture vs Tile Budget", fontsize=10)
     ax.grid(True, alpha=0.3)
 
-    # (3) 每张源图的 tile 前景分布 | Per-image tile fg distribution
+    # ═══ (3) 每张源图的 tile 前景分布 | Panel 3: Per-image tile density scatter — inter-image variance ═══
     ax = axes[2]
-    # 按 img_id 分组
+    # 按 img_id 分组，收集每张源图的所有 tile fg_ratio | Group by img_id, collect per-image fg_ratio list
     img_fg = {}
     for t in tiles:
         img_id = t["img_id"]
         img_fg.setdefault(img_id, []).append(t["fg_ratio"])
-    # 取每张图最 dense 和最 sparse 的 tile
-    img_max_fg = [max(v) for v in img_fg.values()]
-    img_min_fg = [min(v) for v in img_fg.values()]
-    img_mean_fg = [np.mean(v) for v in img_fg.values()]
+    # 取每张图的极值与均值 | Compute per-image max/min/mean fg_ratio
+    img_max_fg = [max(v) for v in img_fg.values()]  # 最密集 tile | Densest tile per image
+    img_min_fg = [min(v) for v in img_fg.values()]  # 最稀疏 tile | Sparsest tile per image
+    img_mean_fg = [np.mean(v) for v in img_fg.values()]  # 平均密度 | Mean density per image
     ax.scatter(img_mean_fg, img_max_fg, c="tab:red", alpha=0.3, s=5)
     ax.plot([0, 1], [0, 1], "k--", alpha=0.3)
     ax.set_xlabel("Mean FG per Image", fontsize=11)

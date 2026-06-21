@@ -43,24 +43,35 @@ logger = get_logger("isaid_mc")
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="iSAID Multi-Class Proto Experiment")
-    p.add_argument("--data-root", type=str, default="data/iSAID_tiles")
-    p.add_argument("--epochs", type=int, default=30)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--embed-dim", type=int, default=128)
-    p.add_argument("--n-protos", type=int, default=12)
-    p.add_argument("--temperature", type=float, default=0.1)
+    """解析命令行参数 | Parse command-line arguments."""
+    p = argparse.ArgumentParser(description="iSAID Multi-Class Proto Experiment | iSAID 多类别 Proto 实验")
+    p.add_argument("--data-root", type=str, default="data/iSAID_tiles",
+                   help="瓦片数据目录 | Tile data directory")
+    p.add_argument("--epochs", type=int, default=30,
+                   help="训练轮数 | Training epochs")
+    p.add_argument("--lr", type=float, default=1e-3,
+                   help="学习率 | Learning rate")
+    p.add_argument("--embed-dim", type=int, default=128,
+                   help="嵌入维度 | Embedding dimension")
+    p.add_argument("--n-protos", type=int, default=12,
+                   help="原型数量 | Number of prototypes")
+    p.add_argument("--temperature", type=float, default=0.1,
+                   help="余弦相似度温度系数 | Temperature for cosine similarity")
     p.add_argument("--num-classes", type=int, default=15,
                    help="iSAID 类别数 | Number of iSAID classes (15)")
-    p.add_argument("--output-dir", type=str, default="runs")
-    p.add_argument("--name", type=str, default="isaid_mc")
+    p.add_argument("--output-dir", type=str, default="runs",
+                   help="输出目录 | Output directory")
+    p.add_argument("--name", type=str, default="isaid_mc",
+                   help="实验名称 | Experiment name")
     p.add_argument("--device", type=str,
-                   default="cuda" if torch.cuda.is_available() else "cpu")
+                   default="cuda" if torch.cuda.is_available() else "cpu",
+                   help="运行设备 | Device to run on")
     p.add_argument("--tile-size", type=int, default=1024,
                    help="瓦片尺寸 (iSAID 图像太大需切分) | Tile size for large iSAID images")
     p.add_argument("--max-images", type=int, default=0,
                    help="限制加载图片数 (0=全部, 调试用) | Limit number of images (0=all)")
-    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--seed", type=int, default=42,
+                   help="随机种子 | Random seed")
     return p.parse_args()
 
 
@@ -271,15 +282,17 @@ def train_head(head: nn.Module, backbone: nn.Module,
                     desc=f"  [{head_name}] Epoch {epoch}/{args.epochs}",
                     leave=False)
         for idx in pbar:
+            # 逐样本加载 (few-shot 风格, 不 shuffle) | Per-sample loading (few-shot style, no shuffle)
             sample = train_ds[idx]
-            image = sample["image"].unsqueeze(0).to(device)
-            target = sample["mask"].unsqueeze(0).to(device)  # [1, H, W] semantic
+            image = sample["image"].unsqueeze(0).to(device)  # [1, 3, H, W]
+            target = sample["mask"].unsqueeze(0).to(device)   # [1, H, W] semantic
 
+            # 冻结 Backbone 提取特征 | Frozen backbone feature extraction
             with torch.no_grad():
                 features = backbone(image)
             p4 = features["p4"]
 
-            # 前向 | Forward
+            # 前向传播 | Forward pass
             if is_proto:
                 _, _, logit = head(p4, temperature=args.temperature)
             else:
@@ -289,8 +302,7 @@ def train_head(head: nn.Module, backbone: nn.Module,
             logit_up = F.interpolate(logit, size=target.shape[1:],
                                      mode="bilinear", align_corners=False)
 
-            # 多类别交叉熵 | Multi-class cross-entropy
-            # input: [B, C, H, W], target: [B, H, W]
+            # 多类别交叉熵 (ignore_index=255 排除无效像素) | Multi-class CE (ignore_index=255 for invalid pixels)
             loss = F.cross_entropy(logit_up, target, ignore_index=255)
 
             optimizer.zero_grad()
@@ -314,9 +326,10 @@ def train_head(head: nn.Module, backbone: nn.Module,
         with torch.no_grad():
             for idx in range(len(val_ds)):
                 sample = val_ds[idx]
-                image = sample["image"].unsqueeze(0).to(device)
+                image = sample["image"].unsqueeze(0).to(device)  # [1, 3, H, W]
                 target = sample["mask"].unsqueeze(0).to(device)  # [1, H, W] semantic
 
+                # 冻结 Backbone 提取特征 | Frozen backbone feature extraction
                 features = backbone(image)
                 p4 = features["p4"]
 
@@ -325,7 +338,7 @@ def train_head(head: nn.Module, backbone: nn.Module,
                 else:
                     _, logit = head(p4)
 
-                # 上采样 + 预测 | Upsample + predict
+                # 上采样 + 取 argmax 预测 | Upsample + argmax to predict
                 logit_up = F.interpolate(logit, size=target.shape[1:],
                                          mode="bilinear", align_corners=False)
                 pred = logit_up.argmax(dim=1)  # [1, H, W], 类别索引 | class indices
@@ -370,9 +383,17 @@ def train_head(head: nn.Module, backbone: nn.Module,
 # ═══════════════════════════════════════════════════════════════════
 
 def main():
+    """iSAID 多类别 Proto 实验主入口 | iSAID multi-class Proto experiment main entry.
+
+    三阶段流水线 | Three-stage pipeline:
+    [1] 加载冻结 FastSAM Backbone | Load frozen FastSAM backbone
+    [2] 加载 iSAID tile 数据集 (语义模式) | Load iSAID tile dataset (semantic mode)
+    [3] 训练 MultiClassProtoHead | Train MultiClassProtoHead
+    """
     args = parse_args()
     device = args.device
 
+    # 记录实验启动配置 | Log experiment start config
     logger.log_info("exp/start",
                     f"iSAID Multi-Class Proto Experiment | "
                     f"N_protos={args.n_protos}, D={args.embed_dim}, "
@@ -381,7 +402,7 @@ def main():
                     f"data_root={args.data_root}, lr={args.lr}, "
                     f"seed={args.seed}, device={device}")
 
-    # 固定随机种子 | Fix random seed (可复现性 | reproducibility)
+    # 固定随机种子 (可复现性) | Fix random seed (reproducibility)
     set_seed(args.seed)
 
     # ── 实验管理 | Experiment management ──
@@ -392,20 +413,24 @@ def main():
     recorder.record_config()
     output_path = Path(config.output_dir) / exp_id
     output_path.mkdir(parents=True, exist_ok=True)
-    logger.log_info("exp/output", f"Results: {output_path}")
+    logger.log_info("exp/output", f"Results: {output_path} | 结果目录: {output_path}")
 
     # ── [1] Backbone (冻结) | Frozen Backbone ──
-    logger.log_info("phase", "[1/3] Loading frozen FastSAM backbone")
+    # FastSAM backbone 保持 eval mode，只做特征提取，不参与梯度更新
+    # FastSAM backbone stays in eval mode, feature extraction only, no gradient updates
+    logger.log_info("phase", "[1/3] Loading frozen FastSAM backbone | 加载冻结 backbone")
     backbone = FastSAMBackbone(freeze_backbone=True)
     backbone.eval()
-    logger.log_info("model/backbone", "FastSAM backbone loaded (frozen, eval mode)")
+    logger.log_info("model/backbone", "FastSAM backbone loaded (frozen, eval mode) | backbone 已加载 (冻结, eval 模式)")
 
     # ── [2] 数据 | Data ──
-    logger.log_info("phase", "[2/3] Loading iSAID data (semantic mode)")
+    # 使用预切 tile 数据集 (semantic=True: mask 为语义标签而非实例)
+    # Uses pre-cut tile dataset (semantic=True: mask is semantic label, not instance)
+    logger.log_info("phase", "[2/3] Loading iSAID data (semantic mode) | 加载 iSAID 数据 (语义模式)")
     train_ds = FastISAIDTileDataset(root_dir=args.data_root, split="train", semantic=True)
     val_ds = FastISAIDTileDataset(root_dir=args.data_root, split="val", semantic=True)
 
-    # 限制 tile 数 (调试) | Limit tiles (debug)
+    # 限制 tile 数 (调试/快速验证) | Limit tiles (debug/quick validation)
     if args.max_images > 0:
         train_ds._tiles = train_ds._tiles[:args.max_images]
         val_ds._tiles = val_ds._tiles[:max(1, args.max_images // 4)]
@@ -418,9 +443,9 @@ def main():
                     (f" [LIMITED]" if args.max_images > 0 else ""))
 
     # ── [3] 训练 ProtoHead | Train ProtoHead ──
-    logger.log_info("phase", "[3/3] Training MultiClassProtoHead")
+    logger.log_info("phase", "[3/3] Training MultiClassProtoHead | 训练多类别 ProtoHead")
 
-    # 多类别 ProtoHead | Multi-class Proto Head (主要实验 | main experiment)
+    # 多类别 ProtoHead (主要实验变体) | Multi-class Proto Head (main experiment variant)
     proto_head = MultiClassProtoHead(
         in_channels=1280, embed_dim=args.embed_dim,
         n_protos=args.n_protos, num_classes=args.num_classes
@@ -437,10 +462,10 @@ def main():
                            phase="val", tags=["isaid", "mc", "summary"])
     logger.log_metric("best_miou", best_miou, tags=["isaid", "summary"])
 
-    # 保存模型 | Save model checkpoint
+    # 保存模型检查点 | Save model checkpoint
     ckpt_path = output_path / "multiclass_proto_head.pt"
     torch.save(proto_head.state_dict(), ckpt_path)
-    logger.log_info("model/saved", f"Checkpoint: {ckpt_path}")
+    logger.log_info("model/saved", f"Checkpoint: {ckpt_path} | 检查点: {ckpt_path}")
 
     recorder.finalize()
     recorder.close()

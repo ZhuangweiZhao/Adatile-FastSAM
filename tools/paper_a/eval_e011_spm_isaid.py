@@ -71,19 +71,38 @@ def parse_args():
 # ═══════════════════════════════════════════════════════════════════
 
 class ProtoHead(nn.Module):
+    """
+    多类别 ProtoHead (Stage 1) | Multi-Class Proto Head (Stage 1).
+
+    P4 → Conv(1280→D)→ReLU → CosineSim(N protos) → Conv(N→C)→logit.
+    训练完成后冻结, 供 Stage 2 的 SPM Router 使用。
+    After training, frozen and used by Stage 2 SPM Router.
+    """
+
     def __init__(self, in_channels=1280, embed_dim=128, n_protos=16, num_classes=15):
         super().__init__()
         self.embed_dim = embed_dim
         self.n_protos = n_protos
         self.num_classes = num_classes
+        # 特征投影 | Feature projection
         self.project = nn.Sequential(
             nn.Conv2d(in_channels, embed_dim, 1, bias=False),
             nn.ReLU(inplace=True),
         )
+        # 可学习原型向量 | Learnable prototype vectors [N, D]
         self.prototypes = nn.Parameter(torch.randn(n_protos, embed_dim) * 0.1)
+        # 多类别分割头 | Multi-class segmentation head: N → C
         self.head = nn.Conv2d(n_protos, num_classes, 1, bias=True)
 
     def forward(self, p4, temperature=0.1):
+        """
+        标准前向 | Standard forward pass.
+
+        Returns:
+            embedding: [B, D, H, W] 低维嵌入 | low-dim embedding
+            sim_maps:  [B, N, H, W] proto 相似度图 | proto similarity maps
+            logit:     [B, C, H, W] 多类别 logit | multi-class logit
+        """
         embedding = self.project(p4)
         emb_n = F.normalize(embedding, dim=1, p=2)
         proto_n = F.normalize(self.prototypes, dim=1, p=2)
@@ -92,6 +111,12 @@ class ProtoHead(nn.Module):
         return embedding, sim_maps, logit
 
     def get_hard_assignment(self, p4, temperature=0.01):
+        """
+        硬分配: 每个像素的 Winner Proto 索引 | Hard winner-take-all assignment.
+
+        Returns:
+            [B, H/16, W/16] int64, 值 ∈ [0, N-1]
+        """
         _, sim_maps, _ = self.forward(p4, temperature)
         return sim_maps.argmax(dim=1)
 
@@ -180,6 +205,17 @@ class SPMHead(nn.Module):
 
 @torch.no_grad()
 def compute_miou(pred, target, num_classes):
+    """
+    计算 mIoU | Compute mean IoU.
+
+    Args:
+        pred:        [B, H, W] or [B, C, H, W] 预测 | prediction
+        target:      [B, H, W] GT 类别标签 | GT class labels
+        num_classes: 类别数 | number of classes
+
+    Returns:
+        float: mIoU averaged over valid classes (union > 0).
+    """
     if pred.dim() == 4:
         pred = pred.argmax(dim=1)
     ious = [(target == c).float().sum() for c in range(num_classes)]
@@ -200,52 +236,68 @@ def compute_miou(pred, target, num_classes):
 def analyze_proto_utilization(model, backbone, val_ds, device, num_classes, n_protos,
                               is_spm: bool, router_k: int = 4):
     """
-    分析 Proto 类别亲和力 (SPM 前后对比) | Per-proto class affinity analysis.
+    分析 Proto 类别亲和力 (SPM 前后对比) | Per-proto class affinity (before/after SPM).
+
+    两种模式 | Two modes:
+      - is_spm=False: Proto only — winner-take-all (每个像素选最相似的 Proto)
+      - is_spm=True:  SPM — Top-K Router 选择 (每个像素可激活多个 Proto)
+
+    Returns:
+        pct:         [N, C] 归一化类别占比 | normalized class proportions
+        proto_class: [N, C] 原始计数 | raw counts
+        n_active:    活跃 Proto 数 (总像素 > 100) | active protos
+        n_bg:        背景主导 Proto 数 (>50% 为 class 0) | BG-dominant protos
     """
     model.eval()
     proto_class = np.zeros((n_protos, num_classes))
 
+    # 采样最多 20 张验证图 | Sample at most 20 val images
     for idx in range(min(20, len(val_ds))):
         sample = val_ds[idx]
         image = sample["image"].unsqueeze(0).to(device)
-        target = sample["mask"].to(device)
+        target = sample["mask"].to(device)  # [H, W] class labels
 
         features = backbone(image)
         p4 = features["p4"]
 
         if is_spm:
-            # SPM: 使用 router 选择的 Top-K proto
+            # SPM 模式: Router 选择 Top-K Proto (每个像素可激活多个 Proto)
+            # SPM mode: Router selects Top-K protos (multi-proto per pixel)
             _, sim, emb, rl = model.forward_routed(p4, k=router_k)
-            # 硬分配: router 选中哪些 proto per pixel
+            # 构建激活矩阵: 哪些 Proto 在每个像素被选中
+            # Build activation matrix: which protos are selected per pixel
             r_flat = rl.permute(0, 2, 3, 1).reshape(-1, n_protos)
             _, topk_idx = r_flat.topk(router_k, dim=1)
             H_emb, W_emb = rl.shape[2], rl.shape[3]
             proto_active = torch.zeros(n_protos, H_emb * W_emb, device=device)
             for k_i in range(router_k):
-                active_p = topk_idx[:, k_i]  # [H_emb*W_emb]
+                active_p = topk_idx[:, k_i]  # [H_emb*W_emb] — proto indices per pixel
                 proto_active[active_p, torch.arange(H_emb * W_emb, device=device)] = 1.0
         else:
-            # Proto only: winner-take-all
+            # Proto only 模式: Winner-Take-All (每个像素只选一个 Proto)
+            # Proto only mode: Winner-take-all (each pixel picks exactly one proto)
             hard = model.get_hard_assignment(p4)
             H_emb, W_emb = hard.shape[1], hard.shape[2]
             proto_active = F.one_hot(hard.squeeze(0).flatten(), num_classes=n_protos).float().T
 
-        # 下采样 target | Downsample target
+        # 下采样 target 到 Proto 分配分辨率 | Downsample target to proto assignment resolution
         tgt_down = F.interpolate(
             target.unsqueeze(0).unsqueeze(0).float(),
             size=(H_emb, W_emb), mode="nearest"
         ).squeeze().long().flatten()
 
+        # 累积每个 Proto 的类别计数 | Accumulate per-proto class counts
         for p in range(n_protos):
-            mask_p = proto_active[p] > 0.5
-            if mask_p.sum() > 50:
+            mask_p = proto_active[p] > 0.5  # 该 Proto 激活的像素 | pixels where proto p is active
+            if mask_p.sum() > 50:  # 至少 50 像素才统计 | require at least 50 pixels
                 for c in range(num_classes):
                     proto_class[p, c] += (tgt_down[mask_p] == c).sum().item()
 
+    # 归一化 | Normalize
     pct = proto_class / (proto_class.sum(axis=1, keepdims=True) + 1e-8)
-    # 活跃 Proto 数 | Number of active protos
+    # 活跃 Proto 数 (总像素 >100, 有统计意义 | statistically meaningful)
     n_active = (proto_class.sum(axis=1) > 100).sum()
-    # 背景主导 Proto 数 | Number of background-dominant protos
+    # 背景主导 Proto 数 (>50% 像素为 class 0 | >50% pixels are background)
     n_bg = (pct[:, 0] > 0.5).sum()
     return pct, proto_class, n_active, n_bg
 
@@ -255,7 +307,15 @@ def analyze_proto_utilization(model, backbone, val_ds, device, num_classes, n_pr
 # ═══════════════════════════════════════════════════════════════════
 
 def train_stage1(proto_head, backbone, train_ds, val_ds, args, device, recorder):
-    """Stage 1: Train ProtoHead normally."""
+    """
+    Stage 1: 标准 ProtoHead 训练 | Stage 1: Train ProtoHead normally.
+
+    使用所有 N 个 Proto 进行训练。收敛后 Proto Dictionary 将被冻结。
+    Trained with all N protos active. Proto Dictionary frozen after convergence.
+
+    Returns:
+        best_miou: Best validation mIoU.
+    """
     proto_head.train()
     opt = torch.optim.Adam(proto_head.parameters(), lr=args.lr)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs_s1, eta_min=1e-6)
@@ -302,7 +362,20 @@ def train_stage1(proto_head, backbone, train_ds, val_ds, args, device, recorder)
 
 
 def train_stage2(spm_head, backbone, train_ds, val_ds, args, device, recorder):
-    """Stage 2: Train Router only (frozen Proto)."""
+    """
+    Stage 2: 只训练 Router (冻结 Proto) | Stage 2: Train Router only (frozen Proto).
+
+    Router 学习类别感知路由, 减少背景 Proto 坍缩。
+    Router learns category-aware routing to reduce background proto collapse.
+
+    Key: BCE + 熵正则化 — BCE 驱动 Router 选择有助分割的 Proto;
+         熵项防止 Router 坍缩到单一 Proto。
+         BCE + entropy regularization — BCE drives useful proto selection;
+         entropy term prevents collapse to a single proto.
+
+    Returns:
+        best_miou: Best validation mIoU with SPM routing.
+    """
     spm_head.train()
     opt = torch.optim.Adam(spm_head.router.parameters(), lr=args.lr_router)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs_s2,
@@ -320,12 +393,15 @@ def train_stage2(spm_head, backbone, train_ds, val_ds, args, device, recorder):
             with torch.no_grad():
                 feats = backbone(img)
 
+            # 路由前向 | Routed forward
             logit, _, _, rl = spm_head.forward_routed(feats["p4"], k=k, temperature=args.temperature)
             logit_up = F.interpolate(logit, size=tgt.shape[1:], mode="bilinear", align_corners=False)
             bce = F.cross_entropy(logit_up, tgt, ignore_index=255)
+            # 熵正则化: 防止 Router 坍缩到单一 Proto
+            # Entropy regularization: prevent router collapse to a single proto
             if rl is not None:
-                probs = F.softmax(rl, dim=1)
-                ent = -(probs * torch.log(probs + 1e-8)).sum(dim=1).mean()
+                probs = F.softmax(rl, dim=1)  # [B, N, H, W] → softmax over N
+                ent = -(probs * torch.log(probs + 1e-8)).sum(dim=1).mean()  # mean entropy per pixel
                 loss = bce + args.entropy_weight * ent
                 total_ent += ent.item()
             else:
@@ -444,15 +520,17 @@ def main():
     print(f"  {'BG-Dominant Protos':<30} {n_bg_before:>14}/{args.n_protos} "
           f"{n_bg_after:>14}/{args.n_protos} (Δ={delta_bg:+d})")
 
-    # Per-proto before/after
+    # 逐 Proto 前后对比 | Per-proto before/after comparison
+    # 显示每个 Proto 在 SPM 前后的主要类别变化
+    # Show each proto's dominant class change before vs after SPM
     for p in range(args.n_protos):
-        top_b = pct_before[p].argsort()[-2:][::-1]
-        top_a = pct_after[p].argsort()[-2:][::-1]
+        top_b = pct_before[p].argsort()[-2:][::-1]  # 前 2 类别 (Before)
+        top_a = pct_after[p].argsort()[-2:][::-1]   # 前 2 类别 (After)
         b_str = "/".join(f"c{t}({pct_before[p,t]:.0%})" for t in top_b if pct_before[p,t] > 0.05)
         a_str = "/".join(f"c{t}({pct_after[p,t]:.0%})" for t in top_a if pct_after[p,t] > 0.05)
         bg_before = "BG" if pct_before[p, 0] > 0.5 else "  "
         bg_after = "BG" if pct_after[p, 0] > 0.5 else "  "
-        arrow = "→" if bg_before != bg_after else " "
+        arrow = "→" if bg_before != bg_after else " "  # 显示状态转移 | show state transition
         if b_str or a_str:
             print(f"    P{p:2d}: [{bg_before}] {b_str:<20s} {arrow} [{bg_after}] {a_str}")
 
