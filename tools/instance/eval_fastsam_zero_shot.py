@@ -168,6 +168,56 @@ def compute_ap(preds, gts, iou_thresh):
     return ap, per_cls_ap
 
 
+
+def compute_recall(preds, gts, iou_thresh):
+    """
+    Compute class-agnostic recall: what fraction of GTs are matched by any pred?
+    For each GT: is there at least one pred mask with IoU >= threshold?
+    This is the RECALL CEILING for any downstream classifier.
+
+    Returns:
+        recall: float (matched_gt / total_gt)
+        per_cls_recall: {cat_id: float} per-class recall
+        matched_gt_mask: set of matched GT indices
+    """
+    if not preds or not gts:
+        return 0.0, {}, set()
+
+    # Lazy GT mask renderer (avoids OOM on 200+ instance images)
+    _gt_mask_cache = {}
+
+    def _get_gt_mask(gi):
+        if gi not in _gt_mask_cache:
+            gt = gts[gi]
+            _gt_mask_cache[gi] = render_gt_mask(gt["ann"], gt["H"], gt["W"])
+        return _gt_mask_cache[gi]
+
+    # For each GT, find best IoU with any pred
+    matched_gt = set()
+    for gi in range(len(gts)):
+        best_iou = 0.0
+        gt_mask = _get_gt_mask(gi)
+        for pred in preds:
+            iou = compute_iou(pred["mask"], gt_mask)
+            if iou > best_iou:
+                best_iou = iou
+        if best_iou >= iou_thresh:
+            matched_gt.add(gi)
+
+    overall_recall = len(matched_gt) / max(len(gts), 1)
+
+    # Per-class recall
+    per_cls_recall = {}
+    n_cls_map = {}
+    for g in gts:
+        n_cls_map[g["cat_id"]] = n_cls_map.get(g["cat_id"], 0) + 1
+    for cat, n_gt_cls in n_cls_map.items():
+        matched_cls = sum(1 for gi in matched_gt if gts[gi]["cat_id"] == cat)
+        per_cls_recall[cat] = matched_cls / max(n_gt_cls, 1)
+
+    return overall_recall, per_cls_recall, matched_gt
+
+
 def resize_masks_to_original(masks_tensor, H_orig, W_orig, chunk_size=10):
     """
     Resize FastSAM masks from processing resolution to original image resolution.
@@ -225,8 +275,11 @@ def main():
 
     # Evaluation
     all_ap50, all_ap75 = [], []
+    all_recall50, all_recall75 = [], []
     per_class_ap50 = {}  # cat_id -> [ap values]
     per_class_ap75 = {}
+    per_class_rec50 = {}  # cat_id -> [recall values]
+    per_class_rec75 = {}
     per_class_gt_count = {}  # cat_id -> n_gt
     sample_images = []
 
@@ -291,21 +344,30 @@ def main():
         preds = [{"mask": m, "score": float(s)}
                  for m, s in zip(mask_list, scores)]
 
-        # Compute AP
+        # Compute AP and Recall
         ap50, per_cls_ap50_i = compute_ap(preds, gts, 0.50)
         ap75, per_cls_ap75_i = compute_ap(preds, gts, 0.75)
+        rec50, per_cls_rec50_i, _ = compute_recall(preds, gts, 0.50)
+        rec75, per_cls_rec75_i, _ = compute_recall(preds, gts, 0.75)
 
         all_ap50.append(ap50)
         all_ap75.append(ap75)
+        all_recall50.append(rec50)
+        all_recall75.append(rec75)
 
         for cat_id, ap_val in per_cls_ap50_i.items():
             per_class_ap50.setdefault(cat_id, []).append(ap_val)
         for cat_id, ap_val in per_cls_ap75_i.items():
             per_class_ap75.setdefault(cat_id, []).append(ap_val)
+        for cat_id, rec_val in per_cls_rec50_i.items():
+            per_class_rec50.setdefault(cat_id, []).append(rec_val)
+        for cat_id, rec_val in per_cls_rec75_i.items():
+            per_class_rec75.setdefault(cat_id, []).append(rec_val)
 
         logger.log_info("c01/per_img",
                        f"  {img_info.get('file_name','?')}: "
-                       f"{len(preds)} preds {len(gts)} GT -> AP50={ap50:.4f} AP75={ap75:.4f}")
+                       f"{len(preds)} preds {len(gts)} GT -> "
+                       f"R@50={rec50:.3f} R@75={rec75:.3f} AP50={ap50:.4f}")
 
         # Collect first 5 images for visualization
         if len(sample_images) < 5:
@@ -316,25 +378,39 @@ def main():
                 "H": H_orig, "W": W_orig,
             })
 
-    # Summary
-    logger.log_info("c01/summary", f"\n{'='*70}")
-    logger.log_info("c01/summary", f"  FastSAM Zero-Shot on iSAID ({split})")
+    # Summary -- RECALL as primary metric (few-shot ceiling analysis)
+    logger.log_info("c01/summary", "\n" + "=" * 70)
+    logger.log_info("c01/summary", f"  FastSAM Zero-Shot Proposal Quality -- iSAID ({split})")
     logger.log_info("c01/summary", f"  Images: {len(images)} | GT instances: {n_gt_total}")
     logger.log_info("c01/summary", f"  conf={args.conf} iou_thresh={args.iou_thresh} imgsz={args.imgsz}")
-    logger.log_info("c01/summary", f"{'='*70}")
+    logger.log_info("c01/summary", "=" * 70)
     logger.log_info("c01/summary",
-                   f"  mAP@50 = {np.mean(all_ap50)*100:.2f}% (+-{np.std(all_ap50)*100:.2f}%) [{len(all_ap50)} imgs]")
+                   f"  mRecall@50 = {np.mean(all_recall50)*100:.1f}% (+-{np.std(all_recall50)*100:.1f}%) "
+                   f"[Recall Ceiling: max possible mAP@50]")
     logger.log_info("c01/summary",
-                   f"  mAP@75 = {np.mean(all_ap75)*100:.2f}% (+-{np.std(all_ap75)*100:.2f}%) [{len(all_ap75)} imgs]")
+                   f"  mRecall@75 = {np.mean(all_recall75)*100:.1f}% (+-{np.std(all_recall75)*100:.1f}%)")
+    if all_ap50:
+        logger.log_info("c01/summary",
+                       f"  mAP@50 = {np.mean(all_ap50)*100:.1f}% (AP/Recall gap: {np.mean(all_ap50)/max(np.mean(all_recall50),1e-8):.1f}x)")
+    if all_ap75:
+        logger.log_info("c01/summary",
+                       f"  mAP@75 = {np.mean(all_ap75)*100:.1f}%")
 
-    # Per-class
-    logger.log_info("c01/per_class", "\n  Per-class AP@50:")
-    for cat_id in sorted(per_class_ap50.keys()):
-        vals = per_class_ap50[cat_id]
+    # Per-class Recall (primary) -- directly answers Section 4.1
+    logger.log_info("c01/per_class", "\n  Per-class Recall@50 (Recall Ceiling = max possible AP@50):")
+    logger.log_info("c01/per_class",
+                   f'    {"Class":<20s} {"#GT":>5} {"Rec@50":>7} {"Ceiling":>7} {"AP@50":>7} {"Rec@75":>7}')
+    logger.log_info("c01/per_class", "    " + "-"*60)
+    for cat_id in sorted(per_class_rec50.keys()):
+        rec50_cls = np.mean(per_class_rec50[cat_id])
+        rec75_cls = np.mean(per_class_rec75.get(cat_id, [0])) if cat_id in per_class_rec75 else 0.0
+        ap50_cls = np.mean(per_class_ap50[cat_id]) if cat_id in per_class_ap50 else 0.0
         name = ISAID_NAMES.get(cat_id, f"cls_{cat_id}")
         n_gt_cls = per_class_gt_count.get(cat_id, 0)
         logger.log_info("c01/per_class",
-                       f"    {name:<20s} AP50={np.mean(vals)*100:.1f}% (n_gt={n_gt_cls})")
+                       f"    {name:<20s} {n_gt_cls:>5} {rec50_cls*100:>6.1f}% "
+                       f"{rec50_cls*100:>6.1f}% {ap50_cls*100:>6.1f}% {rec75_cls*100:>6.1f}%")
+
 
     # Visualization
     if sample_images:
@@ -401,10 +477,20 @@ def main():
         "n_images": len(images),
         "n_gt_total": n_gt_total,
         "config": {"conf": args.conf, "iou_thresh": args.iou_thresh, "imgsz": args.imgsz},
+        # Primary: Recall (proposal quality, upper bound for any downstream method)
+        "mRecall50": float(np.mean(all_recall50)) if all_recall50 else 0.0,
+        "mRecall50_std": float(np.std(all_recall50)) if all_recall50 else 0.0,
+        "mRecall75": float(np.mean(all_recall75)) if all_recall75 else 0.0,
+        # Secondary: AP (current ceiling gap analysis)
         "mAP50": float(np.mean(all_ap50)) if all_ap50 else 0.0,
-        "mAP75": float(np.mean(all_ap75)) if all_ap75 else 0.0,
         "mAP50_std": float(np.std(all_ap50)) if all_ap50 else 0.0,
+        "mAP75": float(np.mean(all_ap75)) if all_ap75 else 0.0,
+        "mAP75_std": float(np.std(all_ap75)) if all_ap75 else 0.0,
+        # Per-class (recall + AP)
+        "per_class_Recall50": {str(k): float(np.mean(v)) for k, v in per_class_rec50.items()},
+        "per_class_Recall75": {str(k): float(np.mean(v)) for k, v in per_class_rec75.items()},
         "per_class_AP50": {str(k): float(np.mean(v)) for k, v in per_class_ap50.items()},
+        "per_class_gt_count": {str(k): v for k, v in per_class_gt_count.items()},
     }
     with open(output_dir / "fastsam_zero_shot.json", "w") as f:
         json.dump(summary, f, indent=2)
