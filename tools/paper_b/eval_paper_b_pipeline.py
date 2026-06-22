@@ -74,6 +74,7 @@ from adatile.decoder.light_decoder import LightDecoder
 DATASET_CONFIGS = {
     "isaid":     {"num_classes": 16},
     "vaihingen": {"num_classes": 7},
+    "loveda":    {"num_classes": 7},
 }
 
 TILE_SIZE = 1024
@@ -93,7 +94,9 @@ def load_tile_dataset(tile_root, dataset_name, split="train"):
     ds_map = {
         "isaid": FastISAIDTileDataset,
         "vaihingen": VaihingenTileDataset,
+        "loveda": LoveDATileDataset,
     }
+    from adatile.datasets.loveda_tiles import LoveDATileDataset
     DSClass = ds_map.get(dataset_name)
     if DSClass is None:
         raise ValueError(f"Unknown dataset: {dataset_name}")
@@ -146,24 +149,25 @@ def train_decoder(args, device, log):
     log("decoder", f"Training LightDecoder ({args.epochs} epochs, {num_classes-1} classes)")
 
     # Auto-detect val split | 自动检测验证集划分
-    val_split = "val" if (Path(args.tile_root) / "val").exists() else "test"
+    val_split = "val" if ((Path(args.tile_root) / "val").exists() or (Path(args.tile_root) / "images" / "val").exists()) else "test"
     train_ds = load_tile_dataset(args.tile_root, args.dataset, "train")
     val_ds = load_tile_dataset(args.tile_root, args.dataset, val_split)
 
     log("decoder", f"Train tiles: {len(train_ds)}, Val({val_split}) tiles: {len(val_ds)}")
 
-    # Detect mask extension | 检测mask文件扩展名
-    mask_ext = ".png"
+    # Detect stem format | 检测命名格式
+    # iSAID: _tiles = ["P0000_t000.png"] (含扩展名)
+    # Vaihingen: _tiles = ["top_mosaic_..."] (不含扩展名)
+    mask_ext = ""
     if train_ds._tiles:
-        first_name = train_ds._tiles[0]
-        if (train_ds._mask_dir / f"{first_name}.png").exists():
-            mask_ext = ".png"
-        elif (train_ds._mask_dir / f"{first_name}.tif").exists():
-            mask_ext = ".tif"
+        first = train_ds._tiles[0]
+        if not first.endswith(".png") and not first.endswith(".tif"):
+            if (train_ds._mask_dir / f"{first}.png").exists():
+                mask_ext = ".png"
+            elif (train_ds._mask_dir / f"{first}.tif").exists():
+                mask_ext = ".tif"
 
     # Filter FG>5% tiles for training | FG>5% 过滤
-    # iSAID: filters ~60pct empty tiles. Vaihingen: keeps almost all tiles (dense).
-    # iSAID: 过滤约60pct空tile. Vaihingen: 保留几乎所有tile(密集标注).
     fg5_tiles = []
     for fname in tqdm(train_ds._tiles, desc="  Filter FG>5%", leave=False):
         mask_path = train_ds._mask_dir / f"{fname}{mask_ext}"

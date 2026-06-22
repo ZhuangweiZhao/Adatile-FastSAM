@@ -99,6 +99,9 @@ class FastISAIDTileDataset(Dataset):
             new_idx = (index + 1) % len(self._tiles)
             return self.__getitem__(new_idx)
 
+        # 图像: numpy → tensor CHW float32 | Image: numpy → tensor CHW float32
+        img_t = torch.from_numpy(img_np).permute(2, 0, 1).float()
+
         if self.semantic:
             # 类别 ID 0-15 → int64 标签 | Category IDs 0-15 → int64 labels
             mask_t = torch.from_numpy(mask_np.astype(np.int64))  # [H, W] long

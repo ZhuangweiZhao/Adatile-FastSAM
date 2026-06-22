@@ -21,3 +21,4 @@ __all__ = [
 ]
 
 from adatile.datasets.vaihingen_tiles import VaihingenTileDataset
+from adatile.datasets.loveda_tiles import LoveDATileDataset
