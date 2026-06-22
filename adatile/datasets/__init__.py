@@ -19,3 +19,5 @@ __all__ = [
     "MassachusettsBuildingsDataset",
     "ISAID_CATEGORIES",
 ]
+
+from adatile.datasets.vaihingen_tiles import VaihingenTileDataset
