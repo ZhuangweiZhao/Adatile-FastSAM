@@ -9,7 +9,7 @@ P4 features → gradual upsampling + multi-layer Conv → segmentation mask.
     Binary (num_classes=1):  1280→64→64→32→32→1, ~716K params
     Multi-class (num_classes>1): 1280→256→128→64→32→C, ~716K params
 
-用法 | Usage:
+用法 | Usage::
     # Binary segmentation (Paper A, MassBuildings)
     decoder = LightDecoder(in_channels=1280, num_classes=1)
 
@@ -104,15 +104,14 @@ class LightDecoder(nn.Module):
         """
         前向传播 | Forward pass.
 
-        Args:
-            features:    {"p4": [B, 1280, H/16, W/16]}
-            target_size: (H, W) 目标尺寸。None → 返回 stride-2 (binary) 或 stride-4 (multi) 的 logit。
-                        Target size. None → return logits at output stride.
+        :param features: {"p4": [B, 1280, H/16, W/16]}
+        :type features: dict[str, torch.Tensor]
 
-        Returns:
-            logit [B, C, *, *] — raw logits (before sigmoid/softmax).
-            Binary mode: C=1, for BCEWithLogitsLoss.
-            Multi-class mode: C=num_classes, for CrossEntropyLoss.
+        :param target_size: (H, W) 目标尺寸。None → 返回 stride-2 (binary) 或 stride-4 (multi) 的 logit。 Target size. None → return logits at output stride.
+        :type target_size: tuple[int, int] | None
+
+        :return: logit [B, C, *, *] — raw logits (before sigmoid/softmax). Binary mode: C=1, for BCEWithLogitsLoss. Multi-class mode: C=num_classes, for CrossEntropyLoss.
+        :rtype: torch.Tensor
         """
         x = features["p4"]  # [B, in_channels, H/16, W/16]
 
@@ -146,13 +145,14 @@ class LightDecoder(nn.Module):
         """
         预测分割掩码 | Predict segmentation mask.
 
-        Args:
-            features:    backbone 输出 | Backbone output.
-            target_size: (H, W) 目标尺寸 | Target size.
+        :param features: backbone 输出 | Backbone output.
+        :type features: dict[str, torch.Tensor]
 
-        Returns:
-            Binary mode: [B, 1, H, W] float mask.
-            Multi-class mode: [B, H, W] int64 class indices.
+        :param target_size: (H, W) 目标尺寸 | Target size.
+        :type target_size: tuple[int, int]
+
+        :return: Binary mode: [B, 1, H, W] float mask. Multi-class mode: [B, H, W] int64 class indices.
+        :rtype: torch.Tensor
         """
         logit = self.forward(features, target_size=target_size)
         if self._is_binary:

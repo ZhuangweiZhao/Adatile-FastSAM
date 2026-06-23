@@ -1,4 +1,4 @@
-﻿'''
+"""
 NWPU-VHR-10 数据集 | NWPU-VHR-10 Dataset Adapter
 ================================================
 
@@ -11,7 +11,7 @@ Classes: airplane(1), ship(2), storage tank(3), baseball diamond(4),
 
 Key design: bboxes used as weak masks for few-shot instance segmentation.
 Images padded to multiples of 32 for FastSAM compatibility.
-'''
+"""
 
 from __future__ import annotations
 import os, re, json
@@ -36,13 +36,13 @@ CLASS_NAMES = {
 }
 
 class NWPUDataset(Dataset):
-    '''
+    """
     Returns per-image: {image, masks, labels, bboxes, image_id, orig_size}
     Where masks = bbox-based binary masks [N, H_pad, W_pad] for each instance.
 
     With bbox-only annotations, each instance uses its bbox rectangle as mask.
     FastSAM pretrained mask quality can optionally refine these masks (TODO).
-    '''
+    """
 
     def __init__(
         self,
@@ -72,7 +72,7 @@ class NWPUDataset(Dataset):
             f'NWPU {split}: {len(self)} images, {sum(len(s["bboxes"]) for s in self._samples)} instances')
 
     def _parse_annotations(self) -> list[dict]:
-        '''Parse all ground truth TXT files into sample dicts.'''
+        """Parse all ground truth TXT files into sample dicts."""
         samples = []
         for txt_file in sorted(self._gt_dir.glob('*.txt')):
             stem = txt_file.stem  # e.g., '001'
@@ -102,7 +102,7 @@ class NWPUDataset(Dataset):
         return samples
 
     def _load_split(self) -> set:
-        '''Load train split. Default: first 70% of images per class (stratified).'''
+        """Load train split. Default: first 70% of images per class (stratified)."""
         # Class-stratified split
         class_to_stems = defaultdict(list)
         for s in self._samples:
@@ -161,7 +161,7 @@ class NWPUDataset(Dataset):
         }
 
     def class_to_images(self, class_id: int) -> list[int]:
-        '''Return indices of images containing a specific class.'''
+        """Return indices of images containing a specific class."""
         return [i for i, s in enumerate(self._samples)
                 if class_id in s['labels']]
 

@@ -1,4 +1,4 @@
-﻿"""Vaihingen Pre-cut Tile Dataset.
+"""Vaihingen Pre-cut Tile Dataset.
 
 Reads pre-cut 1024x1024 tiles from ISPRS Vaihingen.
 Images: TIFF RGB uint8. Masks: PNG class IDs.

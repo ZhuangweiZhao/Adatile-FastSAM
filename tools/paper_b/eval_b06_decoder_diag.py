@@ -22,7 +22,7 @@ B-05 Oracle 实验发现: K=10% 贡献型 tile 几乎等于 K=100% 全量。
         ├── best_01.png ... best_10.png
         └── worst_01.png ... worst_10.png
 
-用法 | Usage:
+用法 | Usage::
     python tools/paper_b/eval_b06_decoder_diag.py \
         --src-root /root/autodl-tmp/iSAID_processed \
         --decoder-ckpt runs/b04_v3/decoder_best.pt \

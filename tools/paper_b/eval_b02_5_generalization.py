@@ -28,7 +28,7 @@ B-02.5 回答：这个能力是类别特定的还是类别无关的？
     - Test: Cityscapes (街景) — 完全不同的域、类别、分辨率
     - 如果 Spearman r 仍然 >0.6 → 跨域可迁移
 
-用法 | Usage:
+用法 | Usage::
     # Experiment B (类别迁移)
     python tools/eval_b02_5_generalization.py --exp B --holdout-classes 5 --epochs 20
 

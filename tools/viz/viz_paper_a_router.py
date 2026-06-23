@@ -28,7 +28,7 @@ E009-C: Router Visualization — What routing strategy did the Router learn?
     两者互补，形成完整的可解释性论证。
     The two are complementary, forming a complete interpretability argument.
 
-用法 | Usage:
+用法 | Usage::
     python tools/viz_e009_router.py --checkpoint runs/.../spm_head_s2.pt
 
 输出文件 | Output files:
@@ -128,11 +128,11 @@ def compute_edge(mask: np.ndarray) -> np.ndarray:
         For binary masks, any boundary pixel has gradient >= 1.0 (8-connectivity),
         so 0.1 is sufficient to detect all edges.
 
-    Args:
-        mask: 二值分割掩码 [H, W] | Binary segmentation mask [H, W]
+    :param mask: 二值分割掩码 [H, W] | Binary segmentation mask [H, W]
+    :type mask: np.ndarray
 
-    Returns:
-        二值边缘图 [H, W] dtype=uint8 | Binary edge map [H, W] dtype=uint8
+    :return: 二值边缘图 [H, W] dtype=uint8 | Binary edge map [H, W] dtype=uint8
+    :rtype: np.ndarray
     """
     # 水平方向梯度 | Gradient along vertical axis (changes along rows)
     gy = sobel(mask.astype(float), axis=0)
@@ -171,13 +171,11 @@ def region_mask(gt: np.ndarray) -> dict:
         If Router selects different Proto combinations for different regions,
         it demonstrates spatial awareness (not just per-pixel pattern matching).
 
-    Args:
-        gt: 二值 GT 掩码 [H, W] | Binary ground-truth mask [H, W]
+    :param gt: 二值 GT 掩码 [H, W] | Binary ground-truth mask [H, W]
+    :type gt: np.ndarray
 
-    Returns:
-        (regions_dict, edge_map): tuple of
-            - regions_dict: 三个布尔掩码的字典 | Dict of three boolean masks
-            - edge_map:     二值边缘图 [H, W] | Binary edge map [H, W]
+    :return: (regions_dict, edge_map): tuple of - regions_dict: 三个布尔掩码的字典 | Dict of three boolean masks - edge_map:     二值边缘图 [H, W] | Binary edge map [H, W]
+    :rtype: dict
     """
     # 计算 GT 的边缘图 | Compute edge map from GT mask
     edge_map = compute_edge(gt)
@@ -206,18 +204,19 @@ def analyze_routing(spm_head, backbone, dataset, device, args, output_dir):
         5. 统计每个区域对不同 Proto 的偏好 | Count per-region Proto selection frequencies
         6. 生成 12 面板可视化 + 跨图像汇总图 | Generate 12-panel visualization + cross-image summary
 
-    Args:
-        spm_head:    SPMHead 模块（含 ProtoHead + Router） | SPMHead module (ProtoHead + Router)
-        backbone:    FastSAM 特征提取骨干 | FastSAM feature extraction backbone
-        dataset:     Massachusetts Buildings 数据集 | Massachusetts Buildings dataset
-        device:      计算设备 | Compute device
-        args:        命令行参数 | Command-line arguments
-        output_dir:  输出目录 | Output directory for saving figures
+    :param spm_head: SPMHead 模块（含 ProtoHead + Router） | SPMHead module (ProtoHead + Router)
 
-    Returns:
-        (per_region, region_pixel_counts): tuple of
-            - per_region:           每个区域的 Proto 选择次数 | Per-region Proto selection counts
-            - region_pixel_counts:  每个区域的总像素数 | Per-region total pixel counts
+    :param backbone: FastSAM 特征提取骨干 | FastSAM feature extraction backbone
+
+    :param dataset: Massachusetts Buildings 数据集 | Massachusetts Buildings dataset
+
+    :param device: 计算设备 | Compute device
+
+    :param args: 命令行参数 | Command-line arguments
+
+    :param output_dir: 输出目录 | Output directory for saving figures
+
+    :return: (per_region, region_pixel_counts): tuple of - per_region:           每个区域的 Proto 选择次数 | Per-region Proto selection counts - region_pixel_counts:  每个区域的总像素数 | Per-region total pixel counts
     """
     # 设置为评估模式 | Set to evaluation mode
     spm_head.eval()

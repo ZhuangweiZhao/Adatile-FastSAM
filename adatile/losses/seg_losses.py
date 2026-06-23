@@ -5,7 +5,7 @@
 Focal Loss + Dice Loss + 组合损失。
 Extracted from train_b04.py inline definitions (2026-06-21).
 
-用法 | Usage:
+用法 | Usage::
     >>> loss_fn = CombinedLoss(num_classes=16, gamma=5.0, ignore_index=255)
     >>> loss = loss_fn(logits, targets)  # logits: [B,C,H,W], targets: [B,H,W]
 """
@@ -24,10 +24,14 @@ class FocalLoss(nn.Module):
     FL(pt) = (1 - pt)^γ * CE(pt)
     对低置信度样本（难例）施加更大权重，缓解类别不平衡。
 
-    Args:
-        gamma: 聚焦参数 | focusing parameter (default 5.0 for extreme imbalance)
-        ignore_index: 忽略标签值 | label value to ignore (default 255)
-        reduction: "mean" | "sum" | "none"
+    :param gamma: 聚焦参数 | focusing parameter (default 5.0 for extreme imbalance)
+    :type gamma: float
+
+    :param ignore_index: 忽略标签值 | label value to ignore (default 255)
+    :type ignore_index: int
+
+    :param reduction: "mean" | "sum" | "none"
+    :type reduction: str
     """
 
     def __init__(self, gamma: float = 5.0, ignore_index: int = 255,
@@ -40,12 +44,14 @@ class FocalLoss(nn.Module):
     def forward(self, logits: torch.Tensor,
                 targets: torch.Tensor) -> torch.Tensor:
         """
-        Args:
-            logits: [B, C, H, W] raw logits (before softmax)
-            targets: [B, H, W] int64 class indices
+        :param logits: [B, C, H, W] raw logits (before softmax)
+        :type logits: torch.Tensor
 
-        Returns:
-            scalar loss if reduction="mean", else per-pixel loss
+        :param targets: [B, H, W] int64 class indices
+        :type targets: torch.Tensor
+
+        :return: scalar loss if reduction="mean", else per-pixel loss
+        :rtype: torch.Tensor
         """
         ce = F.cross_entropy(logits, targets, ignore_index=self.ignore_index,
                              reduction="none")
@@ -68,9 +74,11 @@ class DiceLoss(nn.Module):
 
     忽略 BG (c=0) 和 GT 中不存在的类别。
 
-    Args:
-        num_classes: 总类别数 (含 BG) | total classes including background
-        smooth: 数值稳定项 | numerical stability term
+    :param num_classes: 总类别数 (含 BG) | total classes including background
+    :type num_classes: int
+
+    :param smooth: 数值稳定项 | numerical stability term
+    :type smooth: float
     """
 
     def __init__(self, num_classes: int = 16, smooth: float = 1e-8):
@@ -81,12 +89,14 @@ class DiceLoss(nn.Module):
     def forward(self, logits: torch.Tensor,
                 targets: torch.Tensor) -> torch.Tensor:
         """
-        Args:
-            logits: [B, C, H, W] raw logits
-            targets: [B, H, W] int64 class indices
+        :param logits: [B, C, H, W] raw logits
+        :type logits: torch.Tensor
 
-        Returns:
-            scalar: 1 - mean(Dice over valid foreground classes)
+        :param targets: [B, H, W] int64 class indices
+        :type targets: torch.Tensor
+
+        :return: scalar: 1 - mean(Dice over valid foreground classes)
+        :rtype: torch.Tensor
         """
         probs = F.softmax(logits, dim=1)
 
@@ -122,12 +132,14 @@ class CombinedLoss(nn.Module):
     def forward(self, logits: torch.Tensor,
                 targets: torch.Tensor) -> torch.Tensor:
         """
-        Args:
-            logits: [B, C, H, W] raw logits
-            targets: [B, H, W] int64 class indices
+        :param logits: [B, C, H, W] raw logits
+        :type logits: torch.Tensor
 
-        Returns:
-            scalar combined loss
+        :param targets: [B, H, W] int64 class indices
+        :type targets: torch.Tensor
+
+        :return: scalar combined loss
+        :rtype: torch.Tensor
         """
         return (self.alpha * self.focal(logits, targets) +
                 (1 - self.alpha) * self.dice(logits, targets))

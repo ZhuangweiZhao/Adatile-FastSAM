@@ -26,7 +26,7 @@ E007-B: Proto vs Embedding 公平对照 | Fair Head-to-Head Comparison
     E007:  Proto 绝对值 (Dice=0.459, 有语义分化)
     E007-B: Proto vs Embedding 对照 (证明语义分化来自 Proto 约束，非偶然)
 
-用法 | Usage:
+用法 | Usage::
     python tools/eval_e007b_proto_vs_embedding.py
     python tools/eval_e007b_proto_vs_embedding.py --n-protos 8 --epochs 30
 """
@@ -102,12 +102,11 @@ class EmbeddingHead(nn.Module):
 
     def forward(self, p4: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Args:
-            p4: [B, 1280, H/16, W/16]
+        :param p4: [B, 1280, H/16, W/16]
+        :type p4: torch.Tensor
 
-        Returns:
-            embedding: [B, D, H, W]  低维嵌入 | Low-dim embedding
-            logit:     [B, 1, H, W]  分割 logit | Segmentation logit
+        :return: embedding: [B, D, H, W]  低维嵌入 | Low-dim embedding logit:     [B, 1, H, W]  分割 logit | Segmentation logit
+        :rtype: tuple[torch.Tensor, torch.Tensor]
         """
         embedding = self.project(p4)  # [B, D, H, W]
         logit = self.head(embedding)  # [B, 1, H, W]
@@ -151,14 +150,14 @@ class ProtoHead(nn.Module):
     def forward(self, p4: torch.Tensor, temperature: float = 0.1
                 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Args:
-            p4:          [B, 1280, H/16, W/16]
-            temperature: softmax temperature
+        :param p4: [B, 1280, H/16, W/16]
+        :type p4: torch.Tensor
 
-        Returns:
-            embedding: [B, D, H, W]  低维嵌入 | Low-dim embedding
-            sim_maps:  [B, N, H, W]  proto 相似度图 | Proto similarity maps
-            logit:     [B, 1, H, W]  分割 logit | Segmentation logit
+        :param temperature: softmax temperature
+        :type temperature: float
+
+        :return: embedding: [B, D, H, W]  低维嵌入 | Low-dim embedding sim_maps:  [B, N, H, W]  proto 相似度图 | Proto similarity maps logit:     [B, 1, H, W]  分割 logit | Segmentation logit
+        :rtype: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         """
         embedding = self.project(p4)  # [B, D, H, W]
 
@@ -194,13 +193,17 @@ def compute_silhouette(embedding: torch.Tensor, gt_mask: torch.Tensor,
     Randomly sample pixels from embedding space, evaluate cluster
     quality using GT labels (building=1, background=0).
 
-    Args:
-        embedding: [1, D, H, W] 低维嵌入 | Low-dim embedding (pre-head)
-        gt_mask:   [H, W]        二值 GT 掩码 | Binary GT mask
-        n_samples: 采样像素数 | Number of pixels to sample
+    :param embedding: [1, D, H, W] 低维嵌入 | Low-dim embedding (pre-head)
+    :type embedding: torch.Tensor
 
-    Returns:
-        Silhouette score ∈ [-1, 1]. Higher = better separated clusters.
+    :param gt_mask: [H, W]        二值 GT 掩码 | Binary GT mask
+    :type gt_mask: torch.Tensor
+
+    :param n_samples: 采样像素数 | Number of pixels to sample
+    :type n_samples: int
+
+    :return: Silhouette score ∈ [-1, 1]. Higher = better separated clusters.
+    :rtype: float
     """
     try:
         from sklearn.metrics import silhouette_score
@@ -277,9 +280,8 @@ def train_head(head, backbone, train_ds, val_ds, args, device, recorder,
     """
     训练一个 Head | Train one head variant.
 
-    Returns:
-        results dict with keys: best_dice, final_dice, best_silhouette,
-        final_silhouette, loss_history, dice_history
+    :return: results dict with keys: best_dice, final_dice, best_silhouette, final_silhouette, loss_history, dice_history
+    :rtype: dict
     """
     head.train()
     # 确保可训练参数仅来自 head | Ensure only head params are trainable

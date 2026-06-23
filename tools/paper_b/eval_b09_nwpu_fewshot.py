@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 B-09: FastSAM-FSS on NWPU-VHR-10 -- Few-Shot Instance Segmentation
 ===================================================================
@@ -12,7 +12,7 @@ Only bbox annotations available: bbox used as weak instance mask.
     - Query: P4 -> cosine similarity with prototypes -> upsampled binary mask
     - Evaluation: binary IoU (bbox as GT mask)
 
-用法 | Usage:
+用法 | Usage::
     python tools/paper_b/eval_b09_nwpu_fewshot.py \
         --data-root data/NWPU --shots 1,3,5 --episodes 100 --device cuda
 """

@@ -23,11 +23,11 @@ def count_params(model: nn.Module) -> dict[str, int | dict[str, int]]:
     - frozen:    冻结参数（requires_grad=False）| Frozen parameters
     - per_module: 每个子模块的参数字典 | Per-submodule parameter dict
 
-    Args:
-        model: PyTorch 模型 | PyTorch model.
+    :param model: PyTorch 模型 | PyTorch model.
+    :type model: nn.Module
 
-    Returns:
-        dict with keys: "total", "trainable", "frozen", "per_module"
+    :return: dict with keys: "total", "trainable", "frozen", "per_module"
+    :rtype: dict[str, int | dict[str, int]]
     """
     total = 0
     trainable = 0
@@ -64,11 +64,11 @@ def format_param_count(n: int) -> str:
         999       → "999"
         0         → "0"
 
-    Args:
-        n: 参数数量 | Parameter count.
+    :param n: 参数数量 | Parameter count.
+    :type n: int
 
-    Returns:
-        str: 格式化后的字符串 | Formatted string.
+    :return: str: 格式化后的字符串 | Formatted string.
+    :rtype: str
     """
     if n >= 1_000_000:
         return f"{n / 1_000_000:.2f}M"

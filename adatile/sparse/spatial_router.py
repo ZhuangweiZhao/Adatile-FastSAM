@@ -25,7 +25,7 @@ Paper B 核心模块。B-02.5 证明 Router 学习的是 objectness / instance d
     R2: DensityRouter (正式版)           (主线)
     R3: DensityRouter + EdgeHead         (消融: 边缘是否额外有用)
 
-用法 | Usage:
+用法 | Usage::
     >>> from adatile.sparse.spatial_router import ForegroundDensityRouter, TinyCNNRouter
     >>> fdr = ForegroundDensityRouter(in_channels=576)   # MV3 backbone 特征
     >>> fdr = ForegroundDensityRouter(in_channels=1280)  # FastSAM P8 特征
@@ -56,7 +56,6 @@ class DensityHead(nn.Module):
     B-02.5 finding: this head learns objectness / instance density,
     not class semantics — enabling base-class training, novel-class generalization.
 
-    Parameters
     ----------
     in_channels : int
         输入特征通道数 | Input feature channels.
@@ -85,10 +84,11 @@ class DensityHead(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Args:
-            x: 骨干特征 [B, C, H, W] | Backbone features.
-        Returns:
-            密度图 [B, 1, H, W] ∈ [0, 1] | Density map.
+        :param x: 骨干特征 [B, C, H, W] | Backbone features.
+        :type x: torch.Tensor
+
+        :return: 密度图 [B, 1, H, W] ∈ [0, 1] | Density map.
+        :rtype: torch.Tensor
         """
         return self.head(x)
 
@@ -147,7 +147,6 @@ class ForegroundDensityRouter(nn.Module):
         B-03 证明: Edge ≠ Importance. Edge 容易被背景结构欺骗.
         B-02.5 证明: FDR 学习的 objectness/instance density 是类别无关的.
 
-    Parameters
     ----------
     in_channels : int
         特征通道数 | Feature channels (MV3=576, FastSAM P8=1280).
@@ -178,10 +177,11 @@ class ForegroundDensityRouter(nn.Module):
 
     def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor]:
         """
-        Args:
-            features: 骨干特征 [B, C, H, W] | Backbone features.
-        Returns:
-            dict with "importance" density map [B, 1, H, W].
+        :param features: 骨干特征 [B, C, H, W] | Backbone features.
+        :type features: torch.Tensor
+
+        :return: dict with "importance" density map [B, 1, H, W].
+        :rtype: dict[str, torch.Tensor]
         """
         return {"importance": self.density_head(features)}
 

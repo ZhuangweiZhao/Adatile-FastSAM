@@ -301,7 +301,6 @@ def get_logger(name: str = "default") -> Logger:
     这是日志系统的**唯一入口点**。
     This is the **single entry point** for the logging system.
 
-    Parameters
     ----------
     name : str
         Logger 名称。建议按子系统命名：
@@ -309,7 +308,6 @@ def get_logger(name: str = "default") -> Logger:
         - "data"    — 数据集/数据加载 | dataset/data loading
         - "model"   — 模型内部 | model internals
 
-    Returns
     -------
     Logger
         命名 Logger 实例 | The named Logger instance.

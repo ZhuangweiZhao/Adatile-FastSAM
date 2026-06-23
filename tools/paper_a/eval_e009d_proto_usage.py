@@ -25,7 +25,7 @@ E009-D: Proto Usage Analysis — 多少个 Proto 够用？
     Proto Sparsity: 模型自然趋向使用少数 Proto
     与 Spatial Sparsity (E008) 形成 Dual Sparsity 范式
 
-用法 | Usage:
+用法 | Usage::
     python tools/eval_e009d_proto_usage.py
     python tools/eval_e009d_proto_usage.py --n-list "2,4,6,8,12" --epochs 30
 """
@@ -102,10 +102,7 @@ class ProtoHead(torch.nn.Module):
         """
         标准前向 | Standard forward pass.
 
-        Returns:
-            embedding: [B, D, H, W] 低维嵌入 | low-dim embedding
-            sim_maps:  [B, N, H, W] proto 相似度图 | proto similarity maps
-            logit:     [B, 1, H, W] 分割 logit | segmentation logit
+        :return: embedding: [B, D, H, W] 低维嵌入 | low-dim embedding sim_maps:  [B, N, H, W] proto 相似度图 | proto similarity maps logit:     [B, 1, H, W] 分割 logit | segmentation logit
         """
         embedding = self.project(p4)
         emb_norm = F.normalize(embedding, dim=1, p=2)
@@ -129,11 +126,7 @@ class ProtoHead(torch.nn.Module):
           3. Head weight norm: head 权重的绝对值 (模型对该 proto 的重视程度)
           4. Inter-proto cosine: proto 间余弦相似度 (冗余度)
 
-        Returns:
-            winner_freq:    [N] — 每个 proto 是 winner 的频率
-            energy_frac:    [N] — 每个 proto 的 |w·sim| 能量占比
-            head_norm:      [N] — 每个 proto 的 head weight 的绝对值
-            inter_cos:      [N,N] — proto 间 cosine similarity 矩阵
+        :return: winner_freq:    [N] — 每个 proto 是 winner 的频率 energy_frac:    [N] — 每个 proto 的 |w·sim| 能量占比 head_norm:      [N] — 每个 proto 的 head weight 的绝对值 inter_cos:      [N,N] — proto 间 cosine similarity 矩阵
         """
         self.eval()
         n_protos = self.n_protos
@@ -190,17 +183,21 @@ def train_proto_head(proto_head, backbone, train_ds, val_ds, args, device, recor
     """
     训练 ProtoHead (同 E007-B 配方) | Train ProtoHead (same E007-B recipe).
 
-    Args:
-        proto_head: ProtoHead instance (variable N)
-        backbone:   Frozen FastSAM backbone
-        train_ds:   Training dataset
-        val_ds:     Validation dataset
-        args:       CLI arguments
-        device:     torch device
-        recorder:   ExperimentRecorder instance
+    :param proto_head: ProtoHead instance (variable N)
 
-    Returns:
-        best_dice:  Best validation Dice across all epochs
+    :param backbone: Frozen FastSAM backbone
+
+    :param train_ds: Training dataset
+
+    :param val_ds: Validation dataset
+
+    :param args: CLI arguments
+
+    :param device: torch device
+
+    :param recorder: ExperimentRecorder instance
+
+    :return: best_dice:  Best validation Dice across all epochs
     """
     proto_head.train()
     optimizer = torch.optim.Adam(proto_head.parameters(), lr=args.lr)

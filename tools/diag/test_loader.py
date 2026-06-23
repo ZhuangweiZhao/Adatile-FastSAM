@@ -13,7 +13,7 @@
     快速验证数据预处理后的数据加载链路是否正常。
     Quick validation that the data loading pipeline works after preprocessing.
 
-用法 | Usage:
+用法 | Usage::
     python tools/diag/test_loader.py
 """
 

@@ -37,15 +37,14 @@ def generate_exp_id(prefix: str = "exp", name: Optional[str] = None) -> str:
     加入 PID 前缀防止多进程冲突。
     PID suffix prevents collision in multi-process scenarios.
 
-    Args:
-        prefix: ID 前缀 | ID prefix (default "exp").
-        name:   用户自定义名称 | User-specified name.
-                如果为 None，直接用时间戳。
-                If None, use timestamp only.
+    :param prefix: ID 前缀 | ID prefix (default "exp").
+    :type prefix: str
 
-    Returns:
-        str: 实验 ID，如 "exp_baseline_20260617_143052"
-             Experiment ID, e.g. "exp_baseline_20260617_143052"
+    :param name: 用户自定义名称 | User-specified name. 如果为 None，直接用时间戳。 If None, use timestamp only.
+    :type name: Optional[str]
+
+    :return: str: 实验 ID，如 "exp_baseline_20260617_143052" Experiment ID, e.g. "exp_baseline_20260617_143052"
+    :rtype: str
     """
     # 时间戳：精确到微秒防止同秒冲突 | Timestamp with microseconds to prevent same-second collision
     now = datetime.now()
@@ -176,8 +175,8 @@ class ExperimentConfig:
         保存为 YAML 文件 | Save to YAML file.
         自动创建父目录。| Auto-creates parent directory.
 
-        Args:
-            path: 输出文件路径 | Output file path.
+        :param path: 输出文件路径 | Output file path.
+        :type path: str
         """
         import yaml
 
@@ -197,11 +196,11 @@ class ExperimentConfig:
         """
         从 YAML 文件加载 | Load from YAML file.
 
-        Args:
-            path: YAML 文件路径 | Path to YAML file.
+        :param path: YAML 文件路径 | Path to YAML file.
+        :type path: str
 
-        Returns:
-            ExperimentConfig: 新配置实例 | New config instance.
+        :return: ExperimentConfig: 新配置实例 | New config instance.
+        :rtype: 'ExperimentConfig'
         """
         import yaml
 
@@ -217,8 +216,7 @@ class ExperimentConfig:
         每条配置项作为 INFO 级别记录。
         Each config item logged at INFO level.
 
-        Args:
-            logger: adatile.logging.Logger 实例 | Logger instance.
+        :param logger: adatile.logging.Logger 实例 | Logger instance.
         """
         for key, value in self.to_dict().items():
             logger.log_info(f"config/{key}", str(value))

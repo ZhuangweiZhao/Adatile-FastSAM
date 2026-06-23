@@ -34,7 +34,7 @@ Reads pre-cut 1024x1024 tiles, ISPRS LoveDA land-cover semantic segmentation.
     - 土地覆盖 → fg_ratio 失效 → Contribution Routing 需要新的重要性定义
     - Land-cover → fg_ratio fails → contribution routing needs new importance def
 
-用法 | Usage:
+用法 | Usage::
     >>> ds = LoveDATileDataset("data/LoveDA", split="train")
     >>> sample = ds[0]
     >>> sample["image"].shape  # [3, 1024, 1024]
@@ -82,7 +82,6 @@ class LoveDATileDataset(Dataset):
     从 Rural + Urban 子目录加载所有 1024x1024 tile。
     Loads all 1024x1024 tiles from Rural + Urban subdirectories.
 
-    Parameters
     ----------
     root_dir : str
         LoveDA 根目录 (含 Train/Val/Test) | Root directory.
@@ -163,11 +162,8 @@ class LoveDATileDataset(Dataset):
         """
         加载单个 tile → {image, mask, image_id} | Load single tile.
 
-        Returns:
-            image:    [3, 1024, 1024] float32, 值域 [0,1] | values in [0,1]
-            mask:     [1024, 1024] int64 (semantic) or float32 (binary)
-            image_id: str  "{domain}/{stem}"
-            domain:   str  "Rural" or "Urban"
+        :return: image:    [3, 1024, 1024] float32, 值域 [0,1] | values in [0,1] mask:     [1024, 1024] int64 (semantic) or float32 (binary) image_id: str  "{domain}/{stem}" domain:   str  "Rural" or "Urban"
+        :rtype: dict
         """
         sample = self._samples[index]
 

@@ -37,8 +37,8 @@ class ExperimentRecorder:
         """
         初始化记录器 | Initialize recorder.
 
-        Args:
-            config: 实验配置 | Experiment configuration.
+        :param config: 实验配置 | Experiment configuration.
+        :type config: ExperimentConfig
         """
         self.config = config
 
@@ -78,13 +78,23 @@ class ExperimentRecorder:
         同时：1) 通过日志系统路由 | Routes through logging system
               2) 本地累积用于 summary | Accumulates locally for summary
 
-        Args:
-            key:   指标名称（如 "miou/val", "dice/val", "fps/infer"）| Metric name.
-            value: 指标值 | Metric value.
-            step:  全局步数 | Global step.
-            phase: 流水线阶段 | Pipeline phase (train/val/test).
-            tags:  标签列表 | Tag list.
-            **meta: 额外元数据 | Additional metadata.
+        :param key: 指标名称（如 "miou/val", "dice/val", "fps/infer"）| Metric name.
+        :type key: str
+
+        :param value: 指标值 | Metric value.
+        :type value: float
+
+        :param step: 全局步数 | Global step.
+        :type step: int
+
+        :param phase: 流水线阶段 | Pipeline phase (train/val/test).
+        :type phase: str
+
+        :param tags: 标签列表 | Tag list. **meta: 额外元数据 | Additional metadata.
+        :type tags: Sequence[str]
+
+        :param meta: 
+        :type meta: Any
         """
         self.logger.log_metric(key, value, step=step, phase=phase, tags=tags, **meta)
 

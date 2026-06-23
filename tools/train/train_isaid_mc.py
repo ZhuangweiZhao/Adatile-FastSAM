@@ -16,7 +16,7 @@ E007-B based head-to-head comparison adapted for iSAID 15-class segmentation.
     所有关键值通过 adatile.logging 输出，无 bare print()。
     All key values routed through adatile.logging, no bare print().
 
-用法 | Usage:
+用法 | Usage::
     python tools/train_isaid_multiclass.py
     python tools/train_isaid_multiclass.py --n-protos 12 --epochs 30
 """
@@ -123,14 +123,14 @@ class MultiClassProtoHead(nn.Module):
         """
         前向传播 | Forward pass.
 
-        Args:
-            p4:          [B, 1280, H/16, W/16] FastSAM P4 特征
-            temperature: 余弦相似度的温度系数 | temperature for cosine similarity
+        :param p4: [B, 1280, H/16, W/16] FastSAM P4 特征
+        :type p4: torch.Tensor
 
-        Returns:
-            embedding: [B, D, H, W]   低维嵌入 | Low-dim embedding
-            sim_maps:  [B, N, H, W]   Proto 相似度图 | Proto similarity maps
-            logit:     [B, C, H, W]   多类别 logits | Multi-class logits
+        :param temperature: 余弦相似度的温度系数 | temperature for cosine similarity
+        :type temperature: float
+
+        :return: embedding: [B, D, H, W]   低维嵌入 | Low-dim embedding sim_maps:  [B, N, H, W]   Proto 相似度图 | Proto similarity maps logit:     [B, C, H, W]   多类别 logits | Multi-class logits
+        :rtype: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         """
         # 投影 → 嵌入 | Project → embedding
         embedding = self.project(p4)  # [B, D, H/16, W/16]
@@ -183,12 +183,11 @@ class MultiClassEmbedHead(nn.Module):
     def forward(self, p4: torch.Tensor
                 ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Args:
-            p4: [B, 1280, H/16, W/16]
+        :param p4: [B, 1280, H/16, W/16]
+        :type p4: torch.Tensor
 
-        Returns:
-            embedding: [B, D, H, W]  低维嵌入 | Low-dim embedding
-            logit:     [B, C, H, W]  多类别 logits | Multi-class logits
+        :return: embedding: [B, D, H, W]  低维嵌入 | Low-dim embedding logit:     [B, C, H, W]  多类别 logits | Multi-class logits
+        :rtype: tuple[torch.Tensor, torch.Tensor]
         """
         embedding = self.project(p4)  # [B, D, H, W]
         logit = self.head(embedding)  # [B, C, H, W]
@@ -205,17 +204,21 @@ def compute_miou(pred: torch.Tensor, target: torch.Tensor,
     """
     计算 mIoU + per-class IoU | Compute mIoU + per-class IoU.
 
-    Args:
-        pred:   [B, H, W] 预测标签 | predicted class labels
-                or [B, C, H, W] logits (会取 argmax)
-        target: [B, H, W] GT 语义标签 | ground truth semantic labels
-
-    Returns:
-        {"miou": float, "iou_cls_0": float, ...}
-
     注意 | Note:
         使用 sum+reshape 避免 v1 的 unsqueeze(0) 广播爆炸问题。
         Uses sum+reshape to avoid v1's unsqueeze(0) broadcast bug.
+
+    :param pred: [B, H, W] 预测标签 | predicted class labels or [B, C, H, W] logits (会取 argmax)
+    :type pred: torch.Tensor
+
+    :param target: [B, H, W] GT 语义标签 | ground truth semantic labels
+    :type target: torch.Tensor
+
+    :param num_classes: 
+    :type num_classes: int
+
+    :return: {"miou": float, "iou_cls_0": float, ...}
+    :rtype: dict
     """
     if pred.dim() == 4:
         pred = pred.argmax(dim=1)  # [B, C, H, W] → [B, H, W]
@@ -251,13 +254,26 @@ def train_head(head: nn.Module, backbone: nn.Module,
     固定 Backbone (frozen), 只训练 Head。
     Frozen backbone, train head only.
 
-    Args:
-        head:      MultiClassProtoHead or MultiClassEmbedHead
-        head_name: 用于日志标记 | used as log tag
-        is_proto:  True=ProtoHead (需 temperature), False=EmbedHead
+    :param head: MultiClassProtoHead or MultiClassEmbedHead
+    :type head: nn.Module
 
-    Returns:
-        best_miou: 最佳验证 mIoU | best validation mIoU
+    :param head_name: 用于日志标记 | used as log tag
+    :type head_name: str
+
+    :param is_proto: True=ProtoHead (需 temperature), False=EmbedHead
+    :type is_proto: bool
+
+    :param backbone: 
+    :type backbone: nn.Module
+
+    :param device: 
+    :type device: str
+
+    :param recorder: 
+    :type recorder: ExperimentRecorder
+
+    :return: best_miou: 最佳验证 mIoU | best validation mIoU
+    :rtype: float
     """
     head.train()
     optimizer = torch.optim.Adam(head.parameters(), lr=args.lr)

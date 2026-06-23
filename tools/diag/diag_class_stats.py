@@ -16,7 +16,7 @@ iSAID 类别统计与不均衡分析 | iSAID Class Statistics & Imbalance Analys
     - 异常检测 (anomaly detection: rare classes, tiny objects)
     - B-04 训练建议 (B-04 training recommendations)
 
-用法 | Usage:
+用法 | Usage::
     python tools/diag/diag_class_stats.py
     python tools/diag/diag_class_stats.py --isaid-root data/iSAID_processed --tile-root data/iSAID_tiles
 """
@@ -43,10 +43,10 @@ def parse_args():
 
 
 def analyze_coco(args):
-    """分析 COCO 标注: 每类实例数 + bbox 面积分布 | Analyze COCO annotations: per-class instances + bbox area distribution.
+    """
+    分析 COCO 标注: 每类实例数 + bbox 面积分布 | Analyze COCO annotations: per-class instances + bbox area distribution.
 
-    Returns:
-        (cat_instances, cat_areas) or None if annotation file not found.
+    :return: (cat_instances, cat_areas) or None if annotation file not found.
     """
     ann_file = Path(args.isaid_root) / "train" / "annotations" / "instances_train.json"
     if not ann_file.exists():
@@ -102,10 +102,10 @@ def analyze_coco(args):
 
 
 def analyze_tiles(args):
-    """分析 Tile 数据: FG>5% tile 中每类像素数 + 出现次数 | Analyze tile data: per-class pixels + occurrence in FG>5% tiles.
+    """
+    分析 Tile 数据: FG>5% tile 中每类像素数 + 出现次数 | Analyze tile data: per-class pixels + occurrence in FG>5% tiles.
 
-    Returns:
-        (class_pixels, class_tile_count, fg_arr) or None if mask directory not found.
+    :return: (class_pixels, class_tile_count, fg_arr) or None if mask directory not found.
     """
     from PIL import Image
 

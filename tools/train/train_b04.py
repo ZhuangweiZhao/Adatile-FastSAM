@@ -15,7 +15,7 @@ Paper B 最终实验: FDR 预测 tile 重要性 → Top-K 选择 → Decoder 只
     - 稀有类过采样 (plane/pool/soccer ×5)
     - 使用全部 FG>5% tile (非采样)
 
-用法:
+用法::
     python tools/eval_b04_dynamic_tile_selection.py
     python tools/eval_b04_dynamic_tile_selection.py --decoder-epochs 50 --batch-size 8
 """

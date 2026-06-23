@@ -18,7 +18,7 @@ E011: SPM Router on iSAID — 类别感知 Proto 路由
     Stage 2: 冻结 Proto Dictionary, 只训练 SPM Router
              → Router 学习每个位置选择哪些 Proto
 
-用法 | Usage:
+用法 | Usage::
     python tools/eval_e011_spm_isaid.py --max-tiles 200
 """
 
@@ -98,10 +98,7 @@ class ProtoHead(nn.Module):
         """
         标准前向 | Standard forward pass.
 
-        Returns:
-            embedding: [B, D, H, W] 低维嵌入 | low-dim embedding
-            sim_maps:  [B, N, H, W] proto 相似度图 | proto similarity maps
-            logit:     [B, C, H, W] 多类别 logit | multi-class logit
+        :return: embedding: [B, D, H, W] 低维嵌入 | low-dim embedding sim_maps:  [B, N, H, W] proto 相似度图 | proto similarity maps logit:     [B, C, H, W] 多类别 logit | multi-class logit
         """
         embedding = self.project(p4)
         emb_n = F.normalize(embedding, dim=1, p=2)
@@ -114,8 +111,7 @@ class ProtoHead(nn.Module):
         """
         硬分配: 每个像素的 Winner Proto 索引 | Hard winner-take-all assignment.
 
-        Returns:
-            [B, H/16, W/16] int64, 值 ∈ [0, N-1]
+        :return: [B, H/16, W/16] int64, 值 ∈ [0, N-1]
         """
         _, sim_maps, _ = self.forward(p4, temperature)
         return sim_maps.argmax(dim=1)
@@ -208,13 +204,13 @@ def compute_miou(pred, target, num_classes):
     """
     计算 mIoU | Compute mean IoU.
 
-    Args:
-        pred:        [B, H, W] or [B, C, H, W] 预测 | prediction
-        target:      [B, H, W] GT 类别标签 | GT class labels
-        num_classes: 类别数 | number of classes
+    :param pred: [B, H, W] or [B, C, H, W] 预测 | prediction
 
-    Returns:
-        float: mIoU averaged over valid classes (union > 0).
+    :param target: [B, H, W] GT 类别标签 | GT class labels
+
+    :param num_classes: 类别数 | number of classes
+
+    :return: float: mIoU averaged over valid classes (union > 0).
     """
     if pred.dim() == 4:
         pred = pred.argmax(dim=1)
@@ -242,11 +238,7 @@ def analyze_proto_utilization(model, backbone, val_ds, device, num_classes, n_pr
       - is_spm=False: Proto only — winner-take-all (每个像素选最相似的 Proto)
       - is_spm=True:  SPM — Top-K Router 选择 (每个像素可激活多个 Proto)
 
-    Returns:
-        pct:         [N, C] 归一化类别占比 | normalized class proportions
-        proto_class: [N, C] 原始计数 | raw counts
-        n_active:    活跃 Proto 数 (总像素 > 100) | active protos
-        n_bg:        背景主导 Proto 数 (>50% 为 class 0) | BG-dominant protos
+    :return: pct:         [N, C] 归一化类别占比 | normalized class proportions proto_class: [N, C] 原始计数 | raw counts n_active:    活跃 Proto 数 (总像素 > 100) | active protos n_bg:        背景主导 Proto 数 (>50% 为 class 0) | BG-dominant protos
     """
     model.eval()
     proto_class = np.zeros((n_protos, num_classes))
@@ -313,8 +305,7 @@ def train_stage1(proto_head, backbone, train_ds, val_ds, args, device, recorder)
     使用所有 N 个 Proto 进行训练。收敛后 Proto Dictionary 将被冻结。
     Trained with all N protos active. Proto Dictionary frozen after convergence.
 
-    Returns:
-        best_miou: Best validation mIoU.
+    :return: best_miou: Best validation mIoU.
     """
     proto_head.train()
     opt = torch.optim.Adam(proto_head.parameters(), lr=args.lr)
@@ -373,8 +364,7 @@ def train_stage2(spm_head, backbone, train_ds, val_ds, args, device, recorder):
          BCE + entropy regularization — BCE drives useful proto selection;
          entropy term prevents collapse to a single proto.
 
-    Returns:
-        best_miou: Best validation mIoU with SPM routing.
+    :return: best_miou: Best validation mIoU with SPM routing.
     """
     spm_head.train()
     opt = torch.optim.Adam(spm_head.router.parameters(), lr=args.lr_router)

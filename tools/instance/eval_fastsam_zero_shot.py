@@ -12,7 +12,7 @@ FastSAM predict mode on iSAID — evaluates mask quality (class-agnostic AP).
   - 高效 GT 渲染 (per-image, not per-instance)
   - 采样可视化 (5 张对比图)
 
-用法 | Usage:
+用法 | Usage::
     python tools/instance/eval_fastsam_zero_shot.py \
         --src-root data/iSAID_processed --split val \
         --n-images 50 --output-dir runs/c01_isaid
@@ -61,6 +61,12 @@ from adatile.utils.label_mapping import _ID_TO_NAME as ISAID_NAMES
 
 
 def parse_args():
+    """
+    解析命令行参数 | Parse command-line arguments.
+
+    :return: Parsed argument namespace
+    :rtype: argparse.Namespace
+    """
     p = argparse.ArgumentParser()
     p.add_argument("--src-root", type=str, default="data/iSAID_processed")
     p.add_argument("--split", type=str, default="val")
@@ -75,7 +81,18 @@ def parse_args():
 
 
 def render_gt_mask(ann, H, W):
-    """Render single GT instance mask at full resolution."""
+    """
+    Render single GT instance mask at full resolution | 渲染单个 GT 实例掩码。
+
+    :param ann: COCO annotation dict with "segmentation" or "bbox" key
+    :type ann: dict
+    :param H: Image height in pixels
+    :type H: int
+    :param W: Image width in pixels
+    :type W: int
+    :return: Boolean mask array of shape (H, W)
+    :rtype: numpy.ndarray
+    """
     import cv2
     mask = np.zeros((H, W), dtype=np.uint8)
     seg = ann.get("segmentation", [])
@@ -96,7 +113,16 @@ def render_gt_mask(ann, H, W):
 
 
 def compute_iou(mask_a, mask_b):
-    """Binary mask IoU."""
+    """
+    Binary mask IoU | 二值掩码 IoU。
+
+    :param mask_a: First boolean mask
+    :type mask_a: numpy.ndarray
+    :param mask_b: Second boolean mask
+    :type mask_b: numpy.ndarray
+    :return: IoU score in range [0, 1]
+    :rtype: float
+    """
     inter = (mask_a & mask_b).sum()
     union = (mask_a | mask_b).sum()
     return float(inter / union) if union > 0 else 0.0
@@ -104,9 +130,16 @@ def compute_iou(mask_a, mask_b):
 
 def compute_ap(preds, gts, iou_thresh):
     """
-    Compute AP at given IoU threshold (class-agnostic per-image).
-    preds: [{"mask": bool_arr, "score": float}, ...]
-    gts:   lazy-rendered [{"ann": dict, "cat_id": int, "H": int, "W": int}]
+    Compute AP at given IoU threshold (class-agnostic per-image) | 计算给定 IoU 阈值的 AP。
+
+    :param preds: List of dicts with "mask" (bool array) and "score" (float) keys
+    :type preds: list[dict]
+    :param gts: List of dicts with "ann" (COCO annotation), "cat_id" (int), "H" (int), "W" (int)
+    :type gts: list[dict]
+    :param iou_thresh: IoU threshold for matching
+    :type iou_thresh: float
+    :return: Tuple of (AP score, per-class AP dict mapping cat_id → AP)
+    :rtype: tuple[float, dict[int, float]]
     """
     # Lazy GT mask renderer (to avoid OOM on 200+ instance images)
     # GT mask ???????????? mask
@@ -171,14 +204,19 @@ def compute_ap(preds, gts, iou_thresh):
 
 def compute_recall(preds, gts, iou_thresh):
     """
-    Compute class-agnostic recall: what fraction of GTs are matched by any pred?
+    Compute class-agnostic recall | 计算类别无关的召回率。
+
     For each GT: is there at least one pred mask with IoU >= threshold?
     This is the RECALL CEILING for any downstream classifier.
 
-    Returns:
-        recall: float (matched_gt / total_gt)
-        per_cls_recall: {cat_id: float} per-class recall
-        matched_gt_mask: set of matched GT indices
+    :param preds: List of dicts with "mask" (bool array) and "score" (float) keys
+    :type preds: list[dict]
+    :param gts: List of dicts with "ann", "cat_id", "H", "W" keys
+    :type gts: list[dict]
+    :param iou_thresh: IoU threshold for matching
+    :type iou_thresh: float
+    :return: Tuple of (overall_recall, per_cls_recall dict, matched_gt set)
+    :rtype: tuple[float, dict[int, float], set[int]]
     """
     if not preds or not gts:
         return 0.0, {}, set()
@@ -220,8 +258,20 @@ def compute_recall(preds, gts, iou_thresh):
 
 def resize_masks_to_original(masks_tensor, H_orig, W_orig, chunk_size=10):
     """
-    Resize FastSAM masks from processing resolution to original image resolution.
+    Resize FastSAM masks to original image resolution | 将 FastSAM 掩码调整为原始分辨率。
+
     Uses CPU to avoid GPU OOM on high-res images (4000x4000+).
+
+    :param masks_tensor: Mask tensor of shape [N, h, w]
+    :type masks_tensor: torch.Tensor
+    :param H_orig: Original image height
+    :type H_orig: int
+    :param W_orig: Original image width
+    :type W_orig: int
+    :param chunk_size: Chunk size for batched processing (reserved, unused)
+    :type chunk_size: int
+    :return: List of boolean mask arrays at original resolution
+    :rtype: list[numpy.ndarray]
     """
     import torch
     import torch.nn.functional as F
@@ -243,6 +293,11 @@ def resize_masks_to_original(masks_tensor, H_orig, W_orig, chunk_size=10):
 
 
 def main():
+    """
+    C-01 主入口：FastSAM Zero-Shot 实例分割评估 | C-01 main entry: FastSAM zero-shot evaluation.
+
+    评估 FastSAM predict mode 在 iSAID 上的 mask 质量 (class-agnostic AP/Recall)。
+    """
     args = parse_args()
     from fastsam import FastSAM
 

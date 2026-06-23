@@ -1,4 +1,4 @@
-﻿'''
+"""
 Instance Decoder — Light U-Net for Few-Shot Instance Segmentation
 ==================================================================
 
@@ -36,7 +36,7 @@ Takes FastSAM P4 features, outputs full-resolution binary mask.
     - LightDecoder: 1280->64->64->32->32->1 (binary, ~716K)
     - InstanceDecoder: 1280->256->128->64->32->1 (~716K)
     - InstanceDecoder 的早期通道更宽 (256 vs 64)，更适合实例分割
-'''
+"""
 
 import torch
 import torch.nn as nn
@@ -44,18 +44,18 @@ import torch.nn.functional as F
 
 
 class InstanceDecoder(nn.Module):
-    '''
+    """
     Light U-Net decoder for few-shot instance segmentation.
 
     Input:  P4 feature [B, 1280, H/16, W/16]
     Output: binary mask [B, 1, H, W]
 
-    Usage:
+    Usage::
         decoder = InstanceDecoder()
         mask = decoder(p4_features)  # [B, 1, H, W]
 
     For few-shot: freeze FastSAM, train decoder on support set.
-    '''
+    """
 
     def __init__(self, in_channels: int = 1280):
         super().__init__()
@@ -107,15 +107,15 @@ class InstanceDecoder(nn.Module):
         self,
         p4: torch.Tensor,
     ) -> torch.Tensor:
-        '''
+        """
         Forward pass.
 
-        Args:
-            p4: [B, 1280, H/16, W/16] P4 features from FastSAM
+        :param p4: [B, 1280, H/16, W/16] P4 features from FastSAM
+        :type p4: torch.Tensor
 
-        Returns:
-            [B, 1, H, W] binary mask logits (sigmoid for probability)
-        '''
+        :return: [B, 1, H, W] binary mask logits (sigmoid for probability)
+        :rtype: torch.Tensor
+        """
         # Project
         x = self.proj(p4)  # [B, 256, H/16, W/16]
 
@@ -140,12 +140,12 @@ class InstanceDecoder(nn.Module):
         return mask
 
     def predict(self, p4: torch.Tensor) -> torch.Tensor:
-        '''
+        """
         Predict binary mask (with sigmoid).
 
-        Returns:
-            [B, 1, H, W] float mask in [0, 1]
-        '''
+        :return: [B, 1, H, W] float mask in [0, 1]
+        :rtype: torch.Tensor
+        """
         logits = self.forward(p4)
         return torch.sigmoid(logits)
 
@@ -154,16 +154,18 @@ def build_instance_decoder(
     in_channels: int = 1280,
     pretrained: str | None = None,
 ) -> InstanceDecoder:
-    '''
+    """
     Factory function for InstanceDecoder.
 
-    Args:
-        in_channels: number of input channels (1280 for P4)
-        pretrained: path to pretrained weights
+    :param in_channels: number of input channels (1280 for P4)
+    :type in_channels: int
 
-    Returns:
-        InstanceDecoder instance
-    '''
+    :param pretrained: path to pretrained weights
+    :type pretrained: str | None
+
+    :return: InstanceDecoder instance
+    :rtype: InstanceDecoder
+    """
     model = InstanceDecoder(in_channels=in_channels)
     if pretrained is not None:
         state = torch.load(pretrained, map_location='cpu', weights_only=True)

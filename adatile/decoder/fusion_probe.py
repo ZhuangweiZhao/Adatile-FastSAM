@@ -48,7 +48,6 @@ class FusionProbe(nn.Module):
     极简参数量的双分支融合头，用于验证深层语义贡献。
     Ultra-low-parameter dual-branch fusion head for verifying deep semantic contribution.
 
-    Parameters
     ----------
     in_channels : int
         P4/P8 输入通道数 | P4/P8 input channels.
@@ -87,11 +86,11 @@ class FusionProbe(nn.Module):
         """
         前向传播 | Forward pass.
 
-        Args:
-            features: backbone 输出 {"p4": [B,1280,H/16,W/16], "p8": [B,1280,H/32,W/32]}
+        :param features: backbone 输出 {"p4": [B,1280,H/16,W/16], "p8": [B,1280,H/32,W/32]}
+        :type features: dict[str, torch.Tensor]
 
-        Returns:
-            torch.Tensor [B, 1, H/16, W/16] 概率图 | Probability map at stride 16.
+        :return: torch.Tensor [B, 1, H/16, W/16] 概率图 | Probability map at stride 16.
+        :rtype: torch.Tensor
         """
         p4 = features["p4"]  # [B, 1280, H/16, W/16]
         p8 = features["p8"]  # [B, 1280, H/32, W/32]
@@ -116,12 +115,14 @@ class FusionProbe(nn.Module):
         """
         预测并上采样到目标尺寸 | Predict and upsample to target size.
 
-        Args:
-            features:    backbone 输出 | Backbone output.
-            target_size: (H, W) 目标尺寸 | Target spatial size.
+        :param features: backbone 输出 | Backbone output.
+        :type features: dict[str, torch.Tensor]
 
-        Returns:
-            torch.Tensor [B, 1, H, W] 二值 mask | Binary mask.
+        :param target_size: (H, W) 目标尺寸 | Target spatial size.
+        :type target_size: tuple[int, int]
+
+        :return: torch.Tensor [B, 1, H, W] 二值 mask | Binary mask.
+        :rtype: torch.Tensor
         """
         prob = self.forward(features)  # [B, 1, H/16, W/16]
 

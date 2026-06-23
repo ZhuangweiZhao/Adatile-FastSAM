@@ -13,7 +13,7 @@
     2. 删除 prep_isaid_tiles.py 中 render_semantic_mask 的二次映射
     3. 重新生成所有 tile
 
-用法 | Usage:
+用法 | Usage::
     # 先 dry-run 检查
     python tools/fix_label_mapping.py --data-root data --dry-run
 

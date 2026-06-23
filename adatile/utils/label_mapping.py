@@ -17,7 +17,7 @@ This module provides name-based auto-mapping, ensuring per-split correctness.
     2. 目标编码为标准 ISAID_CATEGORIES (1-15)
        - Target encoding: standard ISAID_CATEGORIES (1-15)
 
-用法 | Usage:
+用法 | Usage::
     from adatile.utils.label_mapping import build_mapping, get_category_id, ISAID_CATEGORIES
 
     # 构建 per-split 映射 | Build per-split mapping
@@ -124,20 +124,17 @@ def build_mapping(
     通过名称匹配（不区分大小写 + 常见别名）。
     Via name matching (case-insensitive + common aliases).
 
-    Args:
-        original_categories: COCO JSON 的 "categories" 列表。
-                            List of category dicts from COCO JSON, each with "id" and "name".
-
-    Returns:
-        (mapping, unmatched):
-            mapping:   {original_id: isaid_id}  映射成功的条目。
-            unmatched: [(original_id, name)]    无法匹配的条目（名称不在别名表中）。
-
     Example:
         >>> cats = [{"id": 1, "name": "plane"}, {"id": 2, "name": "ship"}]
         >>> mapping, unmatched = build_mapping(cats)
         >>> mapping
         {1: 3, 2: 5}   # plane→3, ship→5
+
+    :param original_categories: COCO JSON 的 "categories" 列表。 List of category dicts from COCO JSON, each with "id" and "name".
+    :type original_categories: List[dict]
+
+    :return: (mapping, unmatched): mapping:   {original_id: isaid_id}  映射成功的条目。 unmatched: [(original_id, name)]    无法匹配的条目（名称不在别名表中）。
+    :rtype: Tuple[Dict[int, int], List[Tuple[int, str]]]
     """
     mapping: Dict[int, int] = {}
     unmatched: List[Tuple[int, str]] = []
@@ -181,12 +178,11 @@ def get_category_id(category_id: int) -> int:
     Otherwise return 0 (background/invalid).
     No mapping is done — mapping should only happen during data preprocessing.
 
-    Args:
-        category_id: 类别 ID（可能来自 annotation 或 mask）。
-                    Category ID (from annotation or mask).
+    :param category_id: 类别 ID（可能来自 annotation 或 mask）。 Category ID (from annotation or mask).
+    :type category_id: int
 
-    Returns:
-        int: 有效的类别 ID (0-15) | Valid category ID (0-15).
+    :return: int: 有效的类别 ID (0-15) | Valid category ID (0-15).
+    :rtype: int
     """
     if category_id in VALID_CAT_IDS or category_id == 0:
         return category_id

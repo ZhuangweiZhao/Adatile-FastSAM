@@ -17,7 +17,7 @@ E011-T: Tile Size Ablation — Tile Size 如何影响 Proto Collapse
         - Proto Entropy (Proto 类别多样性 | class diversity)
         - Foreground Ratio (每个 tile 平均前景占比 | avg fg fraction)
 
-用法 | Usage:
+用法 | Usage::
     python tools/eval_e011t_tile_ablation.py --max-images 5
     python tools/eval_e011t_tile_ablation.py --tile-sizes 256,512,1024 --max-images 10
 """
@@ -110,8 +110,7 @@ class ProtoHead(nn.Module):
         """
         每个像素的 Winner Proto 索引 | Winner-take-all proto index per pixel.
 
-        Returns:
-            [B, H/16, W/16] int64, 值 ∈ [0, N-1]
+        :return: [B, H/16, W/16] int64, 值 ∈ [0, N-1]
         """
         _, sim, _ = self.forward(p4, temperature)
         return sim.argmax(dim=1)
@@ -238,16 +237,19 @@ def train_proto(proto_head, backbone, train_ds, args, device, tile_size):
     使用多类别交叉熵 (ignore_index=255) 训练。
     Trained with multi-class CE loss (ignore_index=255 for void labels).
 
-    Args:
-        proto_head: ProtoHead instance
-        backbone:   Frozen FastSAM backbone
-        train_ds:   Training dataset (tiles of this size)
-        args:       CLI arguments
-        device:     torch device
-        tile_size:  当前 tile 尺寸 (仅用于日志标记) | current tile size (for logging)
+    :param proto_head: ProtoHead instance
 
-    Returns:
-        proto_head: Trained ProtoHead (in-place).
+    :param backbone: Frozen FastSAM backbone
+
+    :param train_ds: Training dataset (tiles of this size)
+
+    :param args: CLI arguments
+
+    :param device: torch device
+
+    :param tile_size: 当前 tile 尺寸 (仅用于日志标记) | current tile size (for logging)
+
+    :return: proto_head: Trained ProtoHead (in-place).
     """
     proto_head.train()
     opt = torch.optim.Adam(proto_head.parameters(), lr=args.lr)

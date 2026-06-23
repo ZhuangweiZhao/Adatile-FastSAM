@@ -10,7 +10,7 @@ Trace a single instance through the entire pipeline to verify label consistency.
     ③ prep_isaid_tiles.py render_semantic_mask → masks_full/*.png: pixel value = ?
     ④ prep_isaid_tiles.py step2 cut tiles → masks/{split}/*.png: pixel value = ?
 
-用法 | Usage:
+用法 | Usage::
     python tools/diag_trace_single_instance.py --data-root /root/autodl-tmp
 """
 

@@ -12,7 +12,7 @@
     了解 FastSAM 模型结构，确定 hook 层位置 (P4/P8) 和特征维度。
     Understand FastSAM model structure, determine hook layer positions (P4/P8) and feature dimensions.
 
-用法 | Usage:
+用法 | Usage::
     python tools/_inspect_backbone.py
 """
 

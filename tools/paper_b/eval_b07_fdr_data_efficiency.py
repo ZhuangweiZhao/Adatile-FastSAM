@@ -16,7 +16,7 @@ B-02.5 已证明类别无关。B-07 回答第三个维度：数据效率。
     2. FG Recall@40%       — 连接实际: Top40% Pred tiles 捕获的前景比例
     3. FDR-SES             — r(5%) / r(100%) 数据效率评分
 
-用法 | Usage:
+用法 | Usage::
     python tools/paper_b/eval_b07_fdr_data_efficiency.py \
         --src-root data/iSAID_processed \
         --data-fractions 100,50,20,10,5,1 \
@@ -236,10 +236,11 @@ def train_fdr(model, train_loader, eval_loader, device, epochs, lr,
     训练 FDR + per-epoch 日志 + eval 跟踪。
     Trains FDR with per-epoch logging + eval tracking.
 
-    Args:
-        logger: adatile logger instance
-        tag_prefix: 日志标签前缀 (e.g. "b07/D100/S0")
-        log_every: 每 N epoch 评估一次 Spearman r
+    :param logger: adatile logger instance
+
+    :param tag_prefix: 日志标签前缀 (e.g. "b07/D100/S0")
+
+    :param log_every: 每 N epoch 评估一次 Spearman r
     """
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-6)

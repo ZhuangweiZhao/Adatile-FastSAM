@@ -32,7 +32,7 @@ If P2≈interior, P6≈edge, P8≈background → Protos are not just effective, 
     Row 3: Precision/Recall vs Edge bar chart | Interior Proto activation histogram |
            Detail Proto activation histogram | Per-Prototype Building Ratio bar chart
 
-用法 | Usage:
+用法 | Usage::
     python tools/viz/viz_paper_a_p6.py
 """
 
@@ -97,13 +97,11 @@ def compute_edge(mask: np.ndarray) -> np.ndarray:
         - 目的是捕获所有可能的边缘像素，宁可多检不可漏检
           Goal: capture all potential edge pixels — better over-detect than miss
 
-    Args:
-        mask: 二值分割掩码 [H, W]，1=建筑，0=背景
-              Binary segmentation mask [H, W], 1=building, 0=background
+    :param mask: 二值分割掩码 [H, W]，1=建筑，0=背景 Binary segmentation mask [H, W], 1=building, 0=background
+    :type mask: np.ndarray
 
-    Returns:
-        edge_mask: 二值边缘掩码 [H, W], dtype=np.uint8, 1=边缘像素, 0=非边缘
-                   Binary edge mask [H, W], dtype=np.uint8, 1=edge pixel, 0=non-edge
+    :return: edge_mask: 二值边缘掩码 [H, W], dtype=np.uint8, 1=边缘像素, 0=非边缘 Binary edge mask [H, W], dtype=np.uint8, 1=edge pixel, 0=non-edge
+    :rtype: np.ndarray
     """
     # 垂直方向 Sobel 梯度 (检测水平边缘) | Vertical Sobel gradient (detects horizontal edges)
     gy = sobel(mask.astype(float), axis=0)
@@ -140,12 +138,15 @@ def analyze_p6(backbone, proto_module, dataset, device, output_dir):
     输出: 每张图一个 3×4 面板 PNG，保存到 output_dir
     Output: one 3×4 panel PNG per image, saved to output_dir
 
-    Args:
-        backbone: FastSAMBackbone, 冻结的 P4 特征提取器 | Frozen P4 feature extractor
-        proto_module: ProtoModule, 原型计算模块 | Prototype computation module
-        dataset: MassachusettsBuildingsDataset (val split)
-        device: torch device
-        output_dir: 可视化输出目录 | Visualization output directory
+    :param backbone: FastSAMBackbone, 冻结的 P4 特征提取器 | Frozen P4 feature extractor
+
+    :param proto_module: ProtoModule, 原型计算模块 | Prototype computation module
+
+    :param dataset: MassachusettsBuildingsDataset (val split)
+
+    :param device: torch device
+
+    :param output_dir: 可视化输出目录 | Visualization output directory
     """
     # ── 输出目录创建 | Create output directory ──
     save_dir = Path(output_dir)
@@ -294,11 +295,13 @@ def analyze_p6(backbone, proto_module, dataset, device, output_dir):
             Uses fixed color range vmin=-1.0, vmax=1.0 (cosine similarity theoretical range)
             to ensure comparability across images.
 
-            Args:
-                ax: matplotlib axis
-                proto_idx: Proto 索引 | Proto index
-                title: 子图标题 | Subplot title
-                cmap: 颜色映射 | Colormap (default "hot")
+            :param ax: matplotlib axis
+
+            :param proto_idx: Proto 索引 | Proto index
+
+            :param title: 子图标题 | Subplot title
+
+            :param cmap: 颜色映射 | Colormap (default "hot")
             """
             vmin, vmax = -1.0, 1.0
             im = ax.imshow(sim_np[proto_idx], cmap=cmap, vmin=vmin, vmax=vmax)
@@ -472,17 +475,15 @@ def _quick_analyze(backbone, proto_module, dataset, device):
         - 这是"赢者通吃"策略: 每个像素被唯一分配给一个 Proto
           This is a "winner-take-all" strategy: each pixel is uniquely assigned to one Proto
 
-    Args:
-        backbone: FastSAMBackbone, 冻结的 P4 特征提取器 | Frozen P4 feature extractor
-        proto_module: ProtoModule with get_hard_assignment method
-        dataset: MassachusettsBuildingsDataset
-        device: torch device
+    :param backbone: FastSAMBackbone, 冻结的 P4 特征提取器 | Frozen P4 feature extractor
 
-    Returns:
-        proto_build_pct:     np.ndarray [n_protos], 每个 Proto 的建筑像素占比 (累积归一化)
-                             Per-proto building pixel ratio (accumulated, normalized)
-        proto_activate_count: np.ndarray [n_protos], 每个 Proto 的累积激活像素总数
-                             Per-proto accumulated activated pixel count
+    :param proto_module: ProtoModule with get_hard_assignment method
+
+    :param dataset: MassachusettsBuildingsDataset
+
+    :param device: torch device
+
+    :return: proto_build_pct:     np.ndarray [n_protos], 每个 Proto 的建筑像素占比 (累积归一化) Per-proto building pixel ratio (accumulated, normalized) proto_activate_count: np.ndarray [n_protos], 每个 Proto 的累积激活像素总数 Per-proto accumulated activated pixel count
     """
     n_protos = proto_module.n_protos
     # 累积统计: 分子=建筑像素, 分母=总激活像素 | Cumulative stats: numerator=building pixels, denominator=total activated

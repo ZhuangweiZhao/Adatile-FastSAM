@@ -23,7 +23,6 @@ class LogBackend(ABC):
     子类化并重写 write() 将记录发送到目标位置。
     Subclass and override write() to send records to a destination.
 
-    Parameters
     ----------
     min_level : str
         最低输出级别，低于此级别的记录被丢弃 | Minimum level to output; records below are dropped.

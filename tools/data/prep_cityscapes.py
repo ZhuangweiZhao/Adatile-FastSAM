@@ -11,7 +11,7 @@ Cityscapes 图像 | Images: 2048×1024, ~3000 train / 500 val
 
 输出: {dst}/images/{split}/ + {dst}/masks/{split}/
 
-用法 | Usage:
+用法 | Usage::
     python tools/prep_cityscapes.py
     python tools/prep_cityscapes.py --src /root/autodl-pub/cityscapes --dst /root/autodl-tmp/cityscapes_tiles
 """

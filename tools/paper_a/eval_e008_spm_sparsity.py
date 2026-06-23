@@ -19,7 +19,7 @@ E008: SPM Sparsity Validation — Proto 激活是否天然稀疏？
     → 消除 distribution shift。Head 和 Protos 都适配稀疏推理。
     → 预期：K=2 Dice 接近全量。
 
-用法 | Usage:
+用法 | Usage::
     python tools/eval_e008_spm_sparsity.py                          # E008-A (default)
     python tools/eval_e008_spm_sparsity.py --mode post-hoc-weighted  # E008-B
     python tools/eval_e008_spm_sparsity.py --mode train-sparse --train-k 2  # E008-C
@@ -109,15 +109,19 @@ class ProtoHead(nn.Module):
         """
         稀疏前向 | Sparse forward: 每个位置只保留 Top-K Proto。
 
-        Args:
-            p4:     [1, 1280, H/16, W/16]
-            k:      number of prototypes to keep per position
-            ranking: "sim" = top-K by raw similarity (E008-A)
-                     "head-weighted" = top-K by |w * sim| (E008-B, E008-C)
+        :param p4: [1, 1280, H/16, W/16]
+        :type p4: torch.Tensor
 
-        Returns:
-            logit_sparse: [1, 1, H/16, W/16]
-            sparsity_mask: [1, N, H/16, W/16]
+        :param k: number of prototypes to keep per position
+        :type k: int
+
+        :param ranking: "sim" = top-K by raw similarity (E008-A) "head-weighted" = top-K by |w * sim| (E008-B, E008-C)
+        :type ranking: str
+
+        :param temperature: 
+        :type temperature: float
+
+        :return: logit_sparse: [1, 1, H/16, W/16] sparsity_mask: [1, N, H/16, W/16]
         """
         embedding, sim_maps, _ = self.forward(p4, temperature)
         B, N, H, W = sim_maps.shape
@@ -351,8 +355,8 @@ def analyze_sparsity(proto_head, backbone, val_ds, device, args, ranking: str):
     """
     Top-K 稀疏推理 + 能量统计.
 
-    Args:
-        ranking: "sim" (E008-A) or "head-weighted" (E008-B, E008-C)
+    :param ranking: "sim" (E008-A) or "head-weighted" (E008-B, E008-C)
+    :type ranking: str
     """
     proto_head.eval()
     K_values = [1, 2, 3, 4, 6, args.n_protos]

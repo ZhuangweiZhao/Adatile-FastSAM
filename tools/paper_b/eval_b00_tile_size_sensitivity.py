@@ -28,7 +28,7 @@ Paper B 动机实验：Tile 尺寸对空间稀疏性的影响。
     → 1024 在"省计算"和"高覆盖"之间达到理论最优
     → 为 AdaTile 的 tile 尺寸选择提供理论依据
 
-用法 | Usage:
+用法 | Usage::
     python tools/eval_b00_tile_size_sensitivity.py
     python tools/eval_b00_tile_size_sensitivity.py --max-images 200 --workers 8
 """

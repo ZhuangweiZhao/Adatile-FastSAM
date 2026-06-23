@@ -18,7 +18,7 @@ E011-T 的补充实验: 固定 tile=1024, 扫描 N ∈ {2,4,8,16,32,64}
     - BG-Dominant Proto count
     - Proto Entropy
 
-用法 | Usage:
+用法 | Usage::
     python tools/eval_e011u_proto_capacity.py --max-tiles 2000 --epochs 30
 """
 
@@ -83,10 +83,7 @@ class ProtoHead(nn.Module):
         """
         前向传播 | Forward pass.
 
-        Returns:
-            embedding: [B, D, H, W] 低维嵌入
-            sim_maps:  [B, N, H, W] proto 相似度图
-            logit:     [B, C, H, W] 多类别 logit
+        :return: embedding: [B, D, H, W] 低维嵌入 sim_maps:  [B, N, H, W] proto 相似度图 logit:     [B, C, H, W] 多类别 logit
         """
         emb = self.project(p4)
         emb_n = F.normalize(emb, dim=1, p=2)
@@ -102,8 +99,7 @@ def train_proto(proto_head, backbone, train_ds, args, device):
     使用多类别交叉熵 (ignore_index=255) 训练。
     Validation 在 train subset 上快速评估 (节省全量 val 时间)。
 
-    Returns:
-        best_miou: 最佳验证 mIoU
+    :return: best_miou: 最佳验证 mIoU
     """
     proto_head.train()
     opt = torch.optim.Adam(proto_head.parameters(), lr=args.lr)
@@ -178,8 +174,7 @@ def analyze_proto(proto_head, backbone, val_ds, device, args):
       - n_active:      活跃 Proto 数 (总像素 >100)
       - entropy:       平均 Proto 类别熵
 
-    Returns:
-        dict with keys: miou, eff_n, n_bg, n_active, entropy
+    :return: dict with keys: miou, eff_n, n_bg, n_active, entropy
     """
     proto_head.eval()
     n_p = proto_head.n_protos

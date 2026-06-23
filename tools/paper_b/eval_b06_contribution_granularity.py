@@ -6,7 +6,7 @@ Contribution Imbalance vs Tile Granularity — 贡献不均衡是否跨粒度稳
 加载已有 Decoder → 按不同 tile 尺寸切分 → 逐 tile 测 IoU → IoU 排名 → 算保留率。
 纯推理，不需训练。回答：tile 越小，contribution imbalance 是否越显著？
 
-用法:
+用法::
     # Vaihingen
     python tools/paper_b/eval_b06_contribution_granularity.py \
         --tile-root data/Vaihingen --dataset vaihingen \

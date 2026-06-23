@@ -17,7 +17,7 @@ B-03 围绕"密度预测"这一核心来设计 Router，并消融各组件的贡
     监督信号 = fg_ratio → Router 应该预测"前景密度"，而非"边缘"或"纹理".
     R3 的存在只是为了向审稿人证明：Edge 信号已被密度隐式捕获, 无需显式建模.
 
-用法 | Usage:
+用法 | Usage::
     python tools/eval_b03_router_architecture.py
     python tools/eval_b03_router_architecture.py --routers R0,R2,R3 --epochs 20
     python tools/eval_b03_router_architecture.py --routers R1 --epochs 10

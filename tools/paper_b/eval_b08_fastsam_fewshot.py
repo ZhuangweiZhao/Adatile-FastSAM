@@ -18,7 +18,7 @@ Answer the foundational question: can a frozen FastSAM backbone support few-shot
     - FastSAM + LinearProbe (1×1 conv only, no spatial reasoning)
     - ResNet50 + LightDecoder (ablation: is FastSAM better than RN50?)
 
-用法 | Usage:
+用法 | Usage::
     python tools/paper_b/eval_b08_fastsam_fewshot.py \
         --tile-root data/LoveDA --dataset loveda \
         --shots 1,3,5 --episodes 200 --output-dir runs/b08_loveda

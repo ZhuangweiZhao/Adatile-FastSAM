@@ -15,7 +15,7 @@ B-07: Contribution Ground Truth — 定义并计算每个 tile 的真实贡献
     ├── contribution_labels.json       # 每个 tile 的贡献标签
     └── contribution_analysis.png      # 分布 + vs fg_ratio 散点
 
-用法:
+用法::
     # Vaihingen
     python tools/paper_b/eval_b07_contribution_gt.py \
         --tile-root data/Vaihingen --dataset vaihingen \
@@ -83,9 +83,7 @@ def compute_contribution_labels(images, backbone, decoder, num_classes, device):
     """
     对每张图: 逐 tile 跑 Decoder → Leave-One-Out → Contribution_i = ΔmIoU.
 
-    Returns:
-        labels: list of dicts, each with {img_idx, tile_idx, y0,y1,x0,x1,
-                tile_iou, fg_ratio, contribution, n_tiles_in_image}
+    :return: labels: list of dicts, each with {img_idx, tile_idx, y0,y1,x0,x1, tile_iou, fg_ratio, contribution, n_tiles_in_image}
     """
     labels = []
 

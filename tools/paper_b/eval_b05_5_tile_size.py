@@ -29,7 +29,7 @@ B-04/B-05 在 1024px tile 下: K=50% → 仅 6 tile/图, 保留率 ~68%。
     ├── tile_size_ablation.png      # 4-panel figure
     └── tile_size_ablation.json     # Summary
 
-用法 | Usage:
+用法 | Usage::
     python tools/paper_b/eval_b05_5_tile_size.py \
         --src-root data/iSAID_processed \
         --decoder-ckpt runs/b04_v3/decoder_best.pt \
@@ -106,20 +106,15 @@ def analyze_one_image(img_np, gt_full, tile_size, backbone, decoder, device):
     """
     按 tile_size 切全图 → 逐 tile 过 Decoder → 记录 fg_ratio + pred。
 
-    Args:
-        img_np:   [H, W, 3] uint8
-        gt_full:  [H, W] uint8
-        tile_size: int
-        backbone, decoder: models
-        device: torch device
+    :param img_np: [H, W, 3] uint8
 
-    Returns:
-        tiles: list of dicts with keys:
-            y0, y1, x0, x1, th, tw (tile 在全图坐标 | full-image coords)
-            pred       [th, tw] int64 prediction
-            fg_ratio   float foreground pixel fraction
-            gt_tile    [th, tw] uint8 GT for this tile
-        n_ty, n_tx: int
+    :param gt_full: [H, W] uint8
+
+    :param tile_size: int backbone, decoder: models
+
+    :param device: torch device
+
+    :return: tiles: list of dicts with keys: y0, y1, x0, x1, th, tw (tile 在全图坐标 | full-image coords) pred       [th, tw] int64 prediction fg_ratio   float foreground pixel fraction gt_tile    [th, tw] uint8 GT for this tile n_ty, n_tx: int
     """
     H, W = img_np.shape[:2]
     n_ty = (H + tile_size - 1) // tile_size

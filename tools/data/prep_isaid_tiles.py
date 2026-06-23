@@ -34,7 +34,7 @@ iSAID 离线切 Tile + 元数据 | Offline Tile Preprocessing + Metadata
         ├── val.json
         └── test.json
 
-用法 | Usage:
+用法 | Usage::
     python tools/prep_isaid_tiles.py --max-images 50          # 快速测试
     python tools/prep_isaid_tiles.py --steps 1                 # 只渲染全图 mask
     python tools/prep_isaid_tiles.py --steps 2                 # 只切 tile

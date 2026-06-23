@@ -35,15 +35,20 @@ def compute_dice(
         Fix: use sum(dim=...) directly along spatial dims,
         avoiding reshape/unsqueeze pitfalls.
 
-    Args:
-        pred:   预测张量 [B, C, H, W] 或 [B, H, W] | Prediction tensor.
-        target: 目标张量 [B, C, H, W] 或 [B, H, W] | Target tensor.
-        smooth: 平滑项防止除零 | Smoothing term to prevent division by zero.
-        per_class: 如果 True，返回每类的 Dice [C]；否则返回均值标量。
-                   If True, return per-class Dice [C]; else return mean scalar.
+    :param pred: 预测张量 [B, C, H, W] 或 [B, H, W] | Prediction tensor.
+    :type pred: torch.Tensor
 
-    Returns:
-        Scalar tensor (mean Dice) or [C] tensor (per-class Dice).
+    :param target: 目标张量 [B, C, H, W] 或 [B, H, W] | Target tensor.
+    :type target: torch.Tensor
+
+    :param smooth: 平滑项防止除零 | Smoothing term to prevent division by zero.
+    :type smooth: float
+
+    :param per_class: 如果 True，返回每类的 Dice [C]；否则返回均值标量。 If True, return per-class Dice [C]; else return mean scalar.
+    :type per_class: bool
+
+    :return: Scalar tensor (mean Dice) or [C] tensor (per-class Dice).
+    :rtype: torch.Tensor
     """
     # ── 输入标准化 | Input normalization ──
     # 确保是 float 类型 | Ensure float type

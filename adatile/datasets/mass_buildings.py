@@ -52,7 +52,6 @@ class MassachusettsBuildingsDataset(BaseSegDataset):
     - RGB labels → auto-converted to binary mask
     - No COCO JSON, directly uses PNG files in directories
 
-    Parameters
     ----------
     root_dir : str
         数据集根目录 | Dataset root directory.
@@ -139,10 +138,8 @@ class MassachusettsBuildingsDataset(BaseSegDataset):
             - 转换：取 R 通道 > 128 → 1, 否则 → 0
             - Convert: R channel > 128 → 1, else → 0
 
-        Returns:
-            torch.Tensor [1, H, W] float32, 二值 (0/1) | Binary (0/1).
-            语义分割：始终返回 [1, H, W]（单通道）。
-            Semantic: always returns [1, H, W] (single channel).
+        :return: torch.Tensor [1, H, W] float32, 二值 (0/1) | Binary (0/1). 语义分割：始终返回 [1, H, W]（单通道）。 Semantic: always returns [1, H, W] (single channel).
+        :rtype: torch.Tensor
         """
         filename = self._image_files[index]
         label_path = self._label_dir / filename
@@ -204,13 +201,20 @@ class MassachusettsBuildingsDataset(BaseSegDataset):
         """
         从全图中提取瓦片 | Extract tile from full image.
 
-        Args:
-            image: [C, H, W] 全图 | Full image.
-            masks: [1, H, W] 全尺寸掩码 | Full-size mask.
-            x, y:  瓦片左上角坐标 | Tile top-left coordinates.
+        :param image: [C, H, W] 全图 | Full image.
+        :type image: torch.Tensor
 
-        Returns:
-            (tile_image [C, th, tw], tile_masks [1, th, tw])
+        :param masks: [1, H, W] 全尺寸掩码 | Full-size mask. x, y:  瓦片左上角坐标 | Tile top-left coordinates.
+        :type masks: torch.Tensor
+
+        :param x: 
+        :type x: int
+
+        :param y: 
+        :type y: int
+
+        :return: (tile_image [C, th, tw], tile_masks [1, th, tw])
+        :rtype: tuple[torch.Tensor, torch.Tensor]
         """
         ts = self._tile_size
         _, h, w = image.shape

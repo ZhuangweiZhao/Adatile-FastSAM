@@ -146,15 +146,15 @@ def get_ranked_indices(tiles_info, strategy, rng=None, full_miou=None):
     """
     按指定策略排序 → 返回 tile 索引 (从最重要到最不重要).
 
-    Args:
-        tiles_info: list of per-tile dicts
-        strategy: "random" | "fg_ratio" | "tile_iou" | "contribution"
-        rng: np.random.RandomState (for "random")
-        full_miou: float, 全图 mIoU (仅 "contribution" 需要)
+    :param tiles_info: list of per-tile dicts
 
-    Returns:
-        ranked_indices: [idx_most_important, ..., idx_least_important]
-        importances: importance score per tile (for analysis/plotting)
+    :param strategy: "random" | "fg_ratio" | "tile_iou" | "contribution"
+
+    :param rng: np.random.RandomState (for "random")
+
+    :param full_miou: float, 全图 mIoU (仅 "contribution" 需要)
+
+    :return: ranked_indices: [idx_most_important, ..., idx_least_important] importances: importance score per tile (for analysis/plotting)
     """
     n = len(tiles_info)
 

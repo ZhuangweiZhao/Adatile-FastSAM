@@ -20,7 +20,7 @@ B-00 证明 Spatial Sparsity 存在。B-01 回答核心问题：
     "Top 30% tiles → X% FG retained"
     → 大量空间计算可以安全丢弃
 
-用法 | Usage:
+用法 | Usage::
     python tools/eval_b01_oracle_topk.py
     python tools/eval_b01_oracle_topk.py --max-images 500 --workers 8
 """

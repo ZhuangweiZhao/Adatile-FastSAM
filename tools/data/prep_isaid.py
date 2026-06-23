@@ -24,7 +24,7 @@ iSAID 数据处理 — 解压 DOTA 图像 + 重组目录 + 修正标注
     └── test/
         └── images/              # *.png
 
-用法 | Usage:
+用法 | Usage::
     python tools/prep_isaid.py
     python tools/prep_isaid.py --skip-extract  # 图像已解压
 """
@@ -65,8 +65,8 @@ def extract_zips(zip_dir: Path, output_dir: Path, dry_run: bool = False) -> dict
 
     增量检测 | Incremental: 跳过已存在的 PNG | Skip already-existing PNGs.
 
-    Returns:
-        {"total": N, "exist": N, "extracted": N}
+    :return: {"total": N, "exist": N, "extracted": N}
+    :rtype: dict
     """
     img_dir = output_dir / "images"
     img_dir.mkdir(parents=True, exist_ok=True)
@@ -161,8 +161,8 @@ def fix_annotations(json_path: Path, output_path: Path, images_dir: Path,
     1. 映射 category IDs → ISAIDDataset.ISAID_CATEGORIES
     2. 补全 image height/width (并行读取 | parallel read)
 
-    Returns:
-        {"fixed_cat": N, "fixed_hw": N, "skipped": bool, "msg": str}
+    :return: {"fixed_cat": N, "fixed_hw": N, "skipped": bool, "msg": str}
+    :rtype: dict
     """
     from PIL import Image
     from concurrent.futures import ThreadPoolExecutor

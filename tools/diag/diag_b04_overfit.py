@@ -6,7 +6,7 @@ B-04 诊断: 可视化 + Overfit 测试 | Diagnostics: Visualization + Overfit
 ① 可视化: 保存 GT vs Pred 的对照图, 看模型到底预测了什么
 ② Overfit: 只训练 20 tile, 100 epoch, 验证模型能力上限
 
-用法 | Usage:
+用法 | Usage::
     python tools/diag_b04_overfit.py --tile-root /root/autodl-tmp/iSAID_tiles
 """
 
@@ -126,13 +126,13 @@ COLOR_MAP = [
 # ═══════════════════════════════════════════════════════════════════
 
 def overfit_test(args, device):
-    """20 tile × 100 epoch 过拟合测试 — 验证模型能力上限 | Overfit test — verify model capacity upper bound.
+    """
+    20 tile × 100 epoch 过拟合测试 — 验证模型能力上限 | Overfit test — verify model capacity upper bound.
 
     如果 Decoder 无法过拟合 20 个 tile，说明架构本身有问题。
-    If the Decoder cannot overfit 20 tiles, the architecture itself is the problem.
+        If the Decoder cannot overfit 20 tiles, the architecture itself is the problem.
 
-    Returns:
-        (decoder, backbone) trained models.
+    :return: (decoder, backbone) trained models.
     """
     logger.log_info("diag", "=" * 50)
     logger.log_info("diag", "Overfit Test: 20 tiles × 100 epochs | 过拟合测试: 20 tile × 100 epoch")

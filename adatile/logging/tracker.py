@@ -83,7 +83,6 @@ class _MetricState:
         """
         返回当前统计快照 | Return current statistics as a dict.
 
-        Returns
         -------
         dict with keys: mean, ema, min, max, std, count, latest
         """
@@ -131,7 +130,6 @@ class MetricTracker:
     线程安全说明：GIL 保护字典操作，无需额外锁。
     Thread-safety: GIL protects dict operations, no extra locks needed.
 
-    Parameters
     ----------
     window_size : int
         每个 key 保留的最近值数量 | Number of recent values to keep per key.
@@ -173,14 +171,12 @@ class MetricTracker:
         获取某个 key 的特定统计量 | Get a specific statistic for a key.
         例如 | e.g.: tracker.get_value("loss", "ema") → 指数移动平均
 
-        Parameters
         ----------
         key : str
             指标键名 | Metric key name.
         stat : str
             统计量名：mean, ema, min, max, std, count, latest
 
-        Returns
         -------
         float: 统计量值，key 不存在返回 0.0 | Returns 0.0 if key unseen.
         """

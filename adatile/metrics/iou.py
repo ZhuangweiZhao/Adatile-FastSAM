@@ -34,17 +34,23 @@ def compute_miou(
         - One-hot：pred [B,C,H,W], target [B,C,H,W]
           One-hot: pred [B,C,H,W], target [B,C,H,W]
 
-    Args:
-        pred:        预测张量 | Prediction tensor.
-        target:      目标张量 | Target tensor.
-        num_classes: 类别总数 | Total number of classes.
-        ignore_index: 忽略的标签值 | Label value to ignore (default -1 = none).
-        eps:         数值稳定项 | Numerical stability term.
+    :param pred: 预测张量 | Prediction tensor.
+    :type pred: torch.Tensor
 
-    Returns:
-        dict with:
-            "miou":      float — 所有类别的平均 IoU | Mean IoU over all classes
-            "iou_cls_i": float — 每个类别的 IoU | Per-class IoU
+    :param target: 目标张量 | Target tensor.
+    :type target: torch.Tensor
+
+    :param num_classes: 类别总数 | Total number of classes.
+    :type num_classes: int
+
+    :param ignore_index: 忽略的标签值 | Label value to ignore (default -1 = none).
+    :type ignore_index: int
+
+    :param eps: 数值稳定项 | Numerical stability term.
+    :type eps: float
+
+    :return: dict with: "miou":      float — 所有类别的平均 IoU | Mean IoU over all classes "iou_cls_i": float — 每个类别的 IoU | Per-class IoU
+    :rtype: dict[str, float]
     """
     # ── 输入标准化：统一为 [B, H, W] 标签格式 ──
     # Normalize input: convert to [B, H, W] label format

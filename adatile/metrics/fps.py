@@ -26,7 +26,7 @@ class FPSMeter:
     支持 GPU 和 CPU 两种计时模式。
     Supports both GPU and CPU timing modes.
 
-    Usage:
+    Usage::
         >>> meter = FPSMeter(warmup=10, num_runs=100)
         >>> for batch in dataloader:
         ...     with meter:
@@ -39,9 +39,11 @@ class FPSMeter:
         """
         初始化 FPS 测量器 | Initialize FPS meter.
 
-        Args:
-            warmup:   预热运行次数（不计入统计）| Number of warmup runs (excluded from stats).
-            num_runs: 最多保留的计时次数 | Maximum number of timings to retain.
+        :param warmup: 预热运行次数（不计入统计）| Number of warmup runs (excluded from stats).
+        :type warmup: int
+
+        :param num_runs: 最多保留的计时次数 | Maximum number of timings to retain.
+        :type num_runs: int
         """
         self._warmup = warmup
         self._num_runs = num_runs
@@ -98,9 +100,8 @@ class FPSMeter:
 
         FPS = 1 / 平均耗时(秒) | average duration (seconds).
 
-        Returns:
-            float: FPS 值。如果没有有效计时，返回 -1.0。
-                   FPS value. -1.0 if no valid timings.
+        :return: float: FPS 值。如果没有有效计时，返回 -1.0。 FPS value. -1.0 if no valid timings.
+        :rtype: float
         """
         if not self._times:
             return -1.0

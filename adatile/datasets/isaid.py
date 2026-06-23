@@ -81,7 +81,6 @@ class ISAIDDataset(BaseSegDataset):
             sample["mask"]  → [H, W] 语义类别标签 | semantic class labels (0=bg, 1-15)
             sample["masks"] → 不可用 | not available
 
-    Parameters
     ----------
     root_dir : str
         iSAID 数据集根目录 | iSAID dataset root directory.
@@ -109,7 +108,6 @@ class ISAIDDataset(BaseSegDataset):
         transforms=None,
     ) -> None:
         """
-        Parameters
         ----------
         semantic : bool
             True = 返回语义标签 [H, W] (category IDs)
@@ -176,13 +174,20 @@ class ISAIDDataset(BaseSegDataset):
         边界瓦片自动补零到 tile_size × tile_size (YOLOv8 要求尺寸一致)。
         Edge tiles auto-padded to tile_size × tile_size for YOLOv8 compatibility.
 
-        Args:
-            image: [C, H, W] 全图 | Full image.
-            masks: [N, H, W] 全尺寸掩码 | Full-size masks.
-            x, y:  瓦片左上角坐标 | Tile top-left coordinates.
+        :param image: [C, H, W] 全图 | Full image.
+        :type image: torch.Tensor
 
-        Returns:
-            (tile_image [C, ts, ts], tile_masks [N, ts, ts])
+        :param masks: [N, H, W] 全尺寸掩码 | Full-size masks. x, y:  瓦片左上角坐标 | Tile top-left coordinates.
+        :type masks: torch.Tensor
+
+        :param x: 
+        :type x: int
+
+        :param y: 
+        :type y: int
+
+        :return: (tile_image [C, ts, ts], tile_masks [N, ts, ts])
+        :rtype: tuple[torch.Tensor, torch.Tensor]
         """
         ts = self._tile_size
         _, h, w = image.shape
@@ -270,11 +275,11 @@ class ISAIDDataset(BaseSegDataset):
             - 重叠区域 → 后渲染的实例覆盖先渲染的
             - Overlapping regions → later instances overwrite earlier ones
 
-        Args:
-            index: 图像在 self._image_infos 中的索引
+        :param index: 图像在 self._image_infos 中的索引
+        :type index: int
 
-        Returns:
-            torch.Tensor [H, W] int64, 语义标签 | semantic labels
+        :return: torch.Tensor [H, W] int64, 语义标签 | semantic labels
+        :rtype: torch.Tensor
         """
         info = self._image_infos[index]
         img_id = info["id"]
@@ -388,13 +393,17 @@ class ISAIDDataset(BaseSegDataset):
         支持 COCO 多边形 segmentation 格式。
         Supports COCO polygon segmentation format.
 
-        Args:
-            ann: COCO 标注字典 | COCO annotation dict.
-            h:   图像高度 | Image height.
-            w:   图像宽度 | Image width.
+        :param ann: COCO 标注字典 | COCO annotation dict.
+        :type ann: dict
 
-        Returns:
-            torch.Tensor [H, W] float32, 二值 (0/1) | Binary (0/1).
+        :param h: 图像高度 | Image height.
+        :type h: int
+
+        :param w: 图像宽度 | Image width.
+        :type w: int
+
+        :return: torch.Tensor [H, W] float32, 二值 (0/1) | Binary (0/1).
+        :rtype: torch.Tensor
         """
         seg = ann.get("segmentation", [])
 
@@ -528,11 +537,11 @@ class ISAIDDataset(BaseSegDataset):
         """
         根据类别 ID 获取名称 | Get category name by ID.
 
-        Args:
-            cat_id: 类别 ID (1-15) | Category ID.
+        :param cat_id: 类别 ID (1-15) | Category ID.
+        :type cat_id: int
 
-        Returns:
-            str: 类别名称 | Category name.
+        :return: str: 类别名称 | Category name.
+        :rtype: str
         """
         return _CAT_ID_TO_NAME.get(cat_id, f"unknown_{cat_id}")
 
@@ -540,10 +549,10 @@ class ISAIDDataset(BaseSegDataset):
         """
         根据名称获取类别 ID | Get category ID by name.
 
-        Args:
-            name: 类别名称 | Category name.
+        :param name: 类别名称 | Category name.
+        :type name: str
 
-        Returns:
-            int: 类别 ID, 未知返回 -1 | Category ID, -1 if unknown.
+        :return: int: 类别 ID, 未知返回 -1 | Category ID, -1 if unknown.
+        :rtype: int
         """
         return _CAT_NAME_TO_ID.get(name, -1)

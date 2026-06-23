@@ -16,7 +16,7 @@ Single script: Decoder training → Oracle Importance → Decoder Diag → Tile 
     - 数据集无关 | Dataset-agnostic
     - 零外部依赖（除adatile + torch）| No external deps beyond adatile + torch
 
-用法 | Usage:
+用法 | Usage::
     # iSAID
     python tools/paper_b/eval_paper_b_pipeline.py \
         --tile-root data/iSAID_tiles --dataset isaid \

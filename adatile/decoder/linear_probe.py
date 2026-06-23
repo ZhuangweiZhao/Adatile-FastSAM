@@ -40,7 +40,6 @@ class LinearProbe(nn.Module):
     极简参数量的分割头，用于验证 backbone 特征质量。
     Ultra-low-parameter segmentation head for verifying backbone feature quality.
 
-    Parameters
     ----------
     in_channels : int
         输入通道数（P4 的通道数）| Input channels (P4 channels).
@@ -67,12 +66,11 @@ class LinearProbe(nn.Module):
         """
         前向传播 | Forward pass.
 
-        Args:
-            features: backbone 输出 {"p4": [B, C, H/16, W/16], "p8": ...}
-                      Backbone output.
+        :param features: backbone 输出 {"p4": [B, C, H/16, W/16], "p8": ...} Backbone output.
+        :type features: dict[str, torch.Tensor]
 
-        Returns:
-            torch.Tensor [B, 1, H_orig, W_orig] 二值预测 | Binary prediction.
+        :return: torch.Tensor [B, 1, H_orig, W_orig] 二值预测 | Binary prediction.
+        :rtype: torch.Tensor
         """
         x = features["p4"]  # [B, C, H/16, W/16]
 
@@ -90,12 +88,14 @@ class LinearProbe(nn.Module):
         """
         预测并上采样到目标尺寸 | Predict and upsample to target size.
 
-        Args:
-            features:    backbone 输出 | Backbone output.
-            target_size: (H, W) 目标尺寸 | Target spatial size.
+        :param features: backbone 输出 | Backbone output.
+        :type features: dict[str, torch.Tensor]
 
-        Returns:
-            torch.Tensor [B, 1, H, W] 二值 mask (0/1) | Binary mask.
+        :param target_size: (H, W) 目标尺寸 | Target spatial size.
+        :type target_size: tuple[int, int]
+
+        :return: torch.Tensor [B, 1, H, W] 二值 mask (0/1) | Binary mask.
+        :rtype: torch.Tensor
         """
         prob = self.forward(features)  # [B, 1, H_feat, W_feat]
 

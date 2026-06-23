@@ -14,7 +14,7 @@ B-04 数据诊断 | Tile Dataset Diagnostics
     验证数据集预处理是否正确，确定 FG>5% 过滤阈值是否合理。
     Verify dataset preprocessing correctness, determine if FG>5% filter threshold is appropriate.
 
-用法 | Usage:
+用法 | Usage::
     python tools/diag/diag_b04_tiles.py --tile-root data/iSAID_tiles
 """
 
@@ -30,10 +30,11 @@ from adatile.datasets.isaid_tiles import FastISAIDTileDataset
 
 
 def diagnose(root: str):
-    """对 train/val 分片执行数据质量诊断 | Run data quality diagnostics on train/val splits.
+    """
+    对 train/val 分片执行数据质量诊断 | Run data quality diagnostics on train/val splits.
 
-    Args:
-        root: Tile 数据集根目录 | Tile dataset root directory.
+    :param root: Tile 数据集根目录 | Tile dataset root directory.
+    :type root: str
     """
     for split in ["train", "val"]:
         # 加载数据集 | Load dataset

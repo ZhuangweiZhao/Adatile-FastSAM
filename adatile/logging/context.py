@@ -88,7 +88,6 @@ class LogContext:
     tags 行为特殊：内层的 tags 与外层取并集，而非覆盖。
     Special tag behavior: inner tags are UNIONED with outer tags, not replaced.
 
-    Parameters
     ----------
     phase : str | None
         流水线阶段 (train, val, test, infer) | Pipeline phase.

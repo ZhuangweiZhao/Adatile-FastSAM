@@ -6,7 +6,7 @@ E009 快速诊断 | Quick Diagnosis: train/val/test 独立对比
 如果 train Dice 接近 val Dice → 真实提升。
 如果 train Dice 正常 (0.46) 而 val Dice 异常高 (0.52) → 过拟合 val / 泄漏。
 
-用法 | Usage:
+用法 | Usage::
     python tools/eval_e009_verify.py --checkpoint runs/exp_e009_spm_k4_*/spm_head_s2.pt
 """
 
@@ -45,8 +45,7 @@ def eval_on_dataset(spm_head, backbone, dataset, device, args):
 
     Compares Learned (SPM Router), Fixed (|w·sim|), and Full (all protos) modes.
 
-    Returns:
-        dict with keys "learned", "fixed", "full", each → (mean, std) tuple.
+    :return: dict with keys "learned", "fixed", "full", each → (mean, std) tuple.
     """
     spm_head.eval()
     dice_learned, dice_fixed, dice_full = [], [], []

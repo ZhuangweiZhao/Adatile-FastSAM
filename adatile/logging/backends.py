@@ -58,7 +58,6 @@ class ConsoleBackend(LogBackend):
     不同日志级别使用不同 ANSI 颜色代码。
     Different log levels use different ANSI color codes.
 
-    Parameters
     ----------
     min_level : str
         最低输出级别 | Minimum output level (default "DEBUG").
@@ -110,7 +109,6 @@ class FileBackend(LogBackend):
     - 文件追加模式，每次运行写入同一个文件
       Append mode — each run appends to the same file
 
-    Parameters
     ----------
     filepath : str | Path
         输出文件路径 | Output file path.
@@ -260,7 +258,6 @@ class WandbBackend(LogBackend):
     标量 METRIC → wandb.log()
     其他记录  → wandb.summary / notes
 
-    Parameters
     ----------
     project : str
         W&B 项目名 | W&B project name.

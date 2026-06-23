@@ -26,7 +26,7 @@ E007-B 在 iSAID 15 类场景的复现。验证 Proto 机制是否在
     H1: Proto 的 Silhouette 显著高于 Embedding (表示空间结构化)
     H2: 16 proto 自发形成类别语义分化
 
-用法 | Usage:
+用法 | Usage::
     python tools/eval_e010_isaid_mc.py --max-tiles 200
     python tools/eval_e010_isaid_mc.py --n-protos 16 --epochs 30
 """
@@ -316,9 +316,7 @@ def analyze_proto_semantics(proto_head, backbone, val_ds, device, num_classes):
     对每个 proto，统计其被 winner-take-all 分配到的像素中各类别的占比。
     For each proto, count what classes the pixels assigned to it belong to.
 
-    Returns:
-        proto_class_pct:    [N, C] 归一化类别占比 (行和为1) | normalized class proportions
-        proto_class_counts: [N, C] 原始计数 | raw counts
+    :return: proto_class_pct:    [N, C] 归一化类别占比 (行和为1) | normalized class proportions proto_class_counts: [N, C] 原始计数 | raw counts
     """
     proto_head.eval()
     n_protos = proto_head.n_protos

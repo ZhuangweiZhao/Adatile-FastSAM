@@ -13,7 +13,7 @@ B-02 回答核心问题：模型能学到吗？
     GT:   每个 tile 的 fg_ratio
     Loss:  MSE(pred_score, gt_fg_ratio)
 
-用法 | Usage:
+用法 | Usage::
     python tools/eval_b02_learnability.py
     python tools/eval_b02_learnability.py --train-images 500 --epochs 30 --batch-size 8
 """

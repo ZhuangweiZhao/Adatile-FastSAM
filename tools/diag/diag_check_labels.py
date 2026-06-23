@@ -9,7 +9,7 @@ Quick check: do train and val masks use the same pixel values?
     2. 在 train 和 val 中各找几个包含该类的 tile
     3. 看 mask 中该类的像素值是否一致
 
-用法 | Usage:
+用法 | Usage::
     python tools/diag_quick_check.py --tile-root /root/autodl-tmp/iSAID_tiles
 """
 

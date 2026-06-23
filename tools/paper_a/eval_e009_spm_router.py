@@ -28,7 +28,7 @@ E009: SPM Router — 两阶段学习式路由 | Two-Stage Learned Routing
     Fixed (|w·sim|): |head_w · sim| → Top-K
     Sim (raw):       sim → Top-K (reference)
 
-用法 | Usage:
+用法 | Usage::
     python tools/eval_e009_spm_router.py
     python tools/eval_e009_spm_router.py --proto-checkpoint path/to/proto_head.pt
 """
@@ -195,9 +195,17 @@ class SPMHead(nn.Module):
         """
         路由前向 | Routed forward.
 
-        Args:
-            mode: "learned" = SPM Router, "fixed" = |w·sim|, "sim" = raw sim
-            k:    override router_k (for multi-K comparison)
+        :param mode: "learned" = SPM Router, "fixed" = |w·sim|, "sim" = raw sim
+        :type mode: str
+
+        :param k: override router_k (for multi-K comparison)
+        :type k: int
+
+        :param p4: 
+        :type p4: torch.Tensor
+
+        :param temperature: 
+        :type temperature: float
         """
         if k is None:
             k = self.router_k

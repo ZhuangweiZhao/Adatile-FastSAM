@@ -14,7 +14,7 @@ Paper B-01: Spatial Sparsity Baseline — 多少 tile 是空的？
 Tile metadata 格式 (prep_isaid_tiles.py --steps 3 生成):
     {tile_name, img_id, tile_idx, fg_ratio, fg_pixels, total_pixels, class_distribution}
 
-用法 | Usage:
+用法 | Usage::
     python tools/eval_b01_spatial_baseline.py
     python tools/eval_b01_spatial_baseline.py --metadata data/iSAID_tiles/metadata/train.json
 """

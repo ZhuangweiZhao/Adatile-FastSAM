@@ -4,7 +4,7 @@
 统一所有实验脚本的随机种子设置。
 Unified random seed setup for all experiment scripts.
 
-用法 | Usage:
+用法 | Usage::
     from adatile.utils.seed import set_seed
     set_seed(42)
 """
@@ -25,8 +25,8 @@ def set_seed(seed: int = 42) -> None:
         - PyTorch (CPU + CUDA)
         - cuDNN (deterministic mode)
 
-    Args:
-        seed: 随机种子值 | Random seed value.
+    :param seed: 随机种子值 | Random seed value.
+    :type seed: int
     """
     random.seed(seed)
     np.random.seed(seed)

@@ -14,7 +14,7 @@ V1 关键教训（必须遵守）| V1 critical lessons (must follow):
     3. 钩子位置：stride ≈ 16 和 stride ≈ 32 的层
        Hook locations: layers with stride ≈ 16 and stride ≈ 32
 
-Usage:
+Usage::
     >>> backbone = FastSAMBackbone()
     >>> features = backbone(image_tensor)  # image: [B, 3, H, W]
     >>> print(features["p4"].shape)  # [B, C, H/16, W/16]
@@ -48,7 +48,6 @@ class FastSAMBackbone(nn.Module):
     registers forward hooks to extract intermediate feature maps
     at P4 (stride≈16) and P8 (stride≈32).
 
-    Parameters
     ----------
     checkpoint : str | None
         FastSAM 权重路径。None → 自动使用 'FastSAM-x.pt'。
@@ -123,8 +122,7 @@ class FastSAMBackbone(nn.Module):
         从 thirdLibrary/FastSAM 加载 FastSAM 模型。
         Load FastSAM model from thirdLibrary/FastSAM.
 
-        Returns:
-            FastSAM 实例 | FastSAM instance.
+        :return: FastSAM 实例 | FastSAM instance.
         """
         # 导入 thirdLibrary 中的 FastSAM | Import FastSAM from thirdLibrary
         from fastsam import FastSAM  # type: ignore[import-not-found]
@@ -156,11 +154,10 @@ class FastSAMBackbone(nn.Module):
         """
         创建钩子函数（闭包捕获 idx）| Create hook function (closure captures idx).
 
-        Args:
-            idx: 层索引 | Layer index.
+        :param idx: 层索引 | Layer index.
+        :type idx: int
 
-        Returns:
-            callable: 钩子函数 | Hook function.
+        :return: callable: 钩子函数 | Hook function.
         """
 
         def hook(module, input, output):
@@ -181,8 +178,8 @@ class FastSAMBackbone(nn.Module):
         探测模式：运行一次前向，找到 stride≈16 和 stride≈32 的层。
         Probe mode: run one forward pass, find layers with stride≈16 and stride≈32.
 
-        Args:
-            x: 输入张量 [B, 3, H, W] | Input tensor.
+        :param x: 输入张量 [B, 3, H, W] | Input tensor.
+        :type x: torch.Tensor
         """
         _, _, h_in, w_in = x.shape
         self._features.clear()
@@ -281,11 +278,10 @@ class FastSAMBackbone(nn.Module):
         """
         创建特征提取钩子 | Create feature extraction hook.
 
-        Args:
-            name: 特征名（"p4" 或 "p8"）| Feature name.
+        :param name: 特征名（"p4" 或 "p8"）| Feature name.
+        :type name: str
 
-        Returns:
-            callable: 钩子函数 | Hook function.
+        :return: callable: 钩子函数 | Hook function.
         """
 
         def hook(module, input, output):
@@ -358,8 +354,7 @@ class FastSAMBackbone(nn.Module):
             替代方案：用 requires_grad 控制梯度流。
             Alternative: use requires_grad to control gradient flow.
 
-        Raises:
-            RuntimeError: 总是抛出，因为 train() 不安全 | Always raises, train() is unsafe.
+        :raises RuntimeError: 总是抛出，因为 train() 不安全 | Always raises, train() is unsafe.
         """
         raise RuntimeError(
             "FastSAMBackbone.train() is FORBIDDEN.\n"
@@ -400,14 +395,11 @@ class FastSAMBackbone(nn.Module):
         首次调用时自动探测钩子位置。后续调用直接使用已探测的位置。
         Auto-probes hook locations on first call. Subsequent calls use cached positions.
 
-        Args:
-            x: 输入图像张量 [B, 3, H, W] 值域 [0, 1] 或 [0, 255]
-               Input image tensor [B, 3, H, W] in [0, 1] or [0, 255].
+        :param x: 输入图像张量 [B, 3, H, W] 值域 [0, 1] 或 [0, 255] Input image tensor [B, 3, H, W] in [0, 1] or [0, 255].
+        :type x: torch.Tensor
 
-        Returns:
-            dict with:
-                "p4": [B, C4, H/16, W/16]  stride-16 特征 | stride-16 features
-                "p8": [B, C8, H/32, W/32]  stride-32 特征 | stride-32 features
+        :return: dict with: "p4": [B, C4, H/16, W/16]  stride-16 特征 | stride-16 features "p8": [B, C8, H/32, W/32]  stride-32 特征 | stride-32 features
+        :rtype: dict[str, torch.Tensor]
         """
         # 首次调用：探测钩子位置 | First call: probe hook locations
         if self._hook_p4_idx is None or self._hook_p8_idx is None:
@@ -454,15 +446,13 @@ def build_backbone(name: str = "FastSAM-x", **kwargs) -> FastSAMBackbone:
         - "FastSAM-x": FastSAM 基于 YOLOv8-x | FastSAM on YOLOv8-x
         - "FastSAM-s": FastSAM 基于 YOLOv8-s (TODO) | FastSAM on YOLOv8-s (TODO)
 
-    Args:
-        name: 骨干名称 | Backbone name.
-        **kwargs: 传递给 FastSAMBackbone 的参数 | Args forwarded to FastSAMBackbone.
+    :param name: 骨干名称 | Backbone name. **kwargs: 传递给 FastSAMBackbone 的参数 | Args forwarded to FastSAMBackbone.
+    :type name: str
 
-    Returns:
-        FastSAMBackbone 实例 | FastSAMBackbone instance.
+    :return: FastSAMBackbone 实例 | FastSAMBackbone instance.
+    :rtype: FastSAMBackbone
 
-    Raises:
-        ValueError: 未知的骨干名称 | Unknown backbone name.
+    :raises ValueError: 未知的骨干名称 | Unknown backbone name.
     """
     supported = {"FastSAM-x", "FastSAM-s"}
     if name not in supported:

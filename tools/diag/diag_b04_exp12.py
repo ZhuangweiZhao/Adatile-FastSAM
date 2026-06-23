@@ -7,7 +7,7 @@ B-04 诊断实验 1 & 2 | Diagnostics Exp 1 & 2
 实验 2: Binary Segmentation (FG/BG), 验证定位能力
 日志: Console + File(JSONL), 每5 epoch, 含per-class breakdown
 
-用法:
+用法::
     python tools/diag_b04_exp12.py --tile-root /root/autodl-tmp/iSAID_tiles
 """
 
@@ -40,23 +40,29 @@ COLOR_MAP = [(255,0,0),(0,255,0),(0,0,255),(255,255,0),(255,0,255),
 
 
 def train_eval(decoder, backbone, loader, epochs, device, binary, num_classes, log):
-    """训练与评估循环 | Training and evaluation loop.
+    """
+    训练与评估循环 | Training and evaluation loop.
 
     每 5 epoch 评估一次 per-class IoU，记录完整历史。
-    Evaluates per-class IoU every 5 epochs, records full history.
+        Evaluates per-class IoU every 5 epochs, records full history.
 
-    Args:
-        decoder: LightDecoder 模型 | LightDecoder model
-        backbone: 冻结的 FastSAM backbone | Frozen FastSAM backbone
-        loader: DataLoader
-        epochs: 训练 epoch 数 | Number of training epochs
-        device: cuda/cpu
-        binary: True → FG/BG 二分类 | True → FG/BG binary classification
-        num_classes: 输出通道数 | Number of output channels
-        log: 日志回调函数 | Logging callback function
+    :param decoder: LightDecoder 模型 | LightDecoder model
 
-    Returns:
-        history: list of dict with keys [epoch, loss, miou, bg_pred, per_class_iou]
+    :param backbone: 冻结的 FastSAM backbone | Frozen FastSAM backbone
+
+    :param loader: DataLoader
+
+    :param epochs: 训练 epoch 数 | Number of training epochs
+
+    :param device: cuda/cpu
+
+    :param binary: True → FG/BG 二分类 | True → FG/BG binary classification
+
+    :param num_classes: 输出通道数 | Number of output channels
+
+    :param log: 日志回调函数 | Logging callback function
+
+    :return: history: list of dict with keys [epoch, loss, miou, bg_pred, per_class_iou]
     """
     opt = torch.optim.Adam(decoder.parameters(), lr=1e-3)
     history = []
