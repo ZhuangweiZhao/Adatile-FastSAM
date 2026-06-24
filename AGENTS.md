@@ -57,65 +57,81 @@ All experiment scripts must call `set_seed()` from `adatile.utils.seed`. This se
 
 ```
 adatile/
-├─┢� logging/         �?Structured logging (Console, File/JSONL, Wandb backends)
-├─┢� backbone/        �?FastSAMBackbone (hook P4/P8, eval-mode enforced, freeze control)
-├─┢� config/          �?ExperimentConfig + ExperimentRecorder + generate_exp_id()
-├─┢� metrics/         �?compute_miou, compute_dice, FPSMeter, count_params
-├─┢� decoder/         �?LinearProbe, FusionProbe, LightDecoder, InstanceDecoder
-├─┢� datasets/
-�?  ├─┢� base.py              �?BaseSegDataset
-�?  ├─┢� mass_buildings.py    �?MassBuildings tile dataset
-�?  ├─┢� isaid.py             �?iSAID COCO dataset (full-image)
-�?  └─┢� isaid_tiles.py       鉁?FastISAIDTileDataset (pre-cut 1024×1024 tiles)
-鈹?  鈹溾攢鈹€ loveda_tiles.py      鉁?LoveDA land-cover tiles (7-class dense, SSI<50)
-鈹?  鈹溾攢鈹€ nwpu.py              鉁?NWPU-VHR-10 bbox-based weak masks (10-class)
-鈹?  鈹斺攢鈹€ vaihingen_tiles.py   鉁?Vaihingen tiles (6-class dense semantic)
-├─┢� sparse/
-�?  └─┢� spatial_router.py    �?ForegroundDensityRouter, DensityHead, EdgeHead, TinyCNNRouter
-├─┢� losses/           �?Loss functions (skeleton only)
-└─┢� utils/
-    └─┢� seed.py       �?Unified set_seed() with cuDNN deterministic
+├── logging/         ✅ Structured logging (Console, File/JSONL, Wandb backends)
+├── backbone/        ✅ FastSAMBackbone (hook P4/P8, eval-mode enforced, freeze control)
+├── config/          ✅ ExperimentConfig + ExperimentRecorder + generate_exp_id()
+├── metrics/         ✅ compute_miou, compute_dice, FPSMeter, count_params
+├── decoder/         ✅ LightDecoder, InstanceDecoder, LinearProbe, FusionProbe
+├── datasets/
+│   ├── base.py              ✅ BaseSegDataset
+│   ├── mass_buildings.py    ✅ MassBuildings tile dataset
+│   ├── isaid.py             ✅ iSAID COCO dataset (full-image)
+│   ├── isaid_tiles.py       ✅ FastISAIDTileDataset (pre-cut 1024x1024 tiles)
+│   ├── loveda_tiles.py      ✅ LoveDA land-cover tiles (7-class dense, SSI<50)
+│   ├── nwpu.py              ✅ NWPU-VHR-10 bbox-based weak masks (10-class)
+│   └── vaihingen_tiles.py   ✅ Vaihingen tiles (6-class dense semantic)
+├── sparse/
+│   └── spatial_router.py    ✅ ForegroundDensityRouter, DensityHead, EdgeHead, TinyCNNRouter
+├── losses/           ✅ FocalLoss, DiceLoss, CombinedLoss
+└── utils/
+    ├── seed.py             ✅ Unified set_seed() with cuDNN deterministic
+    ├── label_mapping.py    ✅ Per-split category ID mapping for iSAID
+    └── render.py           ✅ Shared render_semantic_mask() (canonical def)
 
 tools/
-├─┢� data/                            # Data preprocessing
-�?  ├─┢� prep_isaid.py                iSAID COCO �?category-id masks (Step 0)
-�?  ├─┢� prep_isaid_tiles.py       鉁?FastISAIDTileDataset (pre-cut 1024×1024 tiles)
-鈹?  鈹溾攢鈹€ loveda_tiles.py      鉁?LoveDA land-cover tiles (7-class dense, SSI<50)
-鈹?  鈹溾攢鈹€ nwpu.py              鉁?NWPU-VHR-10 bbox-based weak masks (10-class)
-鈹?  鈹斺攢鈹€ vaihingen_tiles.py   鉁?Vaihingen tiles (6-class dense semantic)
-�?  ├─┢� prep_cityscapes.py           Cityscapes �?tile format
-�?  └─┢� fix_labels.py                Repair tool: fix category ID mapping in instances JSON
-�?├─┢� train/                           # Training entry points
-�?  ├─┢� train_isaid_mc.py            iSAID multi-class training entry point
-�?  └─┢� train_b04.py                 B-04 end-to-end: FDR + Decoder training
-�?├─┢� paper_a/                         # Paper A experiments (main branch)
-�?  ├─┢� eval_e007b_proto_vs_embedding.py   Proto vs Embedding fair comparison
-�?  ├─┢� eval_e008_spm_sparsity.py          SPM sparsity validation (A/B/C)
-�?  ├─┢� eval_e009_spm_router.py            Learned vs Fixed Router
-�?  ├─┢� eval_e009d_proto_usage.py          Effective Proto count analysis
-�?  ├─┢� eval_e009_verify.py                Router verification
-�?  ├─┢� eval_e010_isaid_mc.py              iSAID multi-class Proto vs Embedding
-�?  ├─┢� eval_e011_spm_isaid.py             SPM on iSAID
-�?  ├─┢� eval_e011t_tile_ablation.py        Tile size ablation (256-2048)
-�?  └─┢� eval_e011u_proto_capacity.py       Proto count scanning (2-64)
-�?├─┢� paper_b/                         # Paper B experiments (paper-b branch)
-�?  ├─┢� eval_b00_tile_size_sensitivity.py   Spatial Sparsity: 7 tile sizes, empty/meaningful/FG-capture
-�?  ├─┢� eval_b01_oracle_topk.py             Oracle Top-K: FG retention upper bound, SSI definition
-�?  ├─┢� eval_b01_spatial_baseline.py        Tile foreground distribution analysis
-�?  ├─┢� eval_b02_learnability.py            Learnability: can MV3 predict tile importance? (r=0.889)
-�?  ├─┢� eval_b02_5_generalization.py        Generalization: category-agnostic? cross-dataset? (3 exps)
-�?  └─┢� eval_b03_router_architecture.py     FDR vs Edge ablation: R0/R1/R2/R3, Density≠Edge proof
-�?├─┢� diag/                            # Diagnostics (paper-b branch)
-�?  ├─┢� diag_b04_tiles.py               Tile dataset: mask values, fg_ratio, class distribution
-�?  ├─┢� diag_b04_overfit.py             Overfit test (20 tiles × 100 epoch) + 5-panel visualization
-�?  ├─┢� diag_b04_exp12.py               Exp1 (FG>5% multi-class) + Exp2 (binary FG/BG)
-�?  ├─┢� diag_class_stats.py             COCO GT stats + tile stats + cross-validation + anomaly detection
-�?  ├─┢� diag_check_labels.py            Quick train/val label space consistency check
-�?  ├─┢� diag_trace_labels.py            Single-instance mapping chain trace (JSON→mask→tile)
-�?  └─┢� test_loader.py                  Dataset loader validation
-�?└─┢� viz/                             # Visualization
-    ├─┢� viz_paper_a_p6.py               P6 feature visualization for Paper A
-    └─┢� viz_paper_a_router.py           Router behavior visualization for Paper A
+├── data/                            # Data preprocessing
+│   ├── prep_isaid.py                iSAID COCO -> category-id masks (Step 0)
+│   ├── prep_isaid_tiles.py          Full pipeline: render mask -> cut tiles -> metadata
+│   ├── prep_cityscapes.py           Cityscapes -> tile format
+│   └── fix_labels.py                Repair tool: fix category ID mapping in instances JSON
+├── train/                           # Training entry points
+│   ├── train_isaid_mc.py            iSAID multi-class training entry point
+│   ├── train_b04.py                 B-04 end-to-end: FDR + Decoder training
+│   └── fdr_predictor.py             FDR wrapper (frozen MV3 + DensityHead)
+├── paper_a/                         # Paper A experiments (main branch)
+│   ├── eval_e007b_proto_vs_embedding.py   Proto vs Embedding fair comparison
+│   ├── eval_e008_spm_sparsity.py          SPM sparsity validation (A/B/C)
+│   ├── eval_e009_spm_router.py            Learned vs Fixed Router
+│   ├── eval_e009d_proto_usage.py          Effective Proto count analysis
+│   ├── eval_e009_verify.py                Router verification
+│   ├── eval_e010_isaid_mc.py              iSAID multi-class Proto vs Embedding
+│   ├── eval_e011_spm_isaid.py             SPM on iSAID
+│   ├── eval_e011t_tile_ablation.py        Tile size ablation (256-2048)
+│   └── eval_e011u_proto_capacity.py       Proto count scanning (2-64)
+├── paper_b/                         # Paper B experiments (paper-b branch)
+│   ├── eval_b00_tile_size_sensitivity.py   Spatial Sparsity: 7 tile sizes
+│   ├── eval_b01_oracle_topk.py             Oracle Top-K: FG retention, SSI definition
+│   ├── eval_b01_spatial_baseline.py        Tile foreground distribution analysis
+│   ├── eval_b02_learnability.py            Learnability: MV3 predict importance (r=0.889)
+│   ├── eval_b02_5_generalization.py        Generalization: category-agnostic, cross-dataset
+│   ├── eval_b03_router_architecture.py     FDR vs Edge ablation: R0/R1/R2/R3
+│   ├── eval_b05_oracle_importance.py       Oracle tile importance: multi-metric analysis
+│   ├── eval_b05_5_tile_size.py             Tile size x importance interaction
+│   ├── eval_b06_contribution_granularity.py  Contribution imbalance vs tile granularity
+│   ├── eval_b06_decoder_diag.py            Decoder diagnostics: per-class IoU
+│   ├── eval_b07_contribution_gt.py          GT contribution analysis
+│   ├── eval_b07_fdr_data_efficiency.py      FDR sample efficiency (1%-100% data)
+│   ├── eval_b08_fastsam_fewshot.py          FastSAM-FSS: few-shot semantic (LoveDA/Vaihingen)
+│   ├── eval_b09_nwpu_fewshot.py             FastSAM-FSS on NWPU-VHR-10 (bbox weak masks)
+│   └── eval_paper_b_pipeline.py             Unified Paper B pipeline (multi-dataset)
+├── instance/                        # C-series few-shot instance segmentation
+│   ├── eval_c02a_fastsam_fewshot.py       FastSAM + Prototype Matching (3-class iSAID)
+│   ├── eval_c02b_decoder_fewshot.py       FastSAM + Decoder few-shot
+│   ├── eval_c03_catsam_fewshot.py         CAT-SAM baseline comparison
+│   ├── eval_c04_full_fewshot.py           Full 15-class few-shot instance seg (Phase D)
+│   ├── eval_fastsam_zero_shot.py          FastSAM zero-shot baseline
+│   └── run_c01_sweep.py                   Hyperparameter sweep runner
+├── diag/                            # Diagnostics
+│   ├── diag_b04_tiles.py               Tile dataset: mask values, fg_ratio
+│   ├── diag_b04_overfit.py             Overfit test (20 tiles x 100 epoch)
+│   ├── diag_b04_exp12.py               Exp1 (FG>5% multi-class) + Exp2 (binary)
+│   ├── diag_class_stats.py             COCO GT stats + tile stats + anomaly detection
+│   ├── diag_check_labels.py            Quick train/val label space consistency check
+│   ├── diag_trace_labels.py            Single-instance mapping chain trace
+│   └── test_loader.py                  Dataset loader validation
+└── viz/                             # Visualization
+    ├── viz_paper_a_p6.py               P6 feature visualization for Paper A
+    └── viz_paper_a_router.py           Router behavior visualization for Paper A
 ```
 
 ## Key Lessons from v1 (MUST follow)

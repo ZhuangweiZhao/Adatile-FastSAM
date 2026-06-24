@@ -51,7 +51,7 @@ Cross-Attention 细节 | CA Details:
         --shots 1,3,5 --epochs 30
 """
 
-import sys, argparse, time, json, datetime, cv2
+import sys, argparse, time, json, datetime
 from pathlib import Path
 from collections import defaultdict
 import numpy as np
@@ -67,213 +67,185 @@ from adatile.logging import get_logger
 from adatile.logging.backends import ConsoleBackend, FileBackend
 from adatile.utils.seed import set_seed
 from adatile.backbone import FastSAMBackbone
+from adatile.datasets.isaid_tile_wrapper import ISAIDTileWrapper
+from adatile.datasets.p4_cache import auto_build_p4_cache
 
 from tools.instance.eval_c02a_fastsam_fewshot import (
     ISAIDInstanceDataset, TARGET_CLASSES,
 )
 
+
 # ═══════════════════════════════════════════════════════════════════
-# Tile Dataset Wrapper | 瓦片数据集包装器
+# CUDA 优化设置 | CUDA Optimization Setup
 # ═══════════════════════════════════════════════════════════════════
 
-class ISAIDTileWrapper:
+def setup_cuda_optimizations(device: str = "cuda", logger=None):
     """
-    将全图数据集包装为 tile 级别访问。
-    Wraps full-image dataset for tile-level access.
+    配置 CUDA 优化以获得 RTX 5090/3060 的最佳吞吐量。
+    Configure CUDA optimizations for best throughput on RTX 5090/3060.
 
-    全图 (up to 4000×4000) → 896×896 tiles, stride=512, overlap=384.
-    每张 tile 保留原始分辨率细节（不降采样），避免小目标丢失。
-    Each tile preserves original resolution detail — no downscaling, no small-object loss.
-
-    Tile P4: [1280, 56, 56] at stride 16 (896/16=56).
-
-    Usage::
-        ds = ISAIDInstanceDataset(src_root, split='train')
-        tile_ds = ISAIDTileWrapper(ds, tile_size=896, stride=512)
-        img = tile_ds.load_image(tile_idx)   # [3, 896, 896]
-        mask = tile_ds.render_class_mask(tile_idx, class_id)  # [896, 896]
+    优化项 | Optimizations:
+        - cudnn.benchmark: 自动寻找最优卷积算法 | Auto-tune conv algorithms
+        - TF32: 在 Ampere+ GPU 上使用 TF32 加速 matmul | TF32 matmul on Ampere+
+        - 内存碎片化控制 | Memory fragmentation control
     """
+    if not torch.cuda.is_available():
+        return
 
-    def __init__(self, dataset, tile_size: int = 896, stride: int = 512):
-        self.ds = dataset
-        self.tile_size = tile_size
-        self.stride = stride
-        self.overlap = tile_size - stride  # 384 when tile=896, stride=512
+    # cuDNN benchmark: 让 cuDNN 为固定输入尺寸自动寻找最优算法
+    # cuDNN benchmark: auto-tune best conv algorithm for fixed input shapes
+    torch.backends.cudnn.benchmark = True
+    # cuDNN deterministic: benchmark=True 时建议关闭确定性模式以探索更多算法
+    torch.backends.cudnn.deterministic = False
 
-        # LRU image cache: 避免每张 tile 都从磁盘加载 4000×4000 原图
-        self._img_cache = {}       # img_idx → np.ndarray [H, W, 3]
-        self._cache_max = 8        # ~8 × 48MB = 384MB RAM
+    # TF32: Ampere (RTX 30xx) 和 Ada Lovelace (RTX 40xx/50xx) 支持 TF32
+    # TF32 provides ~2x throughput on matmul with minimal precision loss
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
-        # ── 预计算全部 tile 坐标 & class→tile 映射 ──
-        # Pre-compute all tile coords & class→tile mapping
-        self._tiles = []              # [(img_idx, x0, y0), ...]
-        self._class_to_tiles = defaultdict(set)
-        skipped_empty = 0
+    # 内存碎片化: 定期释放 CUDA 缓存以避免 OOM
+    # Memory fragmentation: periodically release CUDA cache to avoid OOM
+    if hasattr(torch.cuda, "memory") and hasattr(torch.cuda.memory, "set_per_process_memory_fraction"):
+        pass  # 保留给未来细粒度控制 | Reserved for future fine-grained control
 
-        for img_idx in tqdm(range(len(dataset)), desc="Tile grid", leave=False):
-            img_info = dataset._img_infos[img_idx]
-            img_path = str(dataset.src_root / dataset.split / "images" / img_info["file_name"])
-            img = cv2.imread(img_path)
-            if img is None:
-                continue
-            h, w = img.shape[:2]
+    gpu_name = torch.cuda.get_device_name(0)
+    gpu_mem = torch.cuda.get_device_properties(0).total_mem / 1e9
+    if logger:
+        logger.log_info(
+            "cuda",
+            f"GPU: {gpu_name} ({gpu_mem:.1f} GB), "
+            f"cudnn.benchmark=True, TF32=True",
+        )
 
-            if h < tile_size or w < tile_size:
-                skipped_empty += 1
-                continue
 
-            # 计算本图 tile 起始索引 | Record start index for this image
-            tile_start = len(self._tiles)
+# ═══════════════════════════════════════════════════════════════════
+# Optimized training functions (AMP + P4Cache + batched backbone)
+# ═══════════════════════════════════════════════════════════════════
 
-            # 滑窗切分 | Sliding window
-            for y0 in range(0, h - tile_size + 1, stride):
-                for x0 in range(0, w - tile_size + 1, stride):
-                    self._tiles.append((img_idx, x0, y0))
+def train_episode_optimized(decoder, support_idxs, query_idx,
+                            train_ds, val_ds, query_class, device, opt, scaler,
+                            p4_cache_train=None, p4_cache_val=None,
+                            backbone=None, use_amp=True):
+    """
+    优化版训练 episode: AMP + P4Cache 查表 + batched backbone forward.
+    Optimized training episode: AMP + P4Cache lookup + batched backbone.
 
-            # ── Class→tile 映射: 检查 bbox 重叠 ──
-            # Map classes to tiles via bbox overlap check
-            anns = dataset._img_anns.get(img_info["id"], [])
-            cat_to_bboxes = defaultdict(list)
-            for ann in anns:
-                bbox = ann.get("bbox", [0, 0, 0, 0])
-                if bbox[2] > 0 and bbox[3] > 0:
-                    cat_to_bboxes[ann["category_id"]].append(bbox)
+    与原始版的关键区别 | Key differences from original:
+        1. 使用 GradScaler 进行 AMP 训练 | AMP training with GradScaler
+        2. P4Cache 支持 GPU 直接索引 (零拷贝) | P4Cache GPU direct index (zero-copy)
+        3. 支持 Support+Query 联合 backbone forward | Combined support+query backbone
+    """
+    shot = len(support_idxs)
 
-            for cat_id, bboxes in cat_to_bboxes.items():
-                for tile_i in range(tile_start, len(self._tiles)):
-                    _, tx0, ty0 = self._tiles[tile_i]
-                    tx1, ty1 = tx0 + tile_size, ty0 + tile_size
-                    for bx, by, bw, bh in bboxes:
-                        if bx < tx1 and bx + bw > tx0 and by < ty1 and by + bh > ty0:
-                            self._class_to_tiles[cat_id].add(tile_i)
-                            break
+    # ── Support P4 ──
+    if p4_cache_train is not None:
+        # P4Cache: 直接从 GPU/CPU 查表 | Direct GPU/CPU lookup
+        if hasattr(p4_cache_train, 'get_batch'):
+            support_p4s = list(p4_cache_train.get_batch(
+                [int(si) for si in support_idxs], target_device=device
+            ))
+        else:
+            support_p4s = [p4_cache_train[int(si)].to(device)
+                          for si in support_idxs]
+        support_p4s = [s if s.dim() == 3 else s.squeeze(0) for s in support_p4s]
+    else:
+        support_imgs = torch.stack([train_ds.load_image(int(si))
+                                     for si in support_idxs]).to(device)
+        support_p4s = list(backbone(support_imgs)['p4'])
 
-        self._class_to_tiles = {int(k): list(v) for k, v in self._class_to_tiles.items()}
+    # ── Query P4 ──
+    if p4_cache_val is not None:
+        if hasattr(p4_cache_val, 'get_batch'):
+            query_p4 = p4_cache_val.get_batch([int(query_idx)], target_device=device)
+        else:
+            query_p4 = p4_cache_val[int(query_idx)].unsqueeze(0).to(device)
+    else:
+        query_img = val_ds.load_image(int(query_idx)).unsqueeze(0).to(device)
+        query_p4 = backbone(query_img)['p4']
 
-        total_tiles = len(self._tiles)
-        n_classes = len(self._class_to_tiles)
-        print(f"[TileWrapper] {len(dataset)} imgs → {total_tiles} tiles "
-              f"(skipped {skipped_empty} too small), "
-              f"{n_classes} classes have tiles")
+    # ── Masks (lazy render — TODO: pre-render cache) ──
+    support_masks = [train_ds.render_class_mask(si, query_class).to(device)
+                     for si in support_idxs]
+    query_mask = val_ds.render_class_mask(query_idx, query_class)
+    query_mask = query_mask.unsqueeze(0).unsqueeze(0).to(device)
 
-    def __len__(self) -> int:
-        return len(self._tiles)
+    # ── Prototype (FP32 精度保证) ──
+    fg_proto = compute_fg_prototype(support_p4s, support_masks)
+    if fg_proto.sum() == 0:
+        return None
 
-    def _load_original_image(self, img_idx: int) -> np.ndarray:
-        """加载全分辨率原始图像（带 LRU 缓存）| Load original image with LRU cache."""
-        if img_idx in self._img_cache:
-            return self._img_cache[img_idx]
+    # ── AMP forward + backward ──
+    with torch.cuda.amp.autocast(enabled=use_amp):
+        logit = decoder(query_p4, fg_proto, target_size=tuple(query_mask.shape[2:]))
+        bce_loss = F.binary_cross_entropy_with_logits(logit, query_mask)
+        prob = torch.sigmoid(logit)
+        inter = (prob * query_mask).sum()
+        union = prob.sum() + query_mask.sum() + 1e-8
+        dice_loss = 1.0 - (2 * inter / union)
+        loss = 0.5 * bce_loss + 0.5 * dice_loss
 
-        img_info = self.ds._img_infos[img_idx]
-        img_path = str(self.ds.src_root / self.ds.split / "images" / img_info["file_name"])
-        img = cv2.imread(img_path)
-        if img is None:
-            raise FileNotFoundError(f"Cannot load: {img_path}")
-        img = img[..., ::-1]  # BGR → RGB
+    opt.zero_grad()
+    scaler.scale(loss).backward()
+    scaler.step(opt)
+    scaler.update()
+    return loss.item()
 
-        # LRU eviction | LRU 淘汰
-        if len(self._img_cache) >= self._cache_max:
-            oldest = next(iter(self._img_cache))
-            del self._img_cache[oldest]
-        self._img_cache[img_idx] = img.copy()  # copy to avoid mutation
-        return self._img_cache[img_idx]
 
-    def load_image(self, tile_idx: int) -> torch.Tensor:
-        """
-        加载单张 tile → [3, tile_size, tile_size], 值域 [0, 1]。
-        Load single tile → [3, tile_size, tile_size], range [0, 1].
-        """
-        img_idx, x0, y0 = self._tiles[int(tile_idx)]
-        img = self._load_original_image(img_idx)
-        tile = img[y0:y0 + self.tile_size, x0:x0 + self.tile_size]  # [H, W, 3]
-        tile_t = torch.from_numpy(tile).permute(2, 0, 1).float() / 255.0
-        return tile_t
+@torch.no_grad()
+def validate_episode_optimized(decoder, train_ds, val_ds, query_class,
+                               shot, device, rng, n_val=30,
+                               p4_cache_train=None, p4_cache_val=None,
+                               backbone=None, use_amp=True):
+    """优化版验证 episode | Optimized validation episode."""
+    train_candidates = train_ds.class_to_images(query_class)
+    val_candidates = val_ds.class_to_images(query_class)
+    if len(train_candidates) < shot or not val_candidates:
+        return 0.0
 
-    def render_class_mask(self, tile_idx: int, class_id: int) -> torch.Tensor:
-        """
-        渲染单张 tile 的目标类别 union mask → [tile_size, tile_size]。
-        Render union mask for target class on a single tile.
+    ious = []
+    for _ in range(n_val):
+        support_idxs = rng.choice(train_candidates, shot, replace=False)
+        qi = int(rng.choice(val_candidates))
 
-        Polygon 坐标相对于 tile 左上角平移后直接渲染，无需渲染全图再裁剪。
-        Polygon coords are shifted relative to tile origin — no full-image rendering needed.
-        """
-        tile_idx = int(tile_idx)
-        img_idx, x0, y0 = self._tiles[tile_idx]
-        img_info = self.ds._img_infos[img_idx]
-        anns = self.ds._img_anns.get(img_info["id"], [])
-        ts = self.tile_size
-
-        mask = np.zeros((ts, ts), dtype=np.uint8)
-
-        for ann in anns:
-            if ann["category_id"] != int(class_id):
-                continue
-
-            seg = ann.get("segmentation", [])
-            if isinstance(seg, dict):
-                # RLE: 渲染全分辨率后裁剪 | Render then crop
-                # (rare in iSAID, fallback)
-                img = self._load_original_image(img_idx)
-                h, w = img.shape[:2]
-                from pycocotools import mask as coco_mask
-                rle = coco_mask.frPyObjects(seg, h, w)
-                if isinstance(rle, list):
-                    rle = coco_mask.merge(rle)
-                full_mask = coco_mask.decode(rle).astype(np.uint8)
-                mask = np.maximum(mask, full_mask[y0:y0 + ts, x0:x0 + ts])
-
-            elif seg and isinstance(seg[0], (int, float)):
-                # Single polygon | 单个多边形
-                self._fill_polygon_on_tile(mask, [seg], x0, y0, ts)
-            elif seg and isinstance(seg[0], list):
-                # Multiple polygons | 多个多边形
-                self._fill_polygon_on_tile(mask, seg, x0, y0, ts)
+        # Support P4
+        if p4_cache_train is not None:
+            if hasattr(p4_cache_train, 'get_batch'):
+                support_p4s = list(p4_cache_train.get_batch(
+                    [int(si) for si in support_idxs], target_device=device
+                ))
+                support_p4s = [s if s.dim() == 3 else s.squeeze(0) for s in support_p4s]
             else:
-                # Bbox fallback | Bbox 回退
-                bbox = ann.get("bbox", [0, 0, 0, 0])
-                bx, by, bw, bh = bbox
-                ix0 = int(max(0, bx - x0))
-                iy0 = int(max(0, by - y0))
-                ix1 = int(min(ts, bx + bw - x0))
-                iy1 = int(min(ts, by + bh - y0))
-                if ix1 > ix0 and iy1 > iy0:
-                    mask[iy0:iy1, ix0:ix1] = 1
+                support_p4s = [p4_cache_train[int(si)].to(device) for si in support_idxs]
+        else:
+            support_imgs = torch.stack([train_ds.load_image(int(si))
+                                         for si in support_idxs]).to(device)
+            support_p4s = list(backbone(support_imgs)['p4'])
 
-        return torch.from_numpy(mask).float()
+        # Query P4
+        if p4_cache_val is not None:
+            if hasattr(p4_cache_val, 'get_batch'):
+                query_p4 = p4_cache_val.get_batch([qi], target_device=device)
+            else:
+                query_p4 = p4_cache_val[qi].unsqueeze(0).to(device)
+        else:
+            query_img = val_ds.load_image(qi).unsqueeze(0).to(device)
+            query_p4 = backbone(query_img)['p4']
 
-    @staticmethod
-    def _fill_polygon_on_tile(mask: np.ndarray, polys: list,
-                               x0: int, y0: int, ts: int):
-        """在 tile 上绘制多边形（坐标相对于 tile 原点平移）."""
-        for poly in polys:
-            pts = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
-            # 平移到 tile 坐标系 | Shift to tile coordinate system
-            pts = pts - [x0, y0]
-            # 裁剪到 tile 边界 | Clip to tile bounds
-            pts[:, :, 0] = np.clip(pts[:, :, 0], 0, ts - 1)
-            pts[:, :, 1] = np.clip(pts[:, :, 1], 0, ts - 1)
-            if len(pts) >= 3:
-                cv2.fillPoly(mask, [pts.astype(np.int32)], 1)
+        support_masks = [train_ds.render_class_mask(si, query_class).to(device)
+                         for si in support_idxs]
+        query_mask = val_ds.render_class_mask(qi, query_class).to(device)
 
-    def class_to_images(self, class_id: int) -> list:
-        """返回包含指定类别的 tile 索引列表 | Returns tile indices containing the class."""
-        return self._class_to_tiles.get(int(class_id), [])
+        fg_proto = compute_fg_prototype(support_p4s, support_masks)
+        if fg_proto.sum() == 0:
+            continue
 
-    @property
-    def src_root(self):
-        return self.ds.src_root
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            logit = decoder(query_p4, fg_proto, target_size=tuple(query_mask.shape))
+        pred = (logit.squeeze().cpu() > 0).numpy()
+        gt = query_mask.cpu().numpy() > 0
+        ious.append(binary_iou(torch.from_numpy(pred), torch.from_numpy(gt)))
 
-    @property
-    def split(self):
-        return self.ds.split
-
-    @property
-    def _img_infos(self):
-        return self.ds._img_infos
-
-    @property
-    def _img_anns(self):
-        return self.ds._img_anns
+    return float(np.mean(ious)) if ious else 0.0
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -470,116 +442,6 @@ def precompute_p4_cache(dataset, backbone, device, desc="P4 cache"):
     return cache
 
 
-# ═══════════════════════════════════════════════════════════════════
-# Episodic Training
-# ═══════════════════════════════════════════════════════════════════
-
-def train_episode(decoder, support_idxs, query_idx,
-                  train_ds, val_ds, query_class, device, opt,
-                  p4_cache_train=None, p4_cache_val=None,
-                  backbone=None):
-    """Single training episode: support → proto → CrossAttn → decoder → loss.
-
-    支持 P4 缓存: 如果传入 cache，跳过 backbone forward。
-    Supports P4 cache: backbone is skipped when caches are provided.
-    """
-
-    shot = len(support_idxs)
-
-    # ── Support P4 (cache first, then backbone fallback) ──
-    if p4_cache_train is not None:
-        support_p4s = [p4_cache_train[int(si)].to(device)
-                       for si in support_idxs]
-    else:
-        support_imgs = torch.stack([train_ds.load_image(int(si))
-                                     for si in support_idxs]).to(device)
-        support_feats = backbone(support_imgs)
-        support_p4s = [support_feats['p4'][i] for i in range(shot)]
-
-    # ── Query P4 (cache first, then backbone fallback) ──
-    if p4_cache_val is not None:
-        query_p4 = p4_cache_val[int(query_idx)].unsqueeze(0).to(device)
-    else:
-        query_img = val_ds.load_image(int(query_idx)).unsqueeze(0).to(device)
-        query_p4 = backbone(query_img)['p4']
-
-    # ── Masks (lazy render) ──
-    support_masks = [train_ds.render_class_mask(si, query_class).to(device)
-                     for si in support_idxs]
-    query_mask = val_ds.render_class_mask(query_idx, query_class)
-    query_mask = query_mask.unsqueeze(0).unsqueeze(0).to(device)  # [1,1,H,W]
-
-    # ── Prototype → CrossAttn → Decoder → Loss ──
-    fg_proto = compute_fg_prototype(support_p4s, support_masks)
-    if fg_proto.sum() == 0:
-        return None
-
-    logit = decoder(query_p4, fg_proto, target_size=tuple(query_mask.shape[2:]))
-
-    # BCE + Dice loss (per spec: 标准二分类损失)
-    bce_loss = F.binary_cross_entropy_with_logits(logit, query_mask)
-
-    prob = torch.sigmoid(logit)
-    inter = (prob * query_mask).sum()
-    union = prob.sum() + query_mask.sum() + 1e-8
-    dice_loss = 1.0 - (2 * inter / union)
-
-    loss = 0.5 * bce_loss + 0.5 * dice_loss
-    opt.zero_grad()
-    loss.backward()
-    opt.step()
-    return loss.item()
-
-
-@torch.no_grad()
-def validate_episode(decoder, train_ds, val_ds, query_class,
-                     shot, device, rng, n_val=30,
-                     p4_cache_train=None, p4_cache_val=None,
-                     backbone=None):
-    """Validation: 固定 episodes 评估 mIoU. Supports P4 cache."""
-    train_candidates = train_ds.class_to_images(query_class)
-    val_candidates = val_ds.class_to_images(query_class)
-    if len(train_candidates) < shot or not val_candidates:
-        return 0.0
-
-    ious = []
-    for _ in range(n_val):
-        support_idxs = rng.choice(train_candidates, shot, replace=False)
-        qi = int(rng.choice(val_candidates))
-
-        # Support P4
-        if p4_cache_train is not None:
-            support_p4s = [p4_cache_train[int(si)].to(device)
-                          for si in support_idxs]
-        else:
-            support_imgs = torch.stack([train_ds.load_image(int(si))
-                                         for si in support_idxs]).to(device)
-            support_p4s = [backbone(support_imgs)['p4'][i] for i in range(shot)]
-
-        # Query P4
-        if p4_cache_val is not None:
-            query_p4 = p4_cache_val[qi].unsqueeze(0).to(device)
-        else:
-            query_img = val_ds.load_image(qi).unsqueeze(0).to(device)
-            query_p4 = backbone(query_img)['p4']
-
-        support_masks = [train_ds.render_class_mask(si, query_class).to(device)
-                         for si in support_idxs]
-        query_mask = val_ds.render_class_mask(qi, query_class).to(device)
-
-        fg_proto = compute_fg_prototype(support_p4s, support_masks)
-        if fg_proto.sum() == 0:
-            continue
-
-        logit = decoder(query_p4, fg_proto,
-                       target_size=tuple(query_mask.shape))
-        pred = (logit.squeeze().cpu() > 0).numpy()
-        gt = query_mask.cpu().numpy() > 0
-        ious.append(binary_iou(torch.from_numpy(pred), torch.from_numpy(gt)))
-
-    return float(np.mean(ious)) if ious else 0.0
-
-
 @torch.no_grad()
 def evaluate_trained(decoder, train_ds, val_ds, device,
                      shot, n_episodes, target_classes, logger, tag,
@@ -684,13 +546,34 @@ def parse_args():
                    help='使用 896x896 tile 模式 (stride=512, overlap=384)')
     p.add_argument('--tile-size', type=int, default=896)
     p.add_argument('--tile-stride', type=int, default=512)
+    # ── 性能优化选项 | Performance optimization options ──
+    p.add_argument('--amp', action='store_true', default=True,
+                   help='使用 Automatic Mixed Precision 训练 (默认开启)')
+    p.add_argument('--no-amp', action='store_true',
+                   help='禁用 AMP, 使用纯 FP32')
+    p.add_argument('--p4-cache-cpu', action='store_true',
+                   help='P4 特征缓存在 CPU pinned memory (非 tile 模式下默认 GPU)')
+    p.add_argument('--p4-cache-dir', type=str, default=None,
+                   help='P4 缓存持久化目录 (下次运行跳过预计算)')
+    p.add_argument('--p4-batch-size', type=int, default=16,
+                   help='P4 预计算 batch size (默认 16, 5090 可设 32)')
+    p.add_argument('--tile-cache-size', type=int, default=32,
+                   help='Tile wrapper 原图 LRU 缓存大小 (默认 32, 5090 可设 64)')
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    set_seed(args.seed)
     device = args.device
+
+    # ── CUDA 优化 (必须在 set_seed 之前: benchmark 覆盖 deterministic) ──
+    # CUDA optimizations (MUST be before set_seed: benchmark overrides deterministic)
+    use_amp = args.amp and not args.no_amp and device == "cuda"
+    setup_cuda_optimizations(device)
+
+    # set_seed 设置 deterministic=True, 但 benchmark=True 需要 deterministic=False
+    # setup_cuda_optimizations 已正确覆盖此设置
+    set_seed(args.seed)
     shots = [int(x.strip()) for x in args.shots.split(',')]
 
     output_dir = Path(args.output_dir)
@@ -708,11 +591,14 @@ def main():
     if use_tile:
         train_ds = ISAIDTileWrapper(train_ds, tile_size=args.tile_size,
                                      stride=args.tile_stride)
+        train_ds._cache_max = args.tile_cache_size
         val_ds = ISAIDTileWrapper(val_ds, tile_size=args.tile_size,
                                    stride=args.tile_stride)
+        val_ds._cache_max = args.tile_cache_size
         logger.log_info('c03/data',
                        f'iSAID Tile: {len(train_ds)} train tiles, {len(val_ds)} val tiles '
-                       f'({args.tile_size}×{args.tile_size}, stride={args.tile_stride})')
+                       f'({args.tile_size}x{args.tile_size}, stride={args.tile_stride}, '
+                       f'LRU cache={args.tile_cache_size})')
     else:
         logger.log_info('c03/data',
                        f'iSAID: {len(train_ds)} train, {len(val_ds)} val')
@@ -724,14 +610,36 @@ def main():
     logger.log_info('c03/model', 'FastSAM backbone (frozen)')
     logger.log_info('c03/method', 'CAT-SAM Lite: Cross-Attention + InstanceDecoder')
 
-    # ── P4 Precomputation Cache | P4 预计算缓存 ──
-    # Tile 模式下 tile 数量大 (~2000+)，不缓存 P4，改用 on-the-fly backbone forward。
-    # In tile mode, tile count is large → skip cache, use on-the-fly backbone instead.
+    # ── P4 预计算缓存 | P4 Pre-computation Cache ──
+    # RTX 5090 (32 GB): GPU cache → 零 backbone forward
+    # RTX 3060 (12 GB): CPU pinned cache → 异步传输
     if use_tile:
-        p4_train, p4_val = None, None
+        # Tile 模式强制 CPU 缓存: ~23k tiles × 8 MB fp16 = ~189 GB >> 32 GB GPU
+        # Tile mode forces CPU cache: ~23k tiles × 8 MB fp16 = ~189 GB >> 32 GB GPU
+        p4_storage = "cpu"
+        p4_cache_name = f"p4_{args.tile_size}_train"
+        p4_cache_name_val = f"p4_{args.tile_size}_val"
+
         logger.log_info('c03/cache',
-                       f'Tile mode: {len(train_ds)} tiles, P4 cache disabled '
-                       f'(backbone stays on GPU, batched forward per episode)')
+                       f'Building P4 cache for {len(train_ds)}+{len(val_ds)} tiles '
+                       f'(storage={p4_storage}, fp16, batch={args.p4_batch_size})')
+
+        p4_cache_train = auto_build_p4_cache(
+            train_ds, backbone, device=p4_storage, fp16=True,
+            batch_size=args.p4_batch_size, pin_memory=(p4_storage == "cpu"),
+            cache_dir=args.p4_cache_dir, cache_name=p4_cache_name,
+        )
+        p4_cache_val = auto_build_p4_cache(
+            val_ds, backbone, device=p4_storage, fp16=True,
+            batch_size=args.p4_batch_size, pin_memory=(p4_storage == "cpu"),
+            cache_dir=args.p4_cache_dir, cache_name=p4_cache_name_val,
+        )
+        p4_train = p4_cache_train
+        p4_val = p4_cache_val
+        # P4 已缓存在 CPU pinned memory，训练时异步传输到 GPU
+        logger.log_info('c03/cache',
+                       f'P4 cache on CPU pinned: {len(p4_train)}+{len(p4_val)} tiles '
+                       f'({p4_cache_train.total_size_gb:.1f} GB)')
     else:
         t_cache = time.perf_counter()
         p4_train = precompute_p4_cache(train_ds, backbone, device, desc="P4 cache train")
@@ -756,9 +664,10 @@ def main():
         # ── Training ──
         decoder = CATFewShotDecoder().to(device)
         decoder.train()
-        opt = torch.optim.Adam(decoder.parameters(), lr=args.lr)
+        opt = torch.optim.AdamW(decoder.parameters(), lr=args.lr, weight_decay=1e-4)
         sch = torch.optim.lr_scheduler.CosineAnnealingLR(
             opt, T_max=args.epochs, eta_min=1e-6)
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
         best_val_iou = 0.0
         best_state = None
@@ -780,10 +689,13 @@ def main():
                 support_idxs = rng.choice(candidates, shot, replace=False)
                 qi = int(rng.choice(val_candidates))
 
-                loss = train_episode(decoder, support_idxs, qi,
-                                    train_ds, val_ds, query_class, device, opt,
-                                    p4_cache_train=p4_train, p4_cache_val=p4_val,
-                                    backbone=backbone if use_tile else None)
+                loss = train_episode_optimized(
+                    decoder, support_idxs, qi,
+                    train_ds, val_ds, query_class, device, opt, scaler,
+                    p4_cache_train=p4_train, p4_cache_val=p4_val,
+                    backbone=backbone if not use_tile else None,
+                    use_amp=use_amp,
+                )
                 if loss is not None:
                     total_loss += loss
                     n += 1
@@ -795,11 +707,13 @@ def main():
             decoder.eval()
             per_cls_val = {}
             for cls_id in TARGET_CLASSES:
-                per_cls_val[cls_id] = validate_episode(
+                per_cls_val[cls_id] = validate_episode_optimized(
                     decoder, train_ds, val_ds,
                     cls_id, shot, device, rng, n_val=30,
                     p4_cache_train=p4_train, p4_cache_val=p4_val,
-                    backbone=backbone if use_tile else None)
+                    backbone=backbone if not use_tile else None,
+                    use_amp=use_amp,
+                )
 
             mval = float(np.mean(list(per_cls_val.values())))
             logger.log_info(f'{tag}/train',
