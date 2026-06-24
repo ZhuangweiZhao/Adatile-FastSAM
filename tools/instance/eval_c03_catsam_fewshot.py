@@ -51,7 +51,7 @@ Cross-Attention 细节 | CA Details:
         --shots 1,3,5 --epochs 30
 """
 
-import sys, argparse, time, json, datetime
+import sys, argparse, time, json, datetime, cv2
 from pathlib import Path
 from collections import defaultdict
 import numpy as np
@@ -71,6 +71,210 @@ from adatile.backbone import FastSAMBackbone
 from tools.instance.eval_c02a_fastsam_fewshot import (
     ISAIDInstanceDataset, TARGET_CLASSES,
 )
+
+# ═══════════════════════════════════════════════════════════════════
+# Tile Dataset Wrapper | 瓦片数据集包装器
+# ═══════════════════════════════════════════════════════════════════
+
+class ISAIDTileWrapper:
+    """
+    将全图数据集包装为 tile 级别访问。
+    Wraps full-image dataset for tile-level access.
+
+    全图 (up to 4000×4000) → 896×896 tiles, stride=512, overlap=384.
+    每张 tile 保留原始分辨率细节（不降采样），避免小目标丢失。
+    Each tile preserves original resolution detail — no downscaling, no small-object loss.
+
+    Tile P4: [1280, 56, 56] at stride 16 (896/16=56).
+
+    Usage::
+        ds = ISAIDInstanceDataset(src_root, split='train')
+        tile_ds = ISAIDTileWrapper(ds, tile_size=896, stride=512)
+        img = tile_ds.load_image(tile_idx)   # [3, 896, 896]
+        mask = tile_ds.render_class_mask(tile_idx, class_id)  # [896, 896]
+    """
+
+    def __init__(self, dataset, tile_size: int = 896, stride: int = 512):
+        self.ds = dataset
+        self.tile_size = tile_size
+        self.stride = stride
+        self.overlap = tile_size - stride  # 384 when tile=896, stride=512
+
+        # LRU image cache: 避免每张 tile 都从磁盘加载 4000×4000 原图
+        self._img_cache = {}       # img_idx → np.ndarray [H, W, 3]
+        self._cache_max = 8        # ~8 × 48MB = 384MB RAM
+
+        # ── 预计算全部 tile 坐标 & class→tile 映射 ──
+        # Pre-compute all tile coords & class→tile mapping
+        self._tiles = []              # [(img_idx, x0, y0), ...]
+        self._class_to_tiles = defaultdict(set)
+        skipped_empty = 0
+
+        for img_idx in tqdm(range(len(dataset)), desc="Tile grid", leave=False):
+            img_info = dataset._img_infos[img_idx]
+            img_path = str(dataset.src_root / dataset.split / "images" / img_info["file_name"])
+            img = cv2.imread(img_path)
+            if img is None:
+                continue
+            h, w = img.shape[:2]
+
+            if h < tile_size or w < tile_size:
+                skipped_empty += 1
+                continue
+
+            # 计算本图 tile 起始索引 | Record start index for this image
+            tile_start = len(self._tiles)
+
+            # 滑窗切分 | Sliding window
+            for y0 in range(0, h - tile_size + 1, stride):
+                for x0 in range(0, w - tile_size + 1, stride):
+                    self._tiles.append((img_idx, x0, y0))
+
+            # ── Class→tile 映射: 检查 bbox 重叠 ──
+            # Map classes to tiles via bbox overlap check
+            anns = dataset._img_anns.get(img_info["id"], [])
+            cat_to_bboxes = defaultdict(list)
+            for ann in anns:
+                bbox = ann.get("bbox", [0, 0, 0, 0])
+                if bbox[2] > 0 and bbox[3] > 0:
+                    cat_to_bboxes[ann["category_id"]].append(bbox)
+
+            for cat_id, bboxes in cat_to_bboxes.items():
+                for tile_i in range(tile_start, len(self._tiles)):
+                    _, tx0, ty0 = self._tiles[tile_i]
+                    tx1, ty1 = tx0 + tile_size, ty0 + tile_size
+                    for bx, by, bw, bh in bboxes:
+                        if bx < tx1 and bx + bw > tx0 and by < ty1 and by + bh > ty0:
+                            self._class_to_tiles[cat_id].add(tile_i)
+                            break
+
+        self._class_to_tiles = {int(k): list(v) for k, v in self._class_to_tiles.items()}
+
+        total_tiles = len(self._tiles)
+        n_classes = len(self._class_to_tiles)
+        print(f"[TileWrapper] {len(dataset)} imgs → {total_tiles} tiles "
+              f"(skipped {skipped_empty} too small), "
+              f"{n_classes} classes have tiles")
+
+    def __len__(self) -> int:
+        return len(self._tiles)
+
+    def _load_original_image(self, img_idx: int) -> np.ndarray:
+        """加载全分辨率原始图像（带 LRU 缓存）| Load original image with LRU cache."""
+        if img_idx in self._img_cache:
+            return self._img_cache[img_idx]
+
+        img_info = self.ds._img_infos[img_idx]
+        img_path = str(self.ds.src_root / self.ds.split / "images" / img_info["file_name"])
+        img = cv2.imread(img_path)
+        if img is None:
+            raise FileNotFoundError(f"Cannot load: {img_path}")
+        img = img[..., ::-1]  # BGR → RGB
+
+        # LRU eviction | LRU 淘汰
+        if len(self._img_cache) >= self._cache_max:
+            oldest = next(iter(self._img_cache))
+            del self._img_cache[oldest]
+        self._img_cache[img_idx] = img.copy()  # copy to avoid mutation
+        return self._img_cache[img_idx]
+
+    def load_image(self, tile_idx: int) -> torch.Tensor:
+        """
+        加载单张 tile → [3, tile_size, tile_size], 值域 [0, 1]。
+        Load single tile → [3, tile_size, tile_size], range [0, 1].
+        """
+        img_idx, x0, y0 = self._tiles[int(tile_idx)]
+        img = self._load_original_image(img_idx)
+        tile = img[y0:y0 + self.tile_size, x0:x0 + self.tile_size]  # [H, W, 3]
+        tile_t = torch.from_numpy(tile).permute(2, 0, 1).float() / 255.0
+        return tile_t
+
+    def render_class_mask(self, tile_idx: int, class_id: int) -> torch.Tensor:
+        """
+        渲染单张 tile 的目标类别 union mask → [tile_size, tile_size]。
+        Render union mask for target class on a single tile.
+
+        Polygon 坐标相对于 tile 左上角平移后直接渲染，无需渲染全图再裁剪。
+        Polygon coords are shifted relative to tile origin — no full-image rendering needed.
+        """
+        tile_idx = int(tile_idx)
+        img_idx, x0, y0 = self._tiles[tile_idx]
+        img_info = self.ds._img_infos[img_idx]
+        anns = self.ds._img_anns.get(img_info["id"], [])
+        ts = self.tile_size
+
+        mask = np.zeros((ts, ts), dtype=np.uint8)
+
+        for ann in anns:
+            if ann["category_id"] != int(class_id):
+                continue
+
+            seg = ann.get("segmentation", [])
+            if isinstance(seg, dict):
+                # RLE: 渲染全分辨率后裁剪 | Render then crop
+                # (rare in iSAID, fallback)
+                img = self._load_original_image(img_idx)
+                h, w = img.shape[:2]
+                from pycocotools import mask as coco_mask
+                rle = coco_mask.frPyObjects(seg, h, w)
+                if isinstance(rle, list):
+                    rle = coco_mask.merge(rle)
+                full_mask = coco_mask.decode(rle).astype(np.uint8)
+                mask = np.maximum(mask, full_mask[y0:y0 + ts, x0:x0 + ts])
+
+            elif seg and isinstance(seg[0], (int, float)):
+                # Single polygon | 单个多边形
+                self._fill_polygon_on_tile(mask, [seg], x0, y0, ts)
+            elif seg and isinstance(seg[0], list):
+                # Multiple polygons | 多个多边形
+                self._fill_polygon_on_tile(mask, seg, x0, y0, ts)
+            else:
+                # Bbox fallback | Bbox 回退
+                bbox = ann.get("bbox", [0, 0, 0, 0])
+                bx, by, bw, bh = bbox
+                ix0 = int(max(0, bx - x0))
+                iy0 = int(max(0, by - y0))
+                ix1 = int(min(ts, bx + bw - x0))
+                iy1 = int(min(ts, by + bh - y0))
+                if ix1 > ix0 and iy1 > iy0:
+                    mask[iy0:iy1, ix0:ix1] = 1
+
+        return torch.from_numpy(mask).float()
+
+    @staticmethod
+    def _fill_polygon_on_tile(mask: np.ndarray, polys: list,
+                               x0: int, y0: int, ts: int):
+        """在 tile 上绘制多边形（坐标相对于 tile 原点平移）."""
+        for poly in polys:
+            pts = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
+            # 平移到 tile 坐标系 | Shift to tile coordinate system
+            pts = pts - [x0, y0]
+            # 裁剪到 tile 边界 | Clip to tile bounds
+            pts[:, :, 0] = np.clip(pts[:, :, 0], 0, ts - 1)
+            pts[:, :, 1] = np.clip(pts[:, :, 1], 0, ts - 1)
+            if len(pts) >= 3:
+                cv2.fillPoly(mask, [pts.astype(np.int32)], 1)
+
+    def class_to_images(self, class_id: int) -> list:
+        """返回包含指定类别的 tile 索引列表 | Returns tile indices containing the class."""
+        return self._class_to_tiles.get(int(class_id), [])
+
+    @property
+    def src_root(self):
+        return self.ds.src_root
+
+    @property
+    def split(self):
+        return self.ds.split
+
+    @property
+    def _img_infos(self):
+        return self.ds._img_infos
+
+    @property
+    def _img_anns(self):
+        return self.ds._img_anns
+
 
 # ═══════════════════════════════════════════════════════════════════
 # Prototype computation (shared)
@@ -476,6 +680,10 @@ def parse_args():
     p.add_argument('--device', type=str,
                    default='cuda' if torch.cuda.is_available() else 'cpu')
     p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--tile', action='store_true',
+                   help='使用 896x896 tile 模式 (stride=512, overlap=384)')
+    p.add_argument('--tile-size', type=int, default=896)
+    p.add_argument('--tile-stride', type=int, default=512)
     return p.parse_args()
 
 
@@ -495,8 +703,19 @@ def main():
     # ── Data ──
     train_ds = ISAIDInstanceDataset(args.src_root, split='train')
     val_ds = ISAIDInstanceDataset(args.src_root, split='val')
-    logger.log_info('c03/data',
-                   f'iSAID: {len(train_ds)} train, {len(val_ds)} val')
+
+    use_tile = args.tile
+    if use_tile:
+        train_ds = ISAIDTileWrapper(train_ds, tile_size=args.tile_size,
+                                     stride=args.tile_stride)
+        val_ds = ISAIDTileWrapper(val_ds, tile_size=args.tile_size,
+                                   stride=args.tile_stride)
+        logger.log_info('c03/data',
+                       f'iSAID Tile: {len(train_ds)} train tiles, {len(val_ds)} val tiles '
+                       f'({args.tile_size}×{args.tile_size}, stride={args.tile_stride})')
+    else:
+        logger.log_info('c03/data',
+                       f'iSAID: {len(train_ds)} train, {len(val_ds)} val')
     logger.log_info('c03/data',
                    f'Target: {[(c, TARGET_CLASSES[c]) for c in sorted(TARGET_CLASSES)]}')
 
@@ -506,20 +725,25 @@ def main():
     logger.log_info('c03/method', 'CAT-SAM Lite: Cross-Attention + InstanceDecoder')
 
     # ── P4 Precomputation Cache | P4 预计算缓存 ──
-    # 冻结 backbone → 每张图的 P4 只算一次。训练/验证直接查表，不再重复 forward。
-    # Frozen backbone → compute P4 once per image. ~3 GB CPU RAM for iSAID train set.
-    t_cache = time.perf_counter()
-    p4_train = precompute_p4_cache(train_ds, backbone, device, desc="P4 cache train")
-    p4_val = precompute_p4_cache(val_ds, backbone, device, desc="P4 cache val")
-    dt_cache = time.perf_counter() - t_cache
-    logger.log_info('c03/cache',
-                   f'P4 cache built: {len(p4_train)} train + {len(p4_val)} val '
-                   f'({dt_cache:.0f}s, ~{sum(t.numel() for t in p4_train.values()) * 4 / 1e9:.1f} GB CPU)')
-
-    # Backbone 移到 CPU 释放 GPU 显存 | Free GPU memory after caching
-    backbone.cpu()
-    torch.cuda.empty_cache()
-    logger.log_info('c03/cache', 'Backbone offloaded to CPU, GPU memory freed')
+    # Tile 模式下 tile 数量大 (~2000+)，不缓存 P4，改用 on-the-fly backbone forward。
+    # In tile mode, tile count is large → skip cache, use on-the-fly backbone instead.
+    if use_tile:
+        p4_train, p4_val = None, None
+        logger.log_info('c03/cache',
+                       f'Tile mode: {len(train_ds)} tiles, P4 cache disabled '
+                       f'(backbone stays on GPU, batched forward per episode)')
+    else:
+        t_cache = time.perf_counter()
+        p4_train = precompute_p4_cache(train_ds, backbone, device, desc="P4 cache train")
+        p4_val = precompute_p4_cache(val_ds, backbone, device, desc="P4 cache val")
+        dt_cache = time.perf_counter() - t_cache
+        logger.log_info('c03/cache',
+                       f'P4 cache built: {len(p4_train)} train + {len(p4_val)} val '
+                       f'({dt_cache:.0f}s, ~{sum(t.numel() for t in p4_train.values()) * 4 / 1e9:.1f} GB CPU)')
+        # Backbone 移到 CPU 释放 GPU 显存 | Free GPU memory after caching
+        backbone.cpu()
+        torch.cuda.empty_cache()
+        logger.log_info('c03/cache', 'Backbone offloaded to CPU, GPU memory freed')
 
     all_results = {}
     rng = np.random.RandomState(args.seed)
@@ -558,7 +782,8 @@ def main():
 
                 loss = train_episode(decoder, support_idxs, qi,
                                     train_ds, val_ds, query_class, device, opt,
-                                    p4_cache_train=p4_train, p4_cache_val=p4_val)
+                                    p4_cache_train=p4_train, p4_cache_val=p4_val,
+                                    backbone=backbone if use_tile else None)
                 if loss is not None:
                     total_loss += loss
                     n += 1
@@ -573,7 +798,8 @@ def main():
                 per_cls_val[cls_id] = validate_episode(
                     decoder, train_ds, val_ds,
                     cls_id, shot, device, rng, n_val=30,
-                    p4_cache_train=p4_train, p4_cache_val=p4_val)
+                    p4_cache_train=p4_train, p4_cache_val=p4_val,
+                    backbone=backbone if use_tile else None)
 
             mval = float(np.mean(list(per_cls_val.values())))
             logger.log_info(f'{tag}/train',
@@ -604,7 +830,8 @@ def main():
         result = evaluate_trained(decoder, train_ds, val_ds, device,
                                   shot, args.eval_episodes, TARGET_CLASSES,
                                   logger, f'{tag}/eval',
-                                  p4_cache_train=p4_train, p4_cache_val=p4_val)
+                                  p4_cache_train=p4_train, p4_cache_val=p4_val,
+                                  backbone=backbone if use_tile else None)
         all_results[f'{shot}shot'] = result
 
         # Compare with baselines if available
