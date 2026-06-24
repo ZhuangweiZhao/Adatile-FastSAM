@@ -248,32 +248,68 @@ def binary_iou(pred: torch.Tensor, gt: torch.Tensor) -> float:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# P4 Feature Cache (frozen backbone → precompute once)
+# ═══════════════════════════════════════════════════════════════════
+
+@torch.no_grad()
+def precompute_p4_cache(dataset, backbone, device, desc="P4 cache"):
+    """预计算数据集中所有图像的 P4 特征，存入 CPU dict。
+    Pre-compute P4 features for all images. Frozen backbone →每一张图只算一次。
+
+    内存 | Memory: ~21 MB/img (1280×64×64×4 bytes). iSAID train 141 img ≈ 3 GB CPU RAM.
+    """
+    cache = {}
+    for idx in tqdm(range(len(dataset)), desc=desc, leave=False):
+        img = dataset.load_image(idx).unsqueeze(0).to(device)
+        feat = backbone(img)['p4']  # [1, 1280, H/16, W/16]
+        cache[idx] = feat.squeeze(0).cpu()  # [1280, H/16, W/16] on CPU
+    return cache
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Episodic Training
 # ═══════════════════════════════════════════════════════════════════
 
-def train_episode(decoder, backbone, support_idxs, query_idx,
-                  train_ds, val_ds, query_class, device, opt):
-    """Single training episode: support → proto → CrossAttn → decoder → loss."""
+def train_episode(decoder, support_idxs, query_idx,
+                  train_ds, val_ds, query_class, device, opt,
+                  p4_cache_train=None, p4_cache_val=None,
+                  backbone=None):
+    """Single training episode: support → proto → CrossAttn → decoder → loss.
 
-    # Support: batch images through backbone
-    support_imgs = torch.stack([train_ds.load_image(si) for si in support_idxs]).to(device)
+    支持 P4 缓存: 如果传入 cache，跳过 backbone forward。
+    Supports P4 cache: backbone is skipped when caches are provided.
+    """
+
+    shot = len(support_idxs)
+
+    # ── Support P4 (cache first, then backbone fallback) ──
+    if p4_cache_train is not None:
+        support_p4s = [p4_cache_train[int(si)].unsqueeze(0).to(device)
+                       for si in support_idxs]
+    else:
+        support_imgs = torch.stack([train_ds.load_image(int(si))
+                                     for si in support_idxs]).to(device)
+        support_feats = backbone(support_imgs)
+        support_p4s = [support_feats['p4'][i] for i in range(shot)]
+
+    # ── Query P4 (cache first, then backbone fallback) ──
+    if p4_cache_val is not None:
+        query_p4 = p4_cache_val[int(query_idx)].unsqueeze(0).to(device)
+    else:
+        query_img = val_ds.load_image(int(query_idx)).unsqueeze(0).to(device)
+        query_p4 = backbone(query_img)['p4']
+
+    # ── Masks (lazy render) ──
     support_masks = [train_ds.render_class_mask(si, query_class).to(device)
                      for si in support_idxs]
-
-    # Query
-    query_img = val_ds.load_image(query_idx).unsqueeze(0).to(device)
     query_mask = val_ds.render_class_mask(query_idx, query_class)
     query_mask = query_mask.unsqueeze(0).unsqueeze(0).to(device)  # [1,1,H,W]
 
-    # Forward
-    support_feats = backbone(support_imgs)
-    support_p4s = [support_feats['p4'][i] for i in range(len(support_idxs))]
-
+    # ── Prototype → CrossAttn → Decoder → Loss ──
     fg_proto = compute_fg_prototype(support_p4s, support_masks)
     if fg_proto.sum() == 0:
         return None
 
-    query_p4 = backbone(query_img)['p4']
     logit = decoder(query_p4, fg_proto, target_size=tuple(query_mask.shape[2:]))
 
     # BCE + Dice loss (per spec: 标准二分类损失)
@@ -292,9 +328,11 @@ def train_episode(decoder, backbone, support_idxs, query_idx,
 
 
 @torch.no_grad()
-def validate_episode(decoder, backbone, train_ds, val_ds, query_class,
-                     shot, device, rng, n_val=30):
-    """Validation: 固定 episodes 评估 mIoU."""
+def validate_episode(decoder, train_ds, val_ds, query_class,
+                     shot, device, rng, n_val=30,
+                     p4_cache_train=None, p4_cache_val=None,
+                     backbone=None):
+    """Validation: 固定 episodes 评估 mIoU. Supports P4 cache."""
     train_candidates = train_ds.class_to_images(query_class)
     val_candidates = val_ds.class_to_images(query_class)
     if len(train_candidates) < shot or not val_candidates:
@@ -305,18 +343,31 @@ def validate_episode(decoder, backbone, train_ds, val_ds, query_class,
         support_idxs = rng.choice(train_candidates, shot, replace=False)
         qi = int(rng.choice(val_candidates))
 
-        support_imgs = torch.stack([train_ds.load_image(si) for si in support_idxs]).to(device)
+        # Support P4
+        if p4_cache_train is not None:
+            support_p4s = [p4_cache_train[int(si)].unsqueeze(0).to(device)
+                          for si in support_idxs]
+        else:
+            support_imgs = torch.stack([train_ds.load_image(int(si))
+                                         for si in support_idxs]).to(device)
+            support_p4s = [backbone(support_imgs)['p4'][i] for i in range(shot)]
+
+        # Query P4
+        if p4_cache_val is not None:
+            query_p4 = p4_cache_val[qi].unsqueeze(0).to(device)
+        else:
+            query_img = val_ds.load_image(qi).unsqueeze(0).to(device)
+            query_p4 = backbone(query_img)['p4']
+
         support_masks = [train_ds.render_class_mask(si, query_class).to(device)
                          for si in support_idxs]
-        query_img = val_ds.load_image(qi).unsqueeze(0).to(device)
         query_mask = val_ds.render_class_mask(qi, query_class).to(device)
 
-        support_p4s = [backbone(support_imgs)['p4'][i] for i in range(len(support_idxs))]
         fg_proto = compute_fg_prototype(support_p4s, support_masks)
         if fg_proto.sum() == 0:
             continue
 
-        logit = decoder(backbone(query_img)['p4'], fg_proto,
+        logit = decoder(query_p4, fg_proto,
                        target_size=tuple(query_mask.shape))
         pred = (logit.squeeze().cpu() > 0).numpy()
         gt = query_mask.cpu().numpy() > 0
@@ -326,9 +377,11 @@ def validate_episode(decoder, backbone, train_ds, val_ds, query_class,
 
 
 @torch.no_grad()
-def evaluate_trained(decoder, backbone, train_ds, val_ds, device,
-                     shot, n_episodes, target_classes, logger, tag):
-    """Full evaluation after training."""
+def evaluate_trained(decoder, train_ds, val_ds, device,
+                     shot, n_episodes, target_classes, logger, tag,
+                     p4_cache_train=None, p4_cache_val=None,
+                     backbone=None):
+    """Full evaluation after training. Supports P4 cache."""
     class_to_images = {c: train_ds.class_to_images(c) for c in target_classes}
     rng = np.random.RandomState(42)
     all_ious, per_cls_ious = [], defaultdict(list)
@@ -349,18 +402,31 @@ def evaluate_trained(decoder, backbone, train_ds, val_ds, device,
         support_idxs = rng.choice(candidates, shot, replace=False)
         qi = int(rng.choice(val_candidates))
 
-        support_imgs = torch.stack([train_ds.load_image(si) for si in support_idxs]).to(device)
+        # Support P4
+        if p4_cache_train is not None:
+            support_p4s = [p4_cache_train[int(si)].unsqueeze(0).to(device)
+                          for si in support_idxs]
+        else:
+            support_imgs = torch.stack([train_ds.load_image(int(si))
+                                         for si in support_idxs]).to(device)
+            support_p4s = [backbone(support_imgs)['p4'][i] for i in range(shot)]
+
+        # Query P4
+        if p4_cache_val is not None:
+            query_p4 = p4_cache_val[qi].unsqueeze(0).to(device)
+        else:
+            query_img = val_ds.load_image(qi).unsqueeze(0).to(device)
+            query_p4 = backbone(query_img)['p4']
+
         support_masks = [train_ds.render_class_mask(si, query_class).to(device)
                          for si in support_idxs]
-        query_img = val_ds.load_image(qi).unsqueeze(0).to(device)
         query_mask = val_ds.render_class_mask(qi, query_class).to(device)
 
-        support_p4s = [backbone(support_imgs)['p4'][i] for i in range(len(support_idxs))]
         fg_proto = compute_fg_prototype(support_p4s, support_masks)
         if fg_proto.sum() == 0:
             continue
 
-        logit = decoder(backbone(query_img)['p4'], fg_proto,
+        logit = decoder(query_p4, fg_proto,
                        target_size=tuple(query_mask.shape))
         pred = (logit.squeeze().cpu() > 0).numpy()
         gt = query_mask.cpu().numpy() > 0
@@ -435,9 +501,25 @@ def main():
                    f'Target: {[(c, TARGET_CLASSES[c]) for c in sorted(TARGET_CLASSES)]}')
 
     # ── Backbone (frozen, shared) ──
-    backbone = FastSAMBackbone(freeze_backbone=True).eval()
+    backbone = FastSAMBackbone(freeze_backbone=True).eval().to(device)
     logger.log_info('c03/model', 'FastSAM backbone (frozen)')
     logger.log_info('c03/method', 'CAT-SAM Lite: Cross-Attention + InstanceDecoder')
+
+    # ── P4 Precomputation Cache | P4 预计算缓存 ──
+    # 冻结 backbone → 每张图的 P4 只算一次。训练/验证直接查表，不再重复 forward。
+    # Frozen backbone → compute P4 once per image. ~3 GB CPU RAM for iSAID train set.
+    t_cache = time.perf_counter()
+    p4_train = precompute_p4_cache(train_ds, backbone, device, desc="P4 cache train")
+    p4_val = precompute_p4_cache(val_ds, backbone, device, desc="P4 cache val")
+    dt_cache = time.perf_counter() - t_cache
+    logger.log_info('c03/cache',
+                   f'P4 cache built: {len(p4_train)} train + {len(p4_val)} val '
+                   f'({dt_cache:.0f}s, ~{sum(t.numel() for t in p4_train.values()) * 4 / 1e9:.1f} GB CPU)')
+
+    # Backbone 移到 CPU 释放 GPU 显存 | Free GPU memory after caching
+    backbone.cpu()
+    torch.cuda.empty_cache()
+    logger.log_info('c03/cache', 'Backbone offloaded to CPU, GPU memory freed')
 
     all_results = {}
     rng = np.random.RandomState(args.seed)
@@ -474,8 +556,9 @@ def main():
                 support_idxs = rng.choice(candidates, shot, replace=False)
                 qi = int(rng.choice(val_candidates))
 
-                loss = train_episode(decoder, backbone, support_idxs, qi,
-                                    train_ds, val_ds, query_class, device, opt)
+                loss = train_episode(decoder, support_idxs, qi,
+                                    train_ds, val_ds, query_class, device, opt,
+                                    p4_cache_train=p4_train, p4_cache_val=p4_val)
                 if loss is not None:
                     total_loss += loss
                     n += 1
@@ -488,8 +571,9 @@ def main():
             per_cls_val = {}
             for cls_id in TARGET_CLASSES:
                 per_cls_val[cls_id] = validate_episode(
-                    decoder, backbone, train_ds, val_ds,
-                    cls_id, shot, device, rng, n_val=30)
+                    decoder, train_ds, val_ds,
+                    cls_id, shot, device, rng, n_val=30,
+                    p4_cache_train=p4_train, p4_cache_val=p4_val)
 
             mval = float(np.mean(list(per_cls_val.values())))
             logger.log_info(f'{tag}/train',
@@ -517,9 +601,10 @@ def main():
 
         # ── Evaluation ──
         logger.log_info(f'{tag}/eval', 'Evaluating trained decoder...')
-        result = evaluate_trained(decoder, backbone, train_ds, val_ds, device,
+        result = evaluate_trained(decoder, train_ds, val_ds, device,
                                   shot, args.eval_episodes, TARGET_CLASSES,
-                                  logger, f'{tag}/eval')
+                                  logger, f'{tag}/eval',
+                                  p4_cache_train=p4_train, p4_cache_val=p4_val)
         all_results[f'{shot}shot'] = result
 
         # Compare with baselines if available
