@@ -811,12 +811,14 @@ def main():
             epoch_metrics = {'epoch': epoch, 'loss': round(avg_loss, 6),
                            'val_miou': round(mval, 6),
                            'per_cls': {str(k): round(v, 6) for k, v in per_cls_val.items()}}
+            metrics_path.parent.mkdir(parents=True, exist_ok=True)
             with open(metrics_path, 'a') as mf:
                 mf.write(json.dumps(epoch_metrics) + '\n'); mf.flush()
 
             if mval > best_val_iou:
                 best_val_iou = mval
                 best_state = {k: v.clone() for k, v in decoder.state_dict().items()}
+                output_dir.mkdir(parents=True, exist_ok=True)
                 torch.save(best_state, str(output_dir / f'catsam_{shot}shot_best.pt'))
 
         if best_state:
