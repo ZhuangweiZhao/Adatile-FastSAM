@@ -175,7 +175,7 @@ def train_episode_optimized(decoder, support_idxs, query_idx,
         return None
 
     # ── AMP forward + backward ──
-    with torch.cuda.amp.autocast(enabled=use_amp):
+    with torch.amp.autocast('cuda', enabled=use_amp):
         logit = decoder(query_p4, fg_proto, target_size=tuple(query_mask.shape[2:]))
         bce_loss = F.binary_cross_entropy_with_logits(logit, query_mask)
         prob = torch.sigmoid(logit)
@@ -239,7 +239,7 @@ def validate_episode_optimized(decoder, train_ds, val_ds, query_class,
         if fg_proto.sum() == 0:
             continue
 
-        with torch.cuda.amp.autocast(enabled=use_amp):
+        with torch.amp.autocast('cuda', enabled=use_amp):
             logit = decoder(query_p4, fg_proto, target_size=tuple(query_mask.shape))
         pred = (logit.squeeze().cpu() > 0).numpy()
         gt = query_mask.cpu().numpy() > 0
@@ -555,9 +555,11 @@ def parse_args():
                    help='P4 特征缓存在 CPU pinned memory (非 tile 模式下默认 GPU)')
     p.add_argument('--p4-cache-dir', type=str, default=None,
                    help='P4 缓存持久化目录 (下次运行跳过预计算)')
-    p.add_argument('--p4-batch-size', type=int, default=16,
-                   help='P4 预计算 batch size (默认 16, 5090 可设 32)')
-    p.add_argument('--tile-cache-size', type=int, default=32,
+    p.add_argument('--p4-batch-size', type=int, default=32,
+                   help='P4 预计算 batch size (默认 32, 5090 可设 64)')
+    p.add_argument('--num-workers', type=int, default=8,
+                   help='并行 I/O 线程数 (默认 8)')
+    p.add_argument('--tile-cache-size', type=int, default=64,
                    help='Tile wrapper 原图 LRU 缓存大小 (默认 32, 5090 可设 64)')
     return p.parse_args()
 
@@ -626,13 +628,15 @@ def main():
 
         p4_cache_train = auto_build_p4_cache(
             train_ds, backbone, device=p4_storage, fp16=True,
-            batch_size=args.p4_batch_size, pin_memory=(p4_storage == "cpu"),
+            batch_size=args.p4_batch_size, pin_memory=True,
             cache_dir=args.p4_cache_dir, cache_name=p4_cache_name,
+            num_workers=args.num_workers,
         )
         p4_cache_val = auto_build_p4_cache(
             val_ds, backbone, device=p4_storage, fp16=True,
-            batch_size=args.p4_batch_size, pin_memory=(p4_storage == "cpu"),
+            batch_size=args.p4_batch_size, pin_memory=True,
             cache_dir=args.p4_cache_dir, cache_name=p4_cache_name_val,
+            num_workers=args.num_workers,
         )
         p4_train = p4_cache_train
         p4_val = p4_cache_val

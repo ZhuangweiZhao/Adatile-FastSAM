@@ -102,60 +102,85 @@ class ISAIDTileWrapper:
 
         # ── 预计算全部 tile 坐标 & class→tile 映射 ──
         # Pre-compute all tile coordinates + class→tile mapping
+        # 优化: 使用 COCO metadata 获取尺寸 (避免每张图 ~48MB 的 cv2.imread)
+        # Opt: use COCO metadata for dims (avoids ~48MB cv2.imread per image)
+        # 优化: O(1) bbox→tile 映射 (整数除法代替 O(n_tiles × n_bboxes) 遍历)
+        # Opt: O(1) bbox→tile via integer division instead of O(tiles×bboxes) scan
         self._tiles: list[tuple[int, int, int]] = []  # [(img_idx, x0, y0), ...]
-        self._class_to_tiles: dict[int, list[int]] = {}
+        self._class_to_tiles: dict[int, set[int]] = defaultdict(set)
         skipped_empty = 0
+        total_bbox_checks = 0  # 统计 | stats
 
         for img_idx in tqdm(range(len(dataset)), desc="Tile grid", leave=False):
             img_info = dataset._img_infos[img_idx]
-            img_path = str(
-                dataset.src_root / dataset.split / "images" / img_info["file_name"]
-            )
-            img = cv2.imread(img_path)
-            if img is None:
-                logger.log_info(
-                    "tile_grid", f"Skip unreadable image: {img_path}"
+            # COCO JSON 已有 width/height — 无需 cv2.imread
+            # COCO JSON already has width/height — no cv2.imread needed
+            w: int = img_info.get("width", 0)
+            h: int = img_info.get("height", 0)
+
+            if w <= 0 or h <= 0:
+                # Fallback: 如果 metadata 缺失则读文件 | Fallback if metadata missing
+                img_path = str(
+                    dataset.src_root / dataset.split / "images" / img_info["file_name"]
                 )
-                continue
-            h, w = img.shape[:2]
+                img = cv2.imread(img_path)
+                if img is None:
+                    logger.log_info("tile_grid", f"Skip unreadable: {img_path}")
+                    skipped_empty += 1
+                    continue
+                h, w = img.shape[:2]
+                logger.log_info("tile_grid",
+                               f"Fallback cv2.imread for {img_info['file_name']}: {w}x{h}")
 
             if h < tile_size or w < tile_size:
                 skipped_empty += 1
                 continue
 
-            # 记录本图 tile 起始索引 | Record start index for this image
+            # ── 滑窗切分 | Sliding window ──
             tile_start = len(self._tiles)
+            n_cols = (w - tile_size) // stride + 1
+            n_rows = (h - tile_size) // stride + 1
 
-            # 滑窗切分 | Sliding window
-            for y0 in range(0, h - tile_size + 1, stride):
-                for x0 in range(0, w - tile_size + 1, stride):
+            for row in range(n_rows):
+                y0 = row * stride
+                for col in range(n_cols):
+                    x0 = col * stride
                     self._tiles.append((img_idx, x0, y0))
 
-            # ── Class→tile 映射: 通过 bbox 重叠检测 ──
-            # Map classes to tiles via bbox overlap check
+            # ── Class→tile O(1) 映射: 对每个 bbox 直接计算覆盖的 tile 范围 ──
+            # O(1) bbox→tile: for each bbox, compute tile range via integer division
             anns = dataset._img_anns.get(img_info["id"], [])
-            cat_to_bboxes: dict[int, list[list[float]]] = defaultdict(list)
+            if not anns:
+                continue
+
+            # 按类别分组 bbox | Group bboxes by category
+            cat_to_bboxes: dict[int, list[tuple[float, float, float, float]]] = defaultdict(list)
             for ann in anns:
                 bbox = ann.get("bbox", [0, 0, 0, 0])
                 if bbox[2] > 0 and bbox[3] > 0:
-                    cat_to_bboxes[ann["category_id"]].append(bbox)
+                    cat_to_bboxes[ann["category_id"]].append(
+                        (bbox[0], bbox[1], bbox[2], bbox[3])
+                    )
 
             for cat_id, bboxes in cat_to_bboxes.items():
-                temp_set: set[int] = set()
-                for tile_i in range(tile_start, len(self._tiles)):
-                    _, tx0, ty0 = self._tiles[tile_i]
-                    tx1, ty1 = tx0 + tile_size, ty0 + tile_size
-                    for bx, by, bw, bh in bboxes:
-                        if bx < tx1 and bx + bw > tx0 and by < ty1 and by + bh > ty0:
-                            temp_set.add(tile_i)
-                            break
-                if cat_id not in self._class_to_tiles:
-                    self._class_to_tiles[cat_id] = []
-                self._class_to_tiles[cat_id].extend(temp_set)
+                for bx, by, bw, bh in bboxes:
+                    # 整数除法计算 bbox 覆盖的 tile 范围 | Integer division for tile range
+                    tx_start = int(bx // stride)
+                    tx_end = min(int((bx + bw - 1) // stride) + 1, n_cols)
+                    ty_start = int(by // stride)
+                    ty_end = min(int((by + bh - 1) // stride) + 1, n_rows)
 
-        # 去重 + 排序 | Deduplicate + sort
+                    # 直接索引 tile: tile_i = tile_start + row * n_cols + col
+                    # Direct tile index: tile_i = tile_start + row * n_cols + col
+                    for ty in range(ty_start, ty_end):
+                        row_offset = ty * n_cols
+                        for tx in range(tx_start, tx_end):
+                            self._class_to_tiles[cat_id].add(tile_start + row_offset + tx)
+                    total_bbox_checks += 1
+
+        # 转为排序列表 | Convert to sorted lists
         self._class_to_tiles = {
-            int(k): sorted(set(v))
+            int(k): sorted(v)
             for k, v in self._class_to_tiles.items()
         }
 

@@ -30,6 +30,7 @@ forward overhead.
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional, Union
 
@@ -87,6 +88,7 @@ class P4Cache:
         fp16: bool = True,
         batch_size: int = 8,
         pin_memory: bool = True,
+        num_workers: int = 4,
     ):
         self.dataset = dataset
         self.backbone = backbone
@@ -94,6 +96,7 @@ class P4Cache:
         self.fp16 = fp16
         self.batch_size = batch_size
         self.pin_memory = pin_memory and (device == "cpu")
+        self.num_workers = num_workers
 
         self._cache: dict[int, torch.Tensor] = {}
         self._built = False
@@ -122,14 +125,20 @@ class P4Cache:
 
         # ── Warmup: 计算单个样本确定 feature shape ──
         # Warmup: compute single sample to determine feature shape
+        # 计算设备始终是 backbone 所在设备 (CUDA)，存储设备可能不同
+        # Compute device is always where backbone lives (CUDA), storage may differ
+        backbone_device = next(self.backbone.parameters()).device
+        storage_device = torch.device(self.device)
+        compute_device = backbone_device  # backbone always on CUDA
+
         sample_img = self.dataset.load_image(0)
         if sample_img.dim() == 3:
             sample_img = sample_img.unsqueeze(0)  # [1, 3, H, W]
-        sample_img = sample_img.to(self.device)
+        sample_img = sample_img.to(compute_device)
 
         # 使用 autocast 加速 warmup (backbone 在 fp16 下更快)
         # Use autocast for warmup speed (backbone faster in fp16)
-        with torch.cuda.amp.autocast(enabled=self.fp16 and self.device == "cuda"):
+        with torch.amp.autocast('cuda', enabled=self.fp16):
             sample_feat = self.backbone(sample_img)["p4"]  # [1, C, h, w]
 
         self.feat_dim = sample_feat.shape[1]
@@ -154,12 +163,8 @@ class P4Cache:
 
         # ── 逐 batch 预计算 | Batch-wise pre-computation ──
         t0 = time.perf_counter()
-        backbone_device = next(self.backbone.parameters()).device
-        storage_device = torch.device(self.device)
-
-        # 将 backbone 放到计算设备 | Put backbone on compute device
-        if str(backbone_device) != self.device:
-            self.backbone = self.backbone.to(self.device)
+        # backbone 保持在计算设备 (CUDA), 不需要移动
+        # backbone stays on compute device (CUDA), no need to move
         self.backbone.eval()
 
         for start in tqdm(
@@ -168,21 +173,38 @@ class P4Cache:
             end = min(start + self.batch_size, n_samples)
             batch_indices = list(range(start, end))
 
-            # 加载 batch 图像 | Load batch images
-            batch_imgs = []
-            for idx in batch_indices:
+            # 加载 batch 图像 (并行 I/O) | Load batch images (parallel I/O)
+            batch_imgs = [None] * len(batch_indices)
+
+            def _load_one(idx: int) -> tuple[int, torch.Tensor]:
+                """加载单个 tile, 返回 (batch_pos, tensor) | Load one tile."""
                 img = self.dataset.load_image(idx)
                 if img.dim() == 3:
                     img = img.unsqueeze(0)
-                batch_imgs.append(img)
+                return batch_indices.index(idx), img
 
-            batch_tensor = torch.cat(batch_imgs, dim=0).to(self.device)
+            if self.num_workers > 1:
+                with ThreadPoolExecutor(max_workers=self.num_workers) as pool:
+                    futures = {pool.submit(self.dataset.load_image, idx): i
+                              for i, idx in enumerate(batch_indices)}
+                    for future in as_completed(futures):
+                        i = futures[future]
+                        img = future.result()
+                        if img.dim() == 3:
+                            img = img.unsqueeze(0)
+                        batch_imgs[i] = img
+            else:
+                for i, idx in enumerate(batch_indices):
+                    img = self.dataset.load_image(idx)
+                    if img.dim() == 3:
+                        img = img.unsqueeze(0)
+                    batch_imgs[i] = img
+
+            batch_tensor = torch.cat(batch_imgs, dim=0).to(compute_device)
 
             # Backbone forward (使用 autocast 加速大 batch)
             # Backbone forward (autocast for speed on large batch)
-            with torch.cuda.amp.autocast(
-                enabled=self.fp16 and self.device == "cuda"
-            ):
+            with torch.amp.autocast('cuda', enabled=self.fp16):
                 feats = self.backbone(batch_tensor)["p4"]  # [B, C, h, w]
 
             # 存入选定设备 + 可选精度 | Store on target device + optional precision
@@ -365,6 +387,7 @@ def auto_build_p4_cache(
     pin_memory: bool = True,
     cache_dir: str = None,
     cache_name: str = "p4_cache",
+    num_workers: int = 4,
 ) -> P4Cache:
     """
     自动构建或加载 P4 缓存 | Auto-build or load P4 cache.
@@ -380,6 +403,7 @@ def auto_build_p4_cache(
     :param pin_memory: CPU 缓存是否使用 pinned memory
     :param cache_dir: 缓存目录 | Cache directory (None = no disk cache)
     :param cache_name: 缓存文件名前缀 | Cache filename prefix
+    :param num_workers: 并行 I/O 线程数 | Parallel I/O thread count
     :return: P4Cache instance (built)
     """
     # 尝试从磁盘加载 | Try loading from disk
@@ -402,6 +426,7 @@ def auto_build_p4_cache(
         fp16=fp16,
         batch_size=batch_size,
         pin_memory=pin_memory,
+        num_workers=num_workers,
     )
     cache.build()
 
