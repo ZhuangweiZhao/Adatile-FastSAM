@@ -51,7 +51,7 @@ Decoder 变体 | Decoder Variants:
         --shots 1,3,5 --eval-only --checkpoint runs/c04/decoder_1shot_best.pt
 """
 
-import sys, argparse, time, json, datetime
+import sys, argparse, time, json, datetime, warnings
 from pathlib import Path
 from collections import defaultdict
 from typing import Dict, List, Tuple, Optional
@@ -68,11 +68,11 @@ from adatile.logging import get_logger
 from adatile.logging.backends import ConsoleBackend, FileBackend
 from adatile.utils.seed import set_seed
 from adatile.backbone import FastSAMBackbone
-from adatile.utils.label_mapping import ISAID_CATEGORIES, get_category_name
+from adatile.utils.label_mapping import ISAID_CATEGORIES
 
-# ── 复用 C-02A 的数据集和 mask 渲染 | Reuse C-02A dataset + mask rendering ──
+# ── 复用 C-02A 的数据集 | Reuse C-02A dataset ──
 from tools.instance.eval_c02a_fastsam_fewshot import (
-    ISAIDInstanceDataset, _render_gt_mask,
+    ISAIDInstanceDataset,
 )
 
 from adatile.utils.prototype import compute_fg_prototype
@@ -125,7 +125,8 @@ class ProtoRefineDecoder(nn.Module):
 
     def forward(self, query_p4, fg_prototype, target_size=None):
         q_norm = F.normalize(query_p4, dim=1, p=2)
-        sim = (q_norm * fg_prototype.view(1, -1, 1, 1)).sum(dim=1, keepdim=True)
+        p_norm = F.normalize(fg_prototype, dim=0, p=2)  # true cosine similarity
+        sim = (q_norm * p_norm.view(1, -1, 1, 1)).sum(dim=1, keepdim=True)
         sim = sim / self.temperature
         x = self.refine(sim)
         if target_size is not None:
@@ -178,10 +179,13 @@ class FiLMFewShotDecoder(nn.Module):
         x = self.proj(query_p4)
 
         # FiLM condition injection
-        if fg_prototype is not None and fg_prototype.sum() != 0:
+        if fg_prototype is not None and fg_prototype.abs().sum() > 1e-8:
             film_out = self.film_mlp(fg_prototype)
             gamma, beta = film_out.chunk(2, dim=0)
             x = gamma[None, :, None, None] * x + beta[None, :, None, None]
+        else:
+            warnings.warn("FiLMFewShotDecoder: empty prototype, FiLM skipped. "
+                         "Output is unconditioned.", RuntimeWarning)
 
         # Upsample path: H/16 → H/4 → H/2 → H
         x = self.up1(x)
@@ -263,13 +267,19 @@ def build_decoder(method: str, **kwargs) -> nn.Module:
     :param kwargs: passed to decoder constructor (e.g. num_prototypes for crossattn)
     """
     if method == "baseline":
-        return ProtoRefineDecoder(**kwargs)
+        return ProtoRefineDecoder(
+            feat_dim=kwargs.get("feat_dim", 1280),
+            temperature=kwargs.get("temperature", 0.1))
     elif method == "film":
-        return FiLMFewShotDecoder(**kwargs)
+        return FiLMFewShotDecoder(
+            feat_dim=kwargs.get("feat_dim", 1280))
     elif method == "crossattn":
         return CATFewShotDecoder(**kwargs)
     elif method == "contrastive":
-        return ContrastiveProtoDecoder(**kwargs)
+        return ContrastiveProtoDecoder(
+            feat_dim=kwargs.get("feat_dim", 1280),
+            proj_dim=kwargs.get("proj_dim", 256),
+            temperature=kwargs.get("temperature", 0.1))
     else:
         raise ValueError(f"Unknown decoder: {method}")
 
@@ -319,7 +329,7 @@ def train_episode(decoder, backbone, support_idxs, query_idx,
     query_mask = val_ds.render_class_mask(query_idx, query_class)
     query_mask = query_mask.unsqueeze(0).unsqueeze(0).to(device)  # [1,1,H,W]
 
-    # Forward - support (no grad on backbone)
+    # Forward - support + query backbone (no grad on frozen backbone)
     with torch.no_grad():
         support_feats = backbone(support_imgs)
         support_p4s = [support_feats["p4"][i] for i in range(len(support_idxs))]
@@ -330,20 +340,20 @@ def train_episode(decoder, backbone, support_idxs, query_idx,
         else:
             fg_proto = compute_fg_prototype(support_p4s, support_masks)
 
-    # Check empty prototype
-    if fg_proto.dim() == 1 and fg_proto.sum() == 0:
-        return None
-    if fg_proto.dim() == 2 and fg_proto.sum() == 0:
-        return None
+        # Check empty prototype
+        if fg_proto.dim() == 1 and fg_proto.sum() == 0:
+            return None
+        if fg_proto.dim() == 2 and fg_proto.sum() == 0:
+            return None
 
-    # Forward - query
+        query_p4 = backbone(query_img)["p4"]
+
+    # Forward - query decoder (grad only through decoder)
     if use_amp:
         with torch.amp.autocast('cuda'):
-            query_p4 = backbone(query_img)["p4"]
             logit = decoder(query_p4, fg_proto, target_size=tuple(query_mask.shape[2:]))
             loss, components = focal_dice_loss(logit, query_mask)
     else:
-        query_p4 = backbone(query_img)["p4"]
         logit = decoder(query_p4, fg_proto, target_size=tuple(query_mask.shape[2:]))
         loss, components = focal_dice_loss(logit, query_mask)
 
@@ -398,9 +408,9 @@ def validate_episode(decoder, backbone, train_ds, val_ds, query_class,
 
         logit = decoder(backbone(query_img)["p4"], fg_proto,
                        target_size=tuple(query_mask.shape))
-        pred = (logit.squeeze().cpu() > 0).numpy()
-        gt = query_mask.cpu().numpy() > 0
-        ious.append(binary_iou(torch.from_numpy(pred), torch.from_numpy(gt)))
+        pred = (logit.squeeze(0).squeeze(0).cpu() > 0)
+        gt = (query_mask.cpu() > 0)
+        ious.append(binary_iou(pred, gt))
 
     return float(np.mean(ious)) if ious else 0.0
 
@@ -450,9 +460,9 @@ def evaluate_full(decoder, backbone, train_ds, val_ds, device,
 
         logit = decoder(backbone(query_img)["p4"], fg_proto,
                        target_size=tuple(query_mask.shape))
-        pred = (logit.squeeze().cpu() > 0).numpy()
-        gt = query_mask.cpu().numpy() > 0
-        iou = binary_iou(torch.from_numpy(pred), torch.from_numpy(gt))
+        pred = (logit.squeeze(0).squeeze(0).cpu() > 0)
+        gt = (query_mask.cpu() > 0)
+        iou = binary_iou(pred, gt)
         all_ious.append(iou)
         per_cls_ious[query_class].append(iou)
 
@@ -506,13 +516,14 @@ def evaluate_full(decoder, backbone, train_ds, val_ds, device,
 # ═══════════════════════════════════════════════════════════════════
 
 def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
-                       shot, target_classes, args, logger, output_dir):
+                       shot, target_classes, args, logger, output_dir,
+                       decoder_type: str = "unknown"):
     """Full training + evaluation pipeline."""
-    tag = f"c04/{args.decoder}/{shot}shot"
+    tag = f"c04/{decoder_type}/{shot}shot"
     n_classes = len(target_classes)
     logger.log_info(f"{tag}/start",
-                   f"\\n{'='*60}\\n"
-                   f"  C-04 [{args.decoder}] {shot}-Shot -- {n_classes} classes\\n"
+                   f"\n{'='*60}\n"
+                   f"  C-04 [{decoder_type}] {shot}-Shot -- {n_classes} classes\n"
                    f"{'='*60}")
 
     # Optimizer & Scheduler
@@ -571,8 +582,9 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
     best_state = None
     best_per_cls_state = {}
     best_per_cls_iou = defaultdict(float)
-    metrics_path = output_dir / f"decoder_{args.decoder}_{shot}shot_metrics.jsonl"
+    metrics_path = output_dir / f"decoder_{decoder_type}_{shot}shot_metrics.jsonl"
     rng = np.random.RandomState(args.seed)
+    rng_val = np.random.RandomState(args.seed + 1)  # 独立 rng: validation 不影响 training 随机序列
 
     class_list = list(valid_classes.keys())
     class_sample_probs = [class_probs[c] for c in class_list]
@@ -613,7 +625,7 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
         for cls_id in valid_classes:
             per_cls_val[cls_id] = validate_episode(
                 decoder, backbone, train_ds, val_ds,
-                cls_id, shot, device, rng, n_val=args.val_episodes_per_class)
+                cls_id, shot, device, rng_val, n_val=args.val_episodes_per_class)
         for cls_id in zero_shot_classes:
             per_cls_val[cls_id] = 0.0
 
@@ -642,13 +654,13 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
             "per_cls": {str(k): round(v, 6) for k, v in per_cls_val.items()},
         }
         with open(metrics_path, "a") as mf:
-            mf.write(json.dumps(epoch_metrics) + "\\n")
+            mf.write(json.dumps(epoch_metrics) + "\n")
             mf.flush()
 
         if mval > best_val_miou:
             best_val_miou = mval
             best_state = {k: v.clone() for k, v in decoder.state_dict().items()}
-            torch.save(best_state, str(output_dir / f"decoder_{args.decoder}_{shot}shot_best.pt"))
+            torch.save(best_state, str(output_dir / f"decoder_{decoder_type}_{shot}shot_best.pt"))
 
     dt_train = time.perf_counter() - t0
     logger.log_info(f"{tag}/best",
@@ -657,7 +669,7 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
     # Save per-class best states
     for cls_id, state in best_per_cls_state.items():
         cls_name = target_classes[cls_id]
-        torch.save(state, str(output_dir / f"decoder_{args.decoder}_{shot}shot_best_c{cls_id}_{cls_name}.pt"))
+        torch.save(state, str(output_dir / f"decoder_{decoder_type}_{shot}shot_best_c{cls_id}_{cls_name}.pt"))
 
     # Restore best overall
     if best_state:
@@ -670,7 +682,7 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
                            logger, f"{tag}/eval")
 
     result["best_val_miou"] = best_val_miou
-    result["per_cls_best"] = {}
+    result["per_cls_best"] = dict(best_per_cls_iou)
     result["train_time_s"] = dt_train
     result["class_image_counts"] = class_image_counts
 
@@ -688,7 +700,8 @@ class NonParametricMatcher(nn.Module):
 
     def forward(self, query_p4, fg_prototype, target_size=None):
         q_norm = F.normalize(query_p4, dim=1, p=2)
-        sim = (q_norm * fg_prototype.view(1, -1, 1, 1)).sum(dim=1, keepdim=True)
+        p_norm = F.normalize(fg_prototype, dim=0, p=2)  # true cosine similarity
+        sim = (q_norm * p_norm.view(1, -1, 1, 1)).sum(dim=1, keepdim=True)
         logit = sim / self.temperature
         if target_size is not None:
             logit = F.interpolate(logit, size=target_size, mode="bilinear",
@@ -772,7 +785,7 @@ def main():
                        f"{n_train:4d} train, {n_val:4d} val images")
 
     # Backbone (frozen, shared)
-    backbone = FastSAMBackbone(freeze_backbone=True).eval()
+    backbone = FastSAMBackbone(freeze_backbone=True).to(device).eval()
     logger.log_info("c04/model", f"FastSAM backbone (frozen) on {device}")
 
     # Non-Parametric Baseline
@@ -808,7 +821,7 @@ def main():
 
     for decoder_type in decoder_types:
         logger.log_info(f"c04/{decoder_type}/header",
-                       f"\\n{'='*60}\\n  Decoder: {decoder_type}\\n{'='*60}")
+                       f"\n{'='*60}\n  Decoder: {decoder_type}\n{'='*60}")
         all_results[decoder_type] = {}
 
         for shot in shots:
@@ -824,7 +837,7 @@ def main():
                 ckpt_path = args.checkpoint or str(
                     output_dir / f"decoder_{decoder_type}_{shot}shot_best.pt")
                 if Path(ckpt_path).exists():
-                    decoder.load_state_dict(torch.load(ckpt_path, map_location=device))
+                    decoder.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True))
                     logger.log_info(f"c04/{decoder_type}/load", f"Loaded: {ckpt_path}")
                 else:
                     logger.log_warn(f"c04/{decoder_type}/load",
@@ -837,7 +850,8 @@ def main():
             else:
                 decoder, result, best_val = train_and_evaluate(
                     decoder, backbone, train_ds, val_ds, device,
-                    shot, target_classes, args, logger, output_dir)
+                    shot, target_classes, args, logger, output_dir,
+                    decoder_type=decoder_type)
                 all_results[decoder_type][f"{shot}shot"] = result
                 logger.log_metric(f"c04/{decoder_type}_miou_{shot}shot",
                                 result["miou_mean"],
@@ -847,7 +861,7 @@ def main():
                                 tags=["c04", decoder_type, f"{shot}shot", "val"])
 
     # Final Summary
-    logger.log_info("c04/summary", f"\\n{'='*90}")
+    logger.log_info("c04/summary", f"\n{'='*90}")
     logger.log_info("c04/summary",
                    f"  C-04: Full-Category Few-Shot -- {len(target_classes)} classes")
     logger.log_info("c04/summary", "="*90)
