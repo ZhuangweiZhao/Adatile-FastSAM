@@ -109,7 +109,7 @@ def setup_cuda_optimizations(device: str = "cuda", logger=None):
         pass  # 保留给未来细粒度控制 | Reserved for future fine-grained control
 
     gpu_name = torch.cuda.get_device_name(0)
-    gpu_mem = torch.cuda.get_device_properties(0).total_mem / 1e9
+    gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
     if logger:
         logger.log_info(
             "cuda",
