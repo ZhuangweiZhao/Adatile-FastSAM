@@ -630,13 +630,13 @@ def main():
             train_ds, backbone, device=p4_storage, fp16=True,
             batch_size=args.p4_batch_size, pin_memory=True,
             cache_dir=args.p4_cache_dir, cache_name=p4_cache_name,
-            num_workers=args.num_workers,
+            tile_wrapper=train_ds,  # 全图级预计算: 141 forwards vs 23621
         )
         p4_cache_val = auto_build_p4_cache(
             val_ds, backbone, device=p4_storage, fp16=True,
             batch_size=args.p4_batch_size, pin_memory=True,
             cache_dir=args.p4_cache_dir, cache_name=p4_cache_name_val,
-            num_workers=args.num_workers,
+            tile_wrapper=val_ds,  # 全图级预计算
         )
         p4_train = p4_cache_train
         p4_val = p4_cache_val

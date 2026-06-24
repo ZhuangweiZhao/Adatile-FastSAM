@@ -395,3 +395,41 @@ class ISAIDTileWrapper:
     def get_total_tiles(self) -> int:
         """返回 tile 总数 | Return total tile count."""
         return len(self._tiles)
+
+    # ── 全图级 P4 预计算支持 | Full-image P4 precomputation support ──
+
+    def get_source_image_count(self) -> int:
+        """
+        返回源图像数量 (用于全图级 P4 预计算)。
+        Returns number of unique source images (for full-image P4 precomputation).
+
+        全图级预计算: 对每张源图像仅运行一次 backbone forward,
+        然后从 feature map 裁剪各 tile 的 P4 → ~167× 加速。
+        Full-image precomputation: backbone forward once per source image,
+        then crop tile P4s from feature map → ~167× speedup.
+        """
+        return len(self.ds)
+
+    def get_tiles_for_image(self, img_idx: int) -> list[tuple[int, int, int]]:
+        """
+        返回属于指定源图像的所有 tile 信息。
+        Returns all tile info for a given source image.
+
+        :param img_idx: 源图像索引 | Source image index
+        :return: list of (tile_idx, x0, y0) tuples sorted by tile_idx
+        """
+        result = []
+        for tile_idx, (ti_img_idx, x0, y0) in enumerate(self._tiles):
+            if ti_img_idx == img_idx:
+                result.append((tile_idx, x0, y0))
+        return result
+
+    def load_full_image(self, img_idx: int) -> torch.Tensor:
+        """
+        加载完整源图像 → [3, H, W], 值域 [0, 1]。
+        Load full source image → [3, H, W] in [0, 1].
+
+        用于全图级 P4 预计算 | Used for full-image P4 precomputation.
+        """
+        img = self._load_original_image(img_idx)  # [H, W, 3] RGB
+        return torch.from_numpy(img).permute(2, 0, 1).float() / 255.0

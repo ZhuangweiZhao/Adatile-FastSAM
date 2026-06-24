@@ -264,6 +264,129 @@ class P4Cache:
 
         return self
 
+    @torch.no_grad()
+    def build_fast(self, tile_wrapper, desc: str = "P4 cache (fast)") -> "P4Cache":
+        """
+        全图级 P4 预计算: 每张源图像一次 backbone forward, 然后裁剪 tile P4。
+        Full-image P4 precomputation: one backbone forward per source image,
+        then crop tile P4s from the feature map.
+
+        对比逐 tile 预计算 (~23k backbone forwards):
+        vs per-tile precomputation (~23k backbone forwards):
+            141 images × 1 forward = 141 forwards → **~167× faster**.
+
+        要求 tile_wrapper 提供:
+        Requires tile_wrapper to provide:
+            - get_source_image_count() → int
+            - get_tiles_for_image(img_idx) → list[(tile_idx, x0, y0)]
+            - load_full_image(img_idx) → Tensor[3, H, W]
+            - tile_size → int
+
+        :param tile_wrapper: ISAIDTileWrapper 实例
+        :param desc: 进度条标签 | Progress bar label
+        :return: self
+        """
+        n_images = tile_wrapper.get_source_image_count()
+        n_tiles = len(tile_wrapper)
+        if n_images == 0 or n_tiles == 0:
+            logger.log_info("p4_cache", "Empty dataset, cache not built")
+            return self
+
+        # ── 确定设备 | Determine devices ──
+        storage_device = torch.device(self.device)
+        try:
+            backbone_device = next(self.backbone.parameters()).device
+        except StopIteration:
+            backbone_device = torch.device(
+                "cuda" if torch.cuda.is_available() else "cpu"
+            )
+        compute_device = backbone_device
+        self.backbone.eval()
+
+        # ── Warmup: 跑一张全图确定 P4 feature shape ──
+        # Warmup: run one full image to determine P4 feature shape
+        sample_img = tile_wrapper.load_full_image(0)
+        if sample_img.dim() == 3:
+            sample_img = sample_img.unsqueeze(0)
+        sample_img = sample_img.to(compute_device)
+        with torch.amp.autocast('cuda', enabled=self.fp16):
+            sample_p4 = self.backbone(sample_img)["p4"]  # [1, C, H/16, W/16]
+        self.feat_dim = sample_p4.shape[1]
+        self.spatial_size = (tile_wrapper.tile_size // 16, tile_wrapper.tile_size // 16)
+
+        per_tile_gb = (self.feat_dim * self.spatial_size[0] * self.spatial_size[1]
+                       * (2 if self.fp16 else 4)) / 1e9
+        total_est_gb = per_tile_gb * n_tiles
+        logger.log_info(
+            "p4_cache",
+            f"Fast pre-computation: {n_images} source images → {n_tiles} tiles, "
+            f"~{per_tile_gb:.3f} GB/tile, ~{total_est_gb:.1f} GB total "
+            f"({'fp16' if self.fp16 else 'fp32'}, storage={self.device})",
+        )
+
+        # ── 逐源图像处理 | Per-source-image processing ──
+        t0 = time.perf_counter()
+        ts = tile_wrapper.tile_size
+        pts = ts // 16  # P4 spatial tile size
+
+        for img_idx in tqdm(range(n_images), desc=desc, unit="img"):
+            # 获取该图像的所有 tile | Get all tiles for this image
+            tiles = tile_wrapper.get_tiles_for_image(img_idx)
+            if not tiles:
+                continue
+
+            # 加载全图 → backbone forward (一次!) | Load full image → backbone ONCE
+            full_img = tile_wrapper.load_full_image(img_idx)
+            if full_img.dim() == 3:
+                full_img = full_img.unsqueeze(0)
+            full_img = full_img.to(compute_device)
+
+            with torch.amp.autocast('cuda', enabled=self.fp16):
+                full_p4 = self.backbone(full_img)["p4"]  # [1, C, H/16, W/16]
+
+            full_p4_fp = full_p4[0]  # [C, H/16, W/16]
+            if self.fp16 and full_p4_fp.dtype != torch.float16:
+                full_p4_fp = full_p4_fp.half()
+
+            # 裁剪每个 tile 的 P4 | Crop P4 for each tile
+            for tile_idx, x0, y0 in tiles:
+                px0, py0 = x0 // 16, y0 // 16
+                tile_p4 = full_p4_fp[:, py0:py0 + pts, px0:px0 + pts]  # [C, ts, ts]
+
+                # 存入目标设备 | Store on target device
+                if storage_device.type == "cpu" and self.pin_memory:
+                    feat_cpu = torch.empty(
+                        tile_p4.shape, dtype=tile_p4.dtype,
+                        device="cpu", pin_memory=True,
+                    )
+                    feat_cpu.copy_(tile_p4, non_blocking=True)
+                    self._cache[tile_idx] = feat_cpu
+                elif storage_device.type == "cpu":
+                    self._cache[tile_idx] = tile_p4.cpu()
+                else:
+                    self._cache[tile_idx] = tile_p4.to(storage_device)
+
+            del full_img, full_p4, full_p4_fp
+
+        dt = time.perf_counter() - t0
+        self._built = True
+        self.total_size_gb = sum(
+            t.numel() * t.element_size() for t in self._cache.values()
+        ) / 1e9
+
+        logger.log_info(
+            "p4_cache",
+            f"P4 cache (fast) built: {len(self._cache)} tiles from {n_images} images, "
+            f"{self.total_size_gb:.1f} GB, {dt:.0f}s "
+            f"({n_images / dt:.1f} img/s, {n_tiles / dt:.1f} tiles/s)",
+        )
+        logger.log_metric("p4_cache_build_time_s", dt,
+                         tags=["p4_cache_fast", f"n_img={n_images}", f"n_tiles={n_tiles}"])
+        logger.log_metric("p4_cache_size_gb", self.total_size_gb,
+                         tags=["p4_cache_fast", f"fp16={self.fp16}"])
+
+        return self
+
     # ── 访问接口 | Access Interface ──────────────────────────────────────
 
     def __getitem__(self, idx: int) -> torch.Tensor:
@@ -395,6 +518,7 @@ def auto_build_p4_cache(
     cache_dir: str = None,
     cache_name: str = "p4_cache",
     num_workers: int = 4,
+    tile_wrapper=None,  # 如果传入则使用 build_fast (全图级预计算) | use build_fast if provided
 ) -> P4Cache:
     """
     自动构建或加载 P4 缓存 | Auto-build or load P4 cache.
@@ -406,11 +530,12 @@ def auto_build_p4_cache(
     :param backbone: Frozen FastSAM backbone
     :param device: 存储设备 | Storage device
     :param fp16: 是否使用 fp16 | Use fp16
-    :param batch_size: 预计算 batch 大小 | Pre-computation batch size
+    :param batch_size: 预计算 batch 大小 (仅 build() 使用)
     :param pin_memory: CPU 缓存是否使用 pinned memory
     :param cache_dir: 缓存目录 | Cache directory (None = no disk cache)
     :param cache_name: 缓存文件名前缀 | Cache filename prefix
-    :param num_workers: 并行 I/O 线程数 | Parallel I/O thread count
+    :param num_workers: 并行 I/O 线程数 (仅 build() 使用)
+    :param tile_wrapper: ISAIDTileWrapper 实例 → 使用 build_fast (全图级, ~167× 加速)
     :return: P4Cache instance (built)
     """
     # 尝试从磁盘加载 | Try loading from disk
@@ -435,7 +560,13 @@ def auto_build_p4_cache(
         pin_memory=pin_memory,
         num_workers=num_workers,
     )
-    cache.build()
+
+    if tile_wrapper is not None:
+        # 全图级预计算: backbone 每张源图像仅跑一次 → ~167× 加速
+        # Full-image precomputation: backbone once per source image
+        cache.build_fast(tile_wrapper)
+    else:
+        cache.build()
 
     # 保存到磁盘 | Save to disk
     if cache_dir is not None:
