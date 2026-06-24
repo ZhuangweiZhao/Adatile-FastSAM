@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 C-04: Full-Category Few-Shot Instance Segmentation on iSAID
 ============================================================
@@ -20,6 +20,7 @@ Phase D 核心实验 | Core Experiment:
 Decoder 变体 | Decoder Variants:
     - 'baseline': ProtoRefineDecoder (~10K params) — Proto → cosine_sim → Refine CNN
     - 'film':     FiLMFewShotDecoder (~1.1M params) — Proto → FiLM → InstanceDecoder
+    - 'crossattn': CATFewShotDecoder (~1.1M params) — Proto → CrossAttn → InstanceDecoder (C-03 同款)
     - 'contrastive': ContrastiveProtoDecoder (~1.3M params) — Proto → Projection → Contrastive
 
 改进 | Improvements over C-02B/C-03:
@@ -75,6 +76,13 @@ from tools.instance.eval_c02a_fastsam_fewshot import (
 )
 
 from adatile.utils.prototype import compute_fg_prototype
+
+# ── 复用 C-03 的 Cross-Attention Decoder 和 Multi-Prototype ──
+# Reuse C-03 Cross-Attention Decoder + Multi-Prototype
+from tools.instance.eval_c03_catsam_fewshot import (
+    CATFewShotDecoder,
+    compute_multi_prototype,
+)
 
 # ═══════════════════════════════════════════════════════════════════
 # 全部 15 个 ISAID 类别 | All 15 ISAID Categories
@@ -248,11 +256,18 @@ class ContrastiveProtoDecoder(nn.Module):
 
 
 def build_decoder(method: str, **kwargs) -> nn.Module:
-    """Decoder factory."""
+    """
+    Decoder factory | 解码器工厂.
+
+    :param method: 'baseline' | 'film' | 'crossattn' | 'contrastive'
+    :param kwargs: passed to decoder constructor (e.g. num_prototypes for crossattn)
+    """
     if method == "baseline":
         return ProtoRefineDecoder(**kwargs)
     elif method == "film":
         return FiLMFewShotDecoder(**kwargs)
+    elif method == "crossattn":
+        return CATFewShotDecoder(**kwargs)
     elif method == "contrastive":
         return ContrastiveProtoDecoder(**kwargs)
     else:
@@ -308,14 +323,22 @@ def train_episode(decoder, backbone, support_idxs, query_idx,
     with torch.no_grad():
         support_feats = backbone(support_imgs)
         support_p4s = [support_feats["p4"][i] for i in range(len(support_idxs))]
-        fg_proto = compute_fg_prototype(support_p4s, support_masks)
+        num_proto = getattr(decoder, 'num_prototypes', 1)
+        if num_proto > 1:
+            fg_proto = compute_multi_prototype(support_p4s, support_masks,
+                                                num_prototypes=num_proto)
+        else:
+            fg_proto = compute_fg_prototype(support_p4s, support_masks)
 
-    if fg_proto.sum() == 0:
+    # Check empty prototype
+    if fg_proto.dim() == 1 and fg_proto.sum() == 0:
+        return None
+    if fg_proto.dim() == 2 and fg_proto.sum() == 0:
         return None
 
     # Forward - query
     if use_amp:
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast('cuda'):
             query_p4 = backbone(query_img)["p4"]
             logit = decoder(query_p4, fg_proto, target_size=tuple(query_mask.shape[2:]))
             loss, components = focal_dice_loss(logit, query_mask)
@@ -348,6 +371,8 @@ def validate_episode(decoder, backbone, train_ds, val_ds, query_class,
     if len(train_candidates) < shot or not val_candidates:
         return 0.0
 
+    num_proto = getattr(decoder, 'num_prototypes', 1)
+
     ious = []
     for _ in range(n_val):
         support_idxs = rng.choice(train_candidates, shot, replace=False)
@@ -360,9 +385,16 @@ def validate_episode(decoder, backbone, train_ds, val_ds, query_class,
         query_mask = val_ds.render_class_mask(qi, query_class).to(device)
 
         support_p4s = [backbone(support_imgs)["p4"][i] for i in range(len(support_idxs))]
-        fg_proto = compute_fg_prototype(support_p4s, support_masks)
-        if fg_proto.sum() == 0:
-            continue
+        if num_proto > 1:
+            fg_proto = compute_multi_prototype(support_p4s, support_masks,
+                                                num_prototypes=num_proto)
+            if (fg_proto.dim() == 1 and fg_proto.sum() == 0) or \
+               (fg_proto.dim() == 2 and fg_proto.sum() == 0):
+                continue
+        else:
+            fg_proto = compute_fg_prototype(support_p4s, support_masks)
+            if fg_proto.sum() == 0:
+                continue
 
         logit = decoder(backbone(query_img)["p4"], fg_proto,
                        target_size=tuple(query_mask.shape))
@@ -377,6 +409,7 @@ def validate_episode(decoder, backbone, train_ds, val_ds, query_class,
 def evaluate_full(decoder, backbone, train_ds, val_ds, device,
                   shot, n_episodes, target_classes, logger, tag):
     """Full evaluation post-training with per-class + group breakdown."""
+    num_proto = getattr(decoder, 'num_prototypes', 1)
     class_to_images = {c: train_ds.class_to_images(c) for c in target_classes}
     rng = np.random.RandomState(42)
     all_ious, per_cls_ious = [], defaultdict(list)
@@ -404,9 +437,16 @@ def evaluate_full(decoder, backbone, train_ds, val_ds, device,
         query_mask = val_ds.render_class_mask(qi, query_class).to(device)
 
         support_p4s = [backbone(support_imgs)["p4"][i] for i in range(len(support_idxs))]
-        fg_proto = compute_fg_prototype(support_p4s, support_masks)
-        if fg_proto.sum() == 0:
-            continue
+        if num_proto > 1:
+            fg_proto = compute_multi_prototype(support_p4s, support_masks,
+                                                num_prototypes=num_proto)
+            if (fg_proto.dim() == 1 and fg_proto.sum() == 0) or \
+               (fg_proto.dim() == 2 and fg_proto.sum() == 0):
+                continue
+        else:
+            fg_proto = compute_fg_prototype(support_p4s, support_masks)
+            if fg_proto.sum() == 0:
+                continue
 
         logit = decoder(backbone(query_img)["p4"], fg_proto,
                        target_size=tuple(query_mask.shape))
@@ -490,7 +530,7 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
         sch = CosineAnnealingLR(opt, T_max=args.epochs, eta_min=args.lr * 0.01)
 
     use_amp = args.amp and device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    scaler = torch.amp.GradScaler('cuda') if use_amp else None
 
     # Class sampling weights (rare class oversampling)
     class_image_counts = {c: len(train_ds.class_to_images(c)) for c in target_classes}
@@ -664,6 +704,8 @@ def parse_args():
     p.add_argument("--device", type=str,
                    default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--num-prototypes", type=int, default=1,
+                   help="多原型数量 (仅 crossattn decoder, 默认 1=mean pool)")
     return p.parse_args()
 
 
@@ -750,7 +792,8 @@ def main():
         all_results[decoder_type] = {}
 
         for shot in shots:
-            decoder = build_decoder(decoder_type).to(device)
+            decoder = build_decoder(decoder_type,
+                                    num_prototypes=args.num_prototypes).to(device)
             n_params = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
             logger.log_info(f"c04/{decoder_type}/model",
                            f"{decoder_type} decoder: {n_params:,} trainable params")
