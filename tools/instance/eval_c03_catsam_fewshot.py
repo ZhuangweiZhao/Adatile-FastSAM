@@ -76,6 +76,98 @@ from tools.instance.eval_c02a_fastsam_fewshot import (
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Multi-Prototype Computation | 多原型计算
+# ═══════════════════════════════════════════════════════════════════
+
+@torch.no_grad()
+def compute_multi_prototype(
+    p4_features: list,
+    masks: list,
+    num_prototypes: int = 4,
+    n_iter: int = 10,
+    min_fg_pixels: int = 64,
+) -> torch.Tensor:
+    """
+    KMeans 聚类 FG 特征 → K 个 prototype | KMeans cluster FG features → K prototypes.
+
+    对 support P4 的 FG 像素做 KMeans，用聚类中心替代 mean pooling。
+    解决了 mean pooling 导致的 shape/part/orientation/scale 信息丢失问题。
+
+    FG pixels from support P4 are clustered via KMeans, and cluster centers
+    replace mean pooling. This preserves part-level, orientational, and scale
+    information that mean pooling destroys.
+
+    :param p4_features: list of [C, H_p4, W_p4] per support image (on device)
+    :param masks: list of [H_orig, W_orig] binary float tensors (on device)
+    :param num_prototypes: K — 聚类数量 | number of clusters/prototypes
+    :param n_iter: KMeans 迭代次数 | KMeans iterations
+    :param min_fg_pixels: 最少 FG 像素数，低于此值回退到 mean pooling
+    :return: [K, C] prototype matrix (K prototypes × feat_dim), L2-normalized per row.
+             Or [C] single prototype if num_prototypes==1 (backward compatible).
+             Or zeros[C] if all masks empty.
+    """
+    feat_dim = p4_features[0].shape[0]
+    p4_h, p4_w = p4_features[0].shape[1], p4_features[0].shape[2]
+    device = p4_features[0].device
+
+    # ── 收集所有 support 的 FG 特征向量 | Collect all FG feature vectors ──
+    all_fg_feats = []
+    for i in range(len(p4_features)):
+        m = masks[i]
+        if m.dim() == 3:
+            m = m.squeeze(0)
+        mask_4d = m.unsqueeze(0).unsqueeze(0).float()
+        mask_p4 = F.interpolate(mask_4d, size=(p4_h, p4_w),
+                                 mode="nearest").squeeze(0)  # [1, p4_h, p4_w]
+        if mask_p4.sum() > 0:
+            # 提取 FG 位置的特征 → [N_fg, C] | Extract FG feature vectors
+            fg_mask = mask_p4.squeeze(0) > 0.5  # [p4_h, p4_w] bool
+            feats = p4_features[i].permute(1, 2, 0)[fg_mask]  # [N_fg, C]
+            if feats.shape[0] > 0:
+                all_fg_feats.append(feats)
+
+    if not all_fg_feats:
+        return torch.zeros(feat_dim, device=device)
+
+    # 拼接所有 support 的 FG 特征 | Concatenate FG features from all supports
+    fg_all = torch.cat(all_fg_feats, dim=0)  # [N_total, C]
+    n_fg = fg_all.shape[0]
+
+    # ── 单原型: 直接 mean pooling (向后兼容) ──
+    if num_prototypes <= 1 or n_fg < min_fg_pixels:
+        proto = fg_all.mean(dim=0)  # [C]
+        return F.normalize(proto, dim=0, p=2)
+
+    # ── KMeans 聚类 → K 个原型 | KMeans clustering → K prototypes ──
+    K = min(num_prototypes, n_fg)  # 聚类数不超过 FG 像素数
+    # 随机采样初始化 | Random sampling initialization (KMeans++)
+    indices = torch.randperm(n_fg, device=device)[:K]
+    centroids = fg_all[indices].clone()  # [K, C]
+
+    # L2-normalize FG features for cosine-distance KMeans (spherical KMeans)
+    fg_norm = F.normalize(fg_all, dim=1, p=2)
+
+    for _ in range(n_iter):
+        # 余弦相似度分配 | Cosine similarity assignment
+        sim = torch.mm(fg_norm, centroids.T)  # [N, K] (centroids are already ~normalized)
+        # 额外归一化 centroids 保证余弦相似度范围 | normalize centroids for cosine sim
+        centroids_norm = F.normalize(centroids, dim=1, p=2)
+        sim = torch.mm(fg_norm, centroids_norm.T)  # [N, K]
+        assignments = sim.argmax(dim=1)  # [N]
+
+        # 更新聚类中心 | Update centroids
+        for j in range(K):
+            mask_j = assignments == j
+            if mask_j.sum() > 0:
+                centroids[j] = fg_all[mask_j].mean(dim=0)
+            # 如果某类为空则保留旧中心 | Keep old center if cluster empty
+
+    # L2-normalize 最终原型 | L2-normalize final prototypes
+    centroids = F.normalize(centroids, dim=1, p=2)
+    return centroids  # [K, C]
+
+
+# ═══════════════════════════════════════════════════════════════════
 # CUDA 优化设置 | CUDA Optimization Setup
 # ═══════════════════════════════════════════════════════════════════
 
@@ -170,9 +262,18 @@ def train_episode_optimized(decoder, support_idxs, query_idx,
     query_mask = query_mask.unsqueeze(0).unsqueeze(0).to(device)
 
     # ── Prototype (FP32 精度保证) ──
-    fg_proto = compute_fg_prototype(support_p4s, support_masks)
-    if fg_proto.sum() == 0:
-        return None
+    num_proto = getattr(decoder, 'num_prototypes', 1)
+    if num_proto > 1:
+        fg_proto = compute_multi_prototype(support_p4s, support_masks,
+                                            num_prototypes=num_proto)
+        if fg_proto.dim() == 1 and fg_proto.sum() == 0:
+            return None
+        if fg_proto.dim() == 2 and fg_proto.sum() == 0:
+            return None
+    else:
+        fg_proto = compute_fg_prototype(support_p4s, support_masks)
+        if fg_proto.sum() == 0:
+            return None
 
     # ── AMP forward + backward ──
     with torch.amp.autocast('cuda', enabled=use_amp):
@@ -235,9 +336,17 @@ def validate_episode_optimized(decoder, train_ds, val_ds, query_class,
                          for si in support_idxs]
         query_mask = val_ds.render_class_mask(qi, query_class).to(device)
 
-        fg_proto = compute_fg_prototype(support_p4s, support_masks)
-        if fg_proto.sum() == 0:
-            continue
+        num_proto = getattr(decoder, 'num_prototypes', 1)
+        if num_proto > 1:
+            fg_proto = compute_multi_prototype(support_p4s, support_masks,
+                                                num_prototypes=num_proto)
+            if (fg_proto.dim() == 1 and fg_proto.sum() == 0) or \
+               (fg_proto.dim() == 2 and fg_proto.sum() == 0):
+                continue
+        else:
+            fg_proto = compute_fg_prototype(support_p4s, support_masks)
+            if fg_proto.sum() == 0:
+                continue
 
         with torch.amp.autocast('cuda', enabled=use_amp):
             logit = decoder(query_p4, fg_proto, target_size=tuple(query_mask.shape))
@@ -256,22 +365,34 @@ class CATFewShotDecoder(nn.Module):
     """
     CAT-SAM Lite: Cross-Attention Conditioned InstanceDecoder.
 
-    Support → proto → ProtoMLP → proto_token [256]
-    Query P4 → Proj → [B,256,H,W] → CrossAttn(Q=x, K=proto_token, V=proto_token)
+    Support → proto → ProtoMLP → proto_token [256] (×K for multi-proto)
+    Query P4 → Proj → [B,256,H,W] → CrossAttn(Q=x, K=proto_tokens, V=proto_tokens)
     → residual(+) → InstanceDecoder → mask.
+
+    Multi-Prototype mode (num_prototypes > 1):
+        - KMeans clusters FG features → K prototypes
+        - Each proto → MLP → proto_token
+        - CrossAttn with K keys → softmax attention (standard Cross-Attention)
+        - Preserves part-level, orientational, and scale information
+
+    Single-Prototype mode (num_prototypes == 1, default):
+        - Mean pooled proto → MLP → proto_token
+        - CrossAttn with 1 key → sigmoid gating (spatial selectivity)
 
     ~1.1M trainable params. Frozen FastSAM backbone.
     Cross-Attention has 0 learned params (parameter-free operation).
     """
 
-    def __init__(self, feat_dim: int = 1280, hidden_dim: int = 256):
+    def __init__(self, feat_dim: int = 1280, hidden_dim: int = 256,
+                 num_prototypes: int = 1):
         super().__init__()
         self.feat_dim = feat_dim
         self.hidden_dim = hidden_dim
+        self.num_prototypes = num_prototypes
 
         # ── Proto Projection | 原型投影 ──
-        # proto [1280] → MLP → proto_token [256]
-        # 将 L2-normalized prototype 投影到与 query feature 相同的 256 维空间
+        # proto [*, 1280] → MLP (shared across K) → proto_token [*, 256]
+        # MLP 在 K 个原型的每个上独立且共享权重
         self.proto_mlp = nn.Sequential(
             nn.Linear(feat_dim, hidden_dim),
             nn.ReLU(inplace=True),
@@ -315,41 +436,42 @@ class CATFewShotDecoder(nn.Module):
               f"CrossAttn: 0, Decoder: {n_dec:,})")
 
     def _cross_attention(self, x: torch.Tensor,
-                         proto_token: torch.Tensor) -> torch.Tensor:
+                         proto_tokens: torch.Tensor) -> torch.Tensor:
         """
-        单层 Cross-Attention: Q=query features, K=V=proto_token.
+        Cross-Attention: Q=query features, K=V=proto tokens.
+
+        单原型 (K=1): sigmoid gating — 每个空间位置独立决定注入多少 proto 信息
+        多原型 (K>1): softmax attention — 每个位置选择最相关的 proto
+
+        Single proto (K=1): sigmoid gate — per-position independent gating.
+        Multi-proto (K>1): softmax attention — each position attends to the most
+                           relevant prototype, preserving part-level information.
 
         :param x: [B, C, H, W] query features (C=hidden_dim=256)
-        :param proto_token: [C] prototype token
+        :param proto_tokens: [K, C] prototype tokens (K=1 for single, K>1 for multi)
         :return: [B, C, H, W] attended features
-
-        细节 | Details:
-            - Q: [B, C, H, W] → [B, N, C]  (N = H*W)
-            - K, V: [C] → [B, 1, C]
-            - gate = sigmoid(Q @ Kᵀ / √d)  [B, N, 1]
-            - 用 sigmoid 而非 softmax：单 token 下 softmax 恒为 1，
-              而 sigmoid 让每个空间位置独立决定注入多少 proto 信息
-            - out = gate * V  [B, N, C] (broadcast)
-            - out → reshape [B, C, H, W]
         """
         B, C, H, W = x.shape
         N = H * W
+        K = proto_tokens.shape[0]
 
         # Q: [B, C, H, W] → [B, N, C]
         Q = x.reshape(B, C, N).transpose(1, 2)  # [B, N, C]
 
-        # K, V: [C] → [B, 1, C] (单 token)
-        K = proto_token.view(1, 1, C).expand(B, 1, C)  # [B, 1, C]
-        V = proto_token.view(1, 1, C).expand(B, 1, C)  # [B, 1, C]
+        # K, V: [K, C] → [B, K, C]
+        K_t = proto_tokens.unsqueeze(0).expand(B, K, C)  # [B, K, C]
+        V_t = proto_tokens.unsqueeze(0).expand(B, K, C)  # [B, K, C]
 
-        # Scaled dot-product attention → sigmoid gate
-        # sigmoid 而非 softmax：单 key 时 softmax = 1，丧失空间差异性
         scale = C ** 0.5
-        gate = torch.sigmoid(torch.bmm(Q, K.transpose(1, 2)) / scale)  # [B, N, 1]
 
-        # Gate the proto token: 相关性越高，proto 信息注入越多
-        # [B, N, 1] * [B, 1, C] → [B, N, C] (broadcast)
-        out = gate * V  # [B, N, C]
+        if K == 1:
+            # 单原型: sigmoid gating (保留空间差异性)
+            gate = torch.sigmoid(torch.bmm(Q, K_t.transpose(1, 2)) / scale)  # [B, N, 1]
+            out = gate * V_t  # [B, N, C] via broadcast
+        else:
+            # 多原型: 标准 softmax Cross-Attention (K>1 时 softmax 有意义)
+            attn = torch.softmax(torch.bmm(Q, K_t.transpose(1, 2)) / scale, dim=-1)  # [B, N, K]
+            out = torch.bmm(attn, V_t)  # [B, N, C]
 
         # Reshape back: [B, N, C] → [B, C, H, W]
         out = out.transpose(1, 2).reshape(B, C, H, W)
@@ -359,7 +481,7 @@ class CATFewShotDecoder(nn.Module):
                 target_size: tuple = None) -> torch.Tensor:
         """
         :param query_p4: [B, 1280, H/16, W/16] P4 features from frozen FastSAM
-        :param fg_prototype: [1280] L2-normalized foreground prototype vector
+        :param fg_prototype: [C] single proto or [K, C] multi-proto matrix
         :param target_size: (H, W) to resize output to
         :return: [B, 1, H_target, W_target] logits
         """
@@ -368,8 +490,13 @@ class CATFewShotDecoder(nn.Module):
 
         # Step 2: Cross-Attention conditioning with residual | 交叉注意力 + 残差
         if fg_prototype is not None and fg_prototype.sum() != 0:
-            proto_token = self.proto_mlp(fg_prototype)  # [256]
-            x = x + self._cross_attention(x, proto_token)  # residual: x + CA(x, proto)
+            # 统一处理单原型 [C] 和多原型 [K, C]
+            if fg_prototype.dim() == 1:
+                proto_input = fg_prototype.unsqueeze(0)  # [1, C]
+            else:
+                proto_input = fg_prototype  # [K, C]
+            proto_tokens = self.proto_mlp(proto_input)  # [K, 256]
+            x = x + self._cross_attention(x, proto_tokens)  # residual
 
         # Step 3: Instance Decoder | 解码器上采样
         x = self.up1(x)  # [B, 128, H/16, W/16]
@@ -464,9 +591,17 @@ def evaluate_trained(decoder, train_ds, val_ds, device,
                          for si in support_idxs]
         query_mask = val_ds.render_class_mask(qi, query_class).to(device)
 
-        fg_proto = compute_fg_prototype(support_p4s, support_masks)
-        if fg_proto.sum() == 0:
-            continue
+        num_proto = getattr(decoder, 'num_prototypes', 1)
+        if num_proto > 1:
+            fg_proto = compute_multi_prototype(support_p4s, support_masks,
+                                                num_prototypes=num_proto)
+            if (fg_proto.dim() == 1 and fg_proto.sum() == 0) or \
+               (fg_proto.dim() == 2 and fg_proto.sum() == 0):
+                continue
+        else:
+            fg_proto = compute_fg_prototype(support_p4s, support_masks)
+            if fg_proto.sum() == 0:
+                continue
 
         logit = decoder(query_p4, fg_proto,
                        target_size=tuple(query_mask.shape))
@@ -537,6 +672,8 @@ def parse_args():
                    help='并行 I/O 线程数 (默认 8)')
     p.add_argument('--tile-cache-size', type=int, default=64,
                    help='Tile wrapper 原图 LRU 缓存大小 (默认 32, 5090 可设 64)')
+    p.add_argument('--num-prototypes', type=int, default=1,
+                   help='多原型数量 K (默认 1=mean pooling, >1 启用 KMeans 聚类)')
     return p.parse_args()
 
 
@@ -586,7 +723,10 @@ def main():
     # ── Backbone (frozen, shared) ──
     backbone = FastSAMBackbone(freeze_backbone=True).eval().to(device)
     logger.log_info('c03/model', 'FastSAM backbone (frozen)')
-    logger.log_info('c03/method', 'CAT-SAM Lite: Cross-Attention + InstanceDecoder')
+    logger.log_info('c03/method',
+                   f'CAT-SAM Lite: Cross-Attention + InstanceDecoder '
+                   f'(num_prototypes={args.num_prototypes}, '
+                   f'{"KMeans" if args.num_prototypes > 1 else "MeanPool"})')
 
     # ── P4 预计算缓存 | P4 Pre-computation Cache ──
     if use_tile:
@@ -623,7 +763,7 @@ def main():
                        f'\n{"─"*55}\n  C-03 CAT-SAM Lite: {shot}-Shot\n{"─"*55}')
 
         # ── Training ──
-        decoder = CATFewShotDecoder().to(device)
+        decoder = CATFewShotDecoder(num_prototypes=args.num_prototypes).to(device)
         decoder.train()
         opt = torch.optim.AdamW(decoder.parameters(), lr=args.lr, weight_decay=1e-4)
         sch = torch.optim.lr_scheduler.CosineAnnealingLR(
