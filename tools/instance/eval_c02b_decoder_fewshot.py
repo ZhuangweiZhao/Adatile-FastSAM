@@ -43,45 +43,18 @@ from adatile.logging import get_logger
 from adatile.logging.backends import ConsoleBackend, FileBackend
 from adatile.utils.seed import set_seed
 from adatile.backbone import FastSAMBackbone
+from adatile.datasets.isaid_tile_wrapper import ISAIDTileWrapper
 
 # ── 复用 C-02A 的数据集和 mask 渲染 | Reuse C-02A dataset + mask rendering ──
 from tools.instance.eval_c02a_fastsam_fewshot import (
-    ISAIDInstanceDataset, TARGET_CLASSES, _render_gt_mask,
+    ISAIDInstanceDataset, TARGET_CLASSES,
 )
 
 # ═══════════════════════════════════════════════════════════════════
 # Few-Shot Decoders
 # ═══════════════════════════════════════════════════════════════════
 
-def _compute_fg_prototype(p4_features: list, masks: list,
-                          feat_dim: int = 1280) -> torch.Tensor:
-    """
-    从 support 特征和 mask 计算 FG prototype | Compute FG prototype.
-    所有 decoder 共享此函数 | Shared across all decoders.
-
-    :param p4_features: list of [C, H_p4, W_p4] per support image (on device)
-    :param masks: list of [H_orig, W_orig] binary masks (on device)
-    :param feat_dim: feature dimension (1280 for FastSAM P4)
-    :return: [feat_dim] L2-normalized prototype vector, or zero if empty
-    """
-    p4_h, p4_w = p4_features[0].shape[1], p4_features[0].shape[2]
-    all_feats = []
-
-    for i in range(len(p4_features)):
-        m = masks[i]
-        if m.dim() == 3:
-            m = m.squeeze(0)
-        mask_4d = m.unsqueeze(0).unsqueeze(0).float()
-        mask_p4 = F.interpolate(mask_4d, size=(p4_h, p4_w),
-                                 mode='nearest').squeeze(0)
-        if mask_p4.sum() > 0:
-            weighted = (p4_features[i] * mask_p4).sum(dim=(1, 2)) / mask_p4.sum()
-            all_feats.append(weighted)
-
-    if not all_feats:
-        return torch.zeros(feat_dim, device=p4_features[0].device)
-
-    return F.normalize(torch.stack(all_feats).mean(dim=0), dim=0, p=2)
+from adatile.utils.prototype import compute_fg_prototype
 
 
 class ProtoRefineDecoder(nn.Module):
@@ -109,7 +82,7 @@ class ProtoRefineDecoder(nn.Module):
         print(f"[ProtoRefineDecoder] Trainable: {n:,}")
 
     def compute_fg_prototype(self, p4_features, masks):
-        return _compute_fg_prototype(p4_features, masks, self.feat_dim)
+        return compute_fg_prototype(p4_features, masks, self.feat_dim)
 
     def forward(self, query_p4, fg_prototype, target_size=None):
         q_norm = F.normalize(query_p4, dim=1, p=2)
@@ -120,109 +93,6 @@ class ProtoRefineDecoder(nn.Module):
             x = F.interpolate(x, size=target_size, mode='bilinear',
                             align_corners=False)
         return x
-
-
-class FiLMConditionedDecoder(nn.Module):
-    """
-    CAT-SAM Lite: InstanceDecoder + prototype → FiLM conditioning.
-    实例解码器 + 原型条件化 | InstanceDecoder + prototype conditioning.
-
-    架构 | Architecture:
-        P4 [B,1280,H/16,W/16]
-            │
-        Proj: 1×1 Conv 1280→256 + BN + ReLU
-            │
-        FiLM: proto [1280] → MLP(1280→256→512) → γ[256], β[256]
-              x = γ * x + β          ← 条件注入 | Condition injection
-            │
-        Up1: 3×3 Conv 256→128 + BN + ReLU + Upsample×4  → H/4
-        Up2: 3×3 Conv 128→64  + BN + ReLU + Upsample×2  → H/2
-        Up3: 3×3 Conv 64→32   + BN + ReLU + Upsample×2  → H
-        Head: 1×1 Conv 32→1                              → mask
-
-    参数 | Params: Proj(~328K) + FiLM(~394K) + Upsample(~388K) + Head(~0.03K) ≈ 1.1M.
-    其中 FiLM 是 CAT-SAM 的核心贡献 | FiLM is the CAT-SAM core contribution.
-    """
-
-    def __init__(self, feat_dim: int = 1280):
-        super().__init__()
-        self.feat_dim = feat_dim
-
-        # ── FiLM Generator (CAT-SAM 风格) ──
-        # Support prototype → task-specific feature modulation
-        self.film_mlp = nn.Sequential(
-            nn.Linear(feat_dim, 256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, 512),  # 256 for γ + 256 for β
-        )
-
-        # ── Decoder (InstanceDecoder 风格) ──
-        self.proj = nn.Sequential(
-            nn.Conv2d(feat_dim, 256, 1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-        )
-        self.up1 = nn.Sequential(
-            nn.Conv2d(256, 128, 3, padding=1, bias=False),
-            nn.BatchNorm2d(128), nn.ReLU(inplace=True),
-        )
-        self.up2 = nn.Sequential(
-            nn.Conv2d(128, 64, 3, padding=1, bias=False),
-            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
-        )
-        self.up3 = nn.Sequential(
-            nn.Conv2d(64, 32, 3, padding=1, bias=False),
-            nn.BatchNorm2d(32), nn.ReLU(inplace=True),
-        )
-        self.mask_head = nn.Conv2d(32, 1, 1, bias=True)
-
-        n = sum(p.numel() for p in self.parameters())
-        n_film = sum(p.numel() for p in self.film_mlp.parameters())
-        n_dec = n - n_film
-        print(f"[FiLMConditionedDecoder] Total: {n:,} (FiLM: {n_film:,}, Decoder: {n_dec:,})")
-
-    def compute_fg_prototype(self, p4_features, masks):
-        return _compute_fg_prototype(p4_features, masks, self.feat_dim)
-
-    def forward(self, query_p4, fg_prototype, target_size=None):
-        # 投影 | Project
-        x = self.proj(query_p4)  # [B, 256, H/16, W/16]
-
-        # ── FiLM 条件注入 | FiLM condition injection ──
-        if fg_prototype is not None and fg_prototype.sum() != 0:
-            film_out = self.film_mlp(fg_prototype)  # [512]
-            gamma, beta = film_out.chunk(2, dim=0)  # [256], [256]
-            x = gamma[None, :, None, None] * x + beta[None, :, None, None]
-
-        # 上采样路径 | Upsample path
-        x = self.up1(x)
-        x = F.interpolate(x, scale_factor=4, mode='bilinear', align_corners=False)
-        x = self.up2(x)
-        x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
-        x = self.up3(x)
-        x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
-        x = self.mask_head(x)
-
-        if target_size is not None:
-            x = F.interpolate(x, size=target_size, mode='bilinear',
-                            align_corners=False)
-        return x
-
-
-def build_decoder(method: str) -> nn.Module:
-    """
-    工厂函数 | Factory function.
-
-    :param method: 'baseline' → ProtoRefineDecoder, 'film' → FiLMConditionedDecoder
-    :return: decoder instance
-    """
-    if method == 'baseline':
-        return ProtoRefineDecoder()
-    elif method == 'film':
-        return FiLMConditionedDecoder()
-    else:
-        raise ValueError(f"Unknown method: {method}. Choose 'baseline' or 'film'.")
-
 
 # ═══════════════════════════════════════════════════════════════════
 # Binary IoU (same as B-09)
@@ -417,6 +287,10 @@ def parse_args():
     p.add_argument('--device', type=str,
                    default='cuda' if torch.cuda.is_available() else 'cpu')
     p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--tile', action='store_true',
+                   help='Tile 模式: 切分全图为 896×896 tiles (stride=512)')
+    p.add_argument('--tile-size', type=int, default=896)
+    p.add_argument('--tile-stride', type=int, default=512)
     return p.parse_args()
 
 
@@ -436,13 +310,23 @@ def main():
     # ── 加载数据 | Load data ──
     train_ds = ISAIDInstanceDataset(args.src_root, split='train')
     val_ds = ISAIDInstanceDataset(args.src_root, split='val')
-    logger.log_info('c02b/data',
-                   f'iSAID: {len(train_ds)} train, {len(val_ds)} val images')
+
+    if args.tile:
+        train_ds = ISAIDTileWrapper(train_ds, tile_size=args.tile_size,
+                                     stride=args.tile_stride)
+        val_ds = ISAIDTileWrapper(val_ds, tile_size=args.tile_size,
+                                   stride=args.tile_stride)
+        logger.log_info('c02b/data',
+                       f'iSAID Tile: {len(train_ds)} train tiles, {len(val_ds)} val tiles '
+                       f'({args.tile_size}×{args.tile_size}, stride={args.tile_stride})')
+    else:
+        logger.log_info('c02b/data',
+                       f'iSAID: {len(train_ds)} train, {len(val_ds)} val images')
     logger.log_info('c02b/data',
                    f'Target: {[(c, TARGET_CLASSES[c]) for c in sorted(TARGET_CLASSES)]}')
 
     # ── Backbone (frozen, shared across all shots) ──
-    backbone = FastSAMBackbone(freeze_backbone=True).eval()
+    backbone = FastSAMBackbone(freeze_backbone=True).eval().to(device)
     logger.log_info('c02b/model', 'FastSAM backbone (frozen)')
 
     all_results = {}

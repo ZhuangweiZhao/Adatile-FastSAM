@@ -68,7 +68,7 @@ from adatile.logging.backends import ConsoleBackend, FileBackend
 from adatile.utils.seed import set_seed
 from adatile.backbone import FastSAMBackbone
 from adatile.datasets.isaid_tile_wrapper import ISAIDTileWrapper
-from adatile.datasets.p4_cache import auto_build_p4_cache
+from adatile.utils.prototype import compute_fg_prototype
 
 from tools.instance.eval_c02a_fastsam_fewshot import (
     ISAIDInstanceDataset, TARGET_CLASSES,
@@ -246,30 +246,6 @@ def validate_episode_optimized(decoder, train_ds, val_ds, query_class,
         ious.append(binary_iou(torch.from_numpy(pred), torch.from_numpy(gt)))
 
     return float(np.mean(ious)) if ious else 0.0
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Prototype computation (shared)
-# ═══════════════════════════════════════════════════════════════════
-
-def compute_fg_prototype(p4_features: list, masks: list,
-                          feat_dim: int = 1280) -> torch.Tensor:
-    """masked_mean(P4) → L2-normalized prototype | 掩码平均 → L2 归一化原型."""
-    p4_h, p4_w = p4_features[0].shape[1], p4_features[0].shape[2]
-    all_feats = []
-    for i in range(len(p4_features)):
-        m = masks[i]
-        if m.dim() == 3:
-            m = m.squeeze(0)
-        mask_4d = m.unsqueeze(0).unsqueeze(0).float()
-        mask_p4 = F.interpolate(mask_4d, size=(p4_h, p4_w),
-                                 mode='nearest').squeeze(0)
-        if mask_p4.sum() > 0:
-            weighted = (p4_features[i] * mask_p4).sum(dim=(1, 2)) / mask_p4.sum()
-            all_feats.append(weighted)
-    if not all_feats:
-        return torch.zeros(feat_dim, device=p4_features[0].device)
-    return F.normalize(torch.stack(all_feats).mean(dim=0), dim=0, p=2)
 
 
 # ═══════════════════════════════════════════════════════════════════

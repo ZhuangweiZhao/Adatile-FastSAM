@@ -40,6 +40,7 @@ from adatile.logging import get_logger
 from adatile.logging.backends import ConsoleBackend, FileBackend
 from adatile.utils.seed import set_seed
 from adatile.backbone import FastSAMBackbone
+from adatile.datasets.isaid_tile_wrapper import ISAIDTileWrapper
 
 # ── 复用 B-09 的核心类 | Reuse B-09 core classes ──
 from tools.paper_b.eval_b09_nwpu_fewshot import (
@@ -384,6 +385,10 @@ def parse_args():
     p.add_argument('--device', type=str,
                    default='cuda' if torch.cuda.is_available() else 'cpu')
     p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--tile', action='store_true',
+                   help='Tile 模式: 切分全图为 896×896 tiles (stride=512)')
+    p.add_argument('--tile-size', type=int, default=896)
+    p.add_argument('--tile-stride', type=int, default=512)
     return p.parse_args()
 
 
@@ -404,13 +409,22 @@ def main():
     train_ds = ISAIDInstanceDataset(args.src_root, split='train')
     val_ds = ISAIDInstanceDataset(args.src_root, split='val')
 
-    logger.log_info('c02a/data',
-                   f'iSAID: {len(train_ds)} train, {len(val_ds)} val images')
+    if args.tile:
+        train_ds = ISAIDTileWrapper(train_ds, tile_size=args.tile_size,
+                                     stride=args.tile_stride)
+        val_ds = ISAIDTileWrapper(val_ds, tile_size=args.tile_size,
+                                   stride=args.tile_stride)
+        logger.log_info('c02a/data',
+                       f'iSAID Tile: {len(train_ds)} train tiles, {len(val_ds)} val tiles '
+                       f'({args.tile_size}×{args.tile_size}, stride={args.tile_stride})')
+    else:
+        logger.log_info('c02a/data',
+                       f'iSAID: {len(train_ds)} train, {len(val_ds)} val images')
     logger.log_info('c02a/data',
                    f'Target classes: {[(c, TARGET_CLASSES[c]) for c in sorted(TARGET_CLASSES)]}')
 
     # ── 加载 Backbone | Load backbone ──
-    backbone = FastSAMBackbone(freeze_backbone=True).eval()
+    backbone = FastSAMBackbone(freeze_backbone=True).eval().to(device)
     logger.log_info('c02a/model', 'FastSAM backbone (frozen) — 0 trainable params')
     logger.log_info('c02a/method', 'Proto Baseline: masked mean P4 → cosine sim → threshold')
 

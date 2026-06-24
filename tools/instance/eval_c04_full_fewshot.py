@@ -19,7 +19,7 @@ Phase D 核心实验 | Core Experiment:
 
 Decoder 变体 | Decoder Variants:
     - 'baseline': ProtoRefineDecoder (~10K params) — Proto → cosine_sim → Refine CNN
-    - 'film':     CATFewShotDecoder (~1.1M params) — Proto → FiLM → InstanceDecoder
+    - 'film':     FiLMFewShotDecoder (~1.1M params) — Proto → FiLM → InstanceDecoder
     - 'contrastive': ContrastiveProtoDecoder (~1.3M params) — Proto → Projection → Contrastive
 
 改进 | Improvements over C-02B/C-03:
@@ -74,6 +74,8 @@ from tools.instance.eval_c02a_fastsam_fewshot import (
     ISAIDInstanceDataset, _render_gt_mask,
 )
 
+from adatile.utils.prototype import compute_fg_prototype
+
 # ═══════════════════════════════════════════════════════════════════
 # 全部 15 个 ISAID 类别 | All 15 ISAID Categories
 # ═══════════════════════════════════════════════════════════════════
@@ -88,34 +90,6 @@ CLASS_GROUPS = {
 }
 # ═══════════════════════════════════════════════════════════════════
 # Prototype Computation (shared) | 原型计算（共享）
-# ═══════════════════════════════════════════════════════════════════
-
-def compute_fg_prototype(p4_features: list, masks: list,
-                          feat_dim: int = 1280) -> torch.Tensor:
-    """
-    masked_mean(P4) → L2-normalized prototype.
-    掩码平均 → L2 归一化原型向量。
-    """
-    p4_h, p4_w = p4_features[0].shape[1], p4_features[0].shape[2]
-    all_feats = []
-
-    for i in range(len(p4_features)):
-        m = masks[i]
-        if m.dim() == 3:
-            m = m.squeeze(0)
-        mask_4d = m.unsqueeze(0).unsqueeze(0).float()
-        mask_p4 = F.interpolate(mask_4d, size=(p4_h, p4_w),
-                                 mode="nearest").squeeze(0)
-        if mask_p4.sum() > 0:
-            weighted = (p4_features[i] * mask_p4).sum(dim=(1, 2)) / (mask_p4.sum() + 1e-8)
-            all_feats.append(weighted)
-
-    if not all_feats:
-        return torch.zeros(feat_dim, device=p4_features[0].device)
-
-    return F.normalize(torch.stack(all_feats).mean(dim=0), dim=0, p=2)
-
-
 # ═══════════════════════════════════════════════════════════════════
 # Decoder Variants | 解码器变体
 # ═══════════════════════════════════════════════════════════════════
@@ -152,10 +126,10 @@ class ProtoRefineDecoder(nn.Module):
         return x
 
 
-class CATFewShotDecoder(nn.Module):
+class FiLMFewShotDecoder(nn.Module):
     """
     CAT-SAM Lite: FiLM-conditioned InstanceDecoder.
-    C-03 同款 | Same as C-03. ~1.1M params.
+    C-04 FiLM 变体 | C-04 FiLM variant. ~1.1M params.
     """
 
     def __init__(self, feat_dim: int = 1280):
@@ -190,7 +164,7 @@ class CATFewShotDecoder(nn.Module):
 
         n_film = sum(p.numel() for p in self.film_mlp.parameters())
         n_total = sum(p.numel() for p in self.parameters())
-        print(f"[CATFewShotDecoder] Total: {n_total:,} (FiLM: {n_film:,})")
+        print(f"[FiLMFewShotDecoder] Total: {n_total:,} (FiLM: {n_film:,})")
 
     def forward(self, query_p4, fg_prototype, target_size=None):
         x = self.proj(query_p4)
@@ -278,7 +252,7 @@ def build_decoder(method: str, **kwargs) -> nn.Module:
     if method == "baseline":
         return ProtoRefineDecoder(**kwargs)
     elif method == "film":
-        return CATFewShotDecoder(**kwargs)
+        return FiLMFewShotDecoder(**kwargs)
     elif method == "contrastive":
         return ContrastiveProtoDecoder(**kwargs)
     else:
