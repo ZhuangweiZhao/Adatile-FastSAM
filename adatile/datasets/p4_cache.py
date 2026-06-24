@@ -125,11 +125,18 @@ class P4Cache:
 
         # ── Warmup: 计算单个样本确定 feature shape ──
         # Warmup: compute single sample to determine feature shape
-        # 计算设备始终是 backbone 所在设备 (CUDA)，存储设备可能不同
-        # Compute device is always where backbone lives (CUDA), storage may differ
-        backbone_device = next(self.backbone.parameters()).device
+        # 计算设备: 检测 backbone 所在设备, fallback CUDA
+        # Compute device: detect from backbone, fallback CUDA
         storage_device = torch.device(self.device)
-        compute_device = backbone_device  # backbone always on CUDA
+        try:
+            backbone_device = next(self.backbone.parameters()).device
+        except StopIteration:
+            # FastSAM 的 YOLO wrapper 可能导致 parameters() 为空
+            # FastSAM YOLO wrapper may produce empty parameters()
+            backbone_device = torch.device(
+                "cuda" if torch.cuda.is_available() else "cpu"
+            )
+        compute_device = backbone_device  # backbone always on CUDA for inference
 
         sample_img = self.dataset.load_image(0)
         if sample_img.dim() == 3:
