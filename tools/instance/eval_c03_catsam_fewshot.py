@@ -613,38 +613,19 @@ def main():
     logger.log_info('c03/method', 'CAT-SAM Lite: Cross-Attention + InstanceDecoder')
 
     # ── P4 预计算缓存 | P4 Pre-computation Cache ──
-    # RTX 5090 (32 GB): GPU cache → 零 backbone forward
-    # RTX 3060 (12 GB): CPU pinned cache → 异步传输
     if use_tile:
-        # Tile 模式强制 CPU 缓存: ~23k tiles × 8 MB fp16 = ~189 GB >> 32 GB GPU
-        # Tile mode forces CPU cache: ~23k tiles × 8 MB fp16 = ~189 GB >> 32 GB GPU
-        p4_storage = "cpu"
-        p4_cache_name = f"p4_{args.tile_size}_train"
-        p4_cache_name_val = f"p4_{args.tile_size}_val"
-
+        # Tile 模式: 23,621 tiles × 8 MB fp16 = ~189 GB >> 88 GB RAM → 放弃缓存
+        # Tile mode: 23k tiles × 8 MB = ~189 GB >> available RAM → skip cache
+        # 每 episode 只有 (1+shot) 张 896×896 小图过 backbone, 开销可忽略 (~0.01s/img)
+        # Per-episode backbone cost is negligible: (1+shot) × 896×896 images ≈ 0.01s/img
+        p4_train, p4_val = None, None
         logger.log_info('c03/cache',
-                       f'Building P4 cache for {len(train_ds)}+{len(val_ds)} tiles '
-                       f'(storage={p4_storage}, fp16, batch={args.p4_batch_size})')
-
-        p4_cache_train = auto_build_p4_cache(
-            train_ds, backbone, device=p4_storage, fp16=True,
-            batch_size=args.p4_batch_size, pin_memory=True,
-            cache_dir=args.p4_cache_dir, cache_name=p4_cache_name,
-            tile_wrapper=train_ds,  # 全图级预计算: 141 forwards vs 23621
-        )
-        p4_cache_val = auto_build_p4_cache(
-            val_ds, backbone, device=p4_storage, fp16=True,
-            batch_size=args.p4_batch_size, pin_memory=True,
-            cache_dir=args.p4_cache_dir, cache_name=p4_cache_name_val,
-            tile_wrapper=val_ds,  # 全图级预计算
-        )
-        p4_train = p4_cache_train
-        p4_val = p4_cache_val
-        # P4 已缓存在 CPU pinned memory，训练时异步传输到 GPU
-        logger.log_info('c03/cache',
-                       f'P4 cache on CPU pinned: {len(p4_train)}+{len(p4_val)} tiles '
-                       f'({p4_cache_train.total_size_gb:.1f} GB)')
+                       f'Tile mode: {len(train_ds)} tiles, P4 cache disabled '
+                       f'(backbone on GPU, on-the-fly forward per episode, '
+                       f'~{(1+max(shots))*0.01:.2f}s backbone overhead per episode)')
+        # Backbone 保持在 GPU | Keep backbone on GPU for on-the-fly forward
     else:
+        # 全图模式: P4 缓存在 CPU (141 images × 21 MB fp32 ≈ 3 GB) | Cache on CPU
         t_cache = time.perf_counter()
         p4_train = precompute_p4_cache(train_ds, backbone, device, desc="P4 cache train")
         p4_val = precompute_p4_cache(val_ds, backbone, device, desc="P4 cache val")
@@ -697,7 +678,7 @@ def main():
                     decoder, support_idxs, qi,
                     train_ds, val_ds, query_class, device, opt, scaler,
                     p4_cache_train=p4_train, p4_cache_val=p4_val,
-                    backbone=backbone if not use_tile else None,
+                    backbone=backbone,
                     use_amp=use_amp,
                 )
                 if loss is not None:
@@ -715,7 +696,7 @@ def main():
                     decoder, train_ds, val_ds,
                     cls_id, shot, device, rng, n_val=30,
                     p4_cache_train=p4_train, p4_cache_val=p4_val,
-                    backbone=backbone if not use_tile else None,
+                    backbone=backbone,
                     use_amp=use_amp,
                 )
 
@@ -751,7 +732,7 @@ def main():
                                   shot, args.eval_episodes, TARGET_CLASSES,
                                   logger, f'{tag}/eval',
                                   p4_cache_train=p4_train, p4_cache_val=p4_val,
-                                  backbone=backbone if use_tile else None)
+                                  backbone=backbone)
         all_results[f'{shot}shot'] = result
 
         # Compare with baselines if available
