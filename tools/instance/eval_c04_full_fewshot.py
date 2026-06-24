@@ -533,20 +533,38 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
     scaler = torch.amp.GradScaler('cuda') if use_amp else None
 
     # Class sampling weights (rare class oversampling)
+    # 排除零样本类（如 iSAID 的 road 在 train 中可能为 0）| Exclude zero-sample classes
     class_image_counts = {c: len(train_ds.class_to_images(c)) for c in target_classes}
-    total_images = sum(class_image_counts.values())
-    class_weights = {c: total_images / max(cnt, 1) for c, cnt in class_image_counts.items()}
+    valid_classes = {c: cnt for c, cnt in class_image_counts.items() if cnt >= shot}
+    zero_shot_classes = {c: cnt for c, cnt in class_image_counts.items() if cnt < shot}
+
+    if zero_shot_classes:
+        logger.log_info(f"{tag}/classes",
+                       f"  !! EXCLUDED (insufficient samples for {shot}-shot): "
+                       + ", ".join(f"{c}({target_classes[c]}={cnt})"
+                                   for c, cnt in sorted(zero_shot_classes.items())))
+
+    total_images = sum(valid_classes.values())
+    class_weights = {c: total_images / cnt for c, cnt in valid_classes.items()}
     weight_sum = sum(class_weights.values())
     class_probs = {c: w / weight_sum for c, w in class_weights.items()}
+
+    logger.log_info(f"{tag}/classes", f"  Training on {len(valid_classes)}/{len(target_classes)} classes "
+                   f"(shot={shot}, excluded {len(zero_shot_classes)} with <{shot} samples)")
 
     logger.log_info(f"{tag}/classes", "  Class distribution (train images):")
     for c in sorted(target_classes):
         name = target_classes[c]
         cnt = class_image_counts[c]
-        prob = class_probs[c]
-        marker = " !! RARE" if cnt < 20 else ""
+        if c in zero_shot_classes:
+            marker = " !! SKIP (0 imgs)"
+            prob_str = "---"
+        else:
+            prob = class_probs[c]
+            marker = " !! RARE" if cnt < 20 else ""
+            prob_str = f"{prob:.3f}"
         logger.log_info(f"{tag}/classes",
-                       f"    {c:2d} {name:<20} {cnt:4d} imgs  p={prob:.3f}{marker}")
+                       f"    {c:2d} {name:<20} {cnt:4d} imgs  p={prob_str}{marker}")
 
     # Training State
     best_val_miou = 0.0
@@ -556,7 +574,7 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
     metrics_path = output_dir / f"decoder_{args.decoder}_{shot}shot_metrics.jsonl"
     rng = np.random.RandomState(args.seed)
 
-    class_list = list(target_classes.keys())
+    class_list = list(valid_classes.keys())
     class_sample_probs = [class_probs[c] for c in class_list]
 
     t0 = time.perf_counter()
@@ -589,13 +607,15 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
         sch.step()
         avg_loss = total_loss / max(n_eps, 1)
 
-        # Per-class validation
+        # Per-class validation (skip zero-shot classes)
         decoder.eval()
         per_cls_val = {}
-        for cls_id in target_classes:
+        for cls_id in valid_classes:
             per_cls_val[cls_id] = validate_episode(
                 decoder, backbone, train_ds, val_ds,
                 cls_id, shot, device, rng, n_val=args.val_episodes_per_class)
+        for cls_id in zero_shot_classes:
+            per_cls_val[cls_id] = 0.0
 
         mval = float(np.mean(list(per_cls_val.values())))
 
