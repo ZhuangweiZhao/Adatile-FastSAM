@@ -792,8 +792,10 @@ def main():
         all_results[decoder_type] = {}
 
         for shot in shots:
-            decoder = build_decoder(decoder_type,
-                                    num_prototypes=args.num_prototypes).to(device)
+            decoder_kwargs = {}
+            if decoder_type == "crossattn":
+                decoder_kwargs["num_prototypes"] = args.num_prototypes
+            decoder = build_decoder(decoder_type, **decoder_kwargs).to(device)
             n_params = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
             logger.log_info(f"c04/{decoder_type}/model",
                            f"{decoder_type} decoder: {n_params:,} trainable params")
