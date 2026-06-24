@@ -312,7 +312,13 @@ class P4Cache:
         _, h_full, w_full = sample_img.shape
         crop_h = min(1024, h_full)
         crop_w = min(1024, w_full)
-        sample_crop = sample_img[:, :crop_h, :crop_w].unsqueeze(0).to(compute_device)
+        sample_crop = sample_img[:, :crop_h, :crop_w]
+        # Pad 到 32 倍数 | Pad to 32×
+        _, ch, cw = sample_crop.shape
+        ph = (32 - ch % 32) % 32
+        pw = (32 - cw % 32) % 32
+        sample_crop = torch.nn.functional.pad(sample_crop, (0, pw, 0, ph), value=0)
+        sample_crop = sample_crop.unsqueeze(0).to(compute_device)
         with torch.amp.autocast('cuda', enabled=self.fp16):
             sample_p4 = self.backbone(sample_crop)["p4"]
         del sample_crop, sample_img
@@ -353,46 +359,58 @@ class P4Cache:
             need_chunk = (h > MAX_CHUNK or w > MAX_CHUNK)
 
             if not need_chunk:
-                # 小图: 直接全图 backbone forward
-                batch = full_img.unsqueeze(0).to(compute_device)
+                # 小图: pad 到 32 倍数 → backbone forward
+                # Small image: pad to 32× → backbone forward
+                _, h_img, w_img = full_img.shape
+                pad_h_img = (32 - h_img % 32) % 32
+                pad_w_img = (32 - w_img % 32) % 32
+                if pad_h_img > 0 or pad_w_img > 0:
+                    batch = torch.nn.functional.pad(
+                        full_img, (0, pad_w_img, 0, pad_h_img), value=0
+                    ).unsqueeze(0).to(compute_device)
+                else:
+                    batch = full_img.unsqueeze(0).to(compute_device)
                 with torch.amp.autocast('cuda', enabled=self.fp16):
-                    full_p4 = self.backbone(batch)["p4"][0]  # [C, H/16, W/16]
+                    full_p4 = self.backbone(batch)["p4"][0]
                 if self.fp16 and full_p4.dtype != torch.float16:
                     full_p4 = full_p4.half()
                 self._store_tile_p4s(full_p4, tiles, pts, storage_device)
                 del batch, full_p4
             else:
                 # 大图: 分块 backbone forward + 按 tile 裁剪
-                # Large image: chunked backbone forward + per-tile crop
-                # 预计算 chunk 网格 (在像素空间) | Precompute chunk grid (pixel space)
-                chunk_coords = []
+                # Large image: chunked backbone + per-tile crop
+                # FastSAM 要求输入尺寸是 32 的倍数 → 对每个 chunk pad
+                # FastSAM requires input dims be multiples of 32 → pad each chunk
                 for cy0 in range(0, h - ts + 1, MAX_CHUNK - CHUNK_OVERLAP):
                     cy1 = min(cy0 + MAX_CHUNK, h)
                     for cx0 in range(0, w - ts + 1, MAX_CHUNK - CHUNK_OVERLAP):
                         cx1 = min(cx0 + MAX_CHUNK, w)
-                        chunk_coords.append((cx0, cy0, cx1, cy1))
 
-                # 对每个 chunk 跑 backbone | Backbone forward per chunk
-                for cx0, cy0, cx1, cy1 in chunk_coords:
-                    chunk = full_img[:, cy0:cy1, cx0:cx1].unsqueeze(0).to(compute_device)
-                    with torch.amp.autocast('cuda', enabled=self.fp16):
-                        chunk_p4 = self.backbone(chunk)["p4"][0]  # [C, cH/16, cW/16]
-                    if self.fp16 and chunk_p4.dtype != torch.float16:
-                        chunk_p4 = chunk_p4.half()
+                        # 裁剪 + pad 到 32 的倍数 | Crop + pad to multiple of 32
+                        chunk_raw = full_img[:, cy0:cy1, cx0:cx1]
+                        _, cH, cW = chunk_raw.shape
+                        pad_h = (32 - cH % 32) % 32
+                        pad_w = (32 - cW % 32) % 32
+                        chunk = torch.nn.functional.pad(
+                            chunk_raw, (0, pad_w, 0, pad_h), value=0
+                        ).unsqueeze(0).to(compute_device)
 
-                    # 裁剪属于此 chunk 的 tile | Crop tiles belonging to this chunk
-                    for tile_idx, x0, y0 in tiles:
-                        # Tile 必须完全在 chunk 内 | Tile must be fully inside chunk
-                        if (x0 >= cx0 and y0 >= cy0 and
-                            x0 + ts <= cx1 and y0 + ts <= cy1):
-                            px0 = (x0 - cx0) // 16
-                            py0 = (y0 - cy0) // 16
-                            if (py0 + pts <= chunk_p4.shape[1] and
-                                px0 + pts <= chunk_p4.shape[2]):
+                        with torch.amp.autocast('cuda', enabled=self.fp16):
+                            chunk_p4 = self.backbone(chunk)["p4"][0]
+
+                        if self.fp16 and chunk_p4.dtype != torch.float16:
+                            chunk_p4 = chunk_p4.half()
+
+                        # 裁剪 tile (用未 pad 坐标) | Crop tiles (un-padded coords)
+                        for tile_idx, x0, y0 in tiles:
+                            if (x0 >= cx0 and y0 >= cy0 and
+                                x0 + ts <= cx1 and y0 + ts <= cy1):
+                                px0 = (x0 - cx0) // 16
+                                py0 = (y0 - cy0) // 16
                                 tile_p4 = chunk_p4[:, py0:py0 + pts, px0:px0 + pts]
                                 self._store_one(tile_idx, tile_p4, storage_device)
 
-                    del chunk, chunk_p4
+                        del chunk, chunk_p4
 
             del full_img
             # 定期清理 GPU 缓存 | Periodic GPU cache cleanup
