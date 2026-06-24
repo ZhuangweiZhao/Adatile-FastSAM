@@ -284,7 +284,7 @@ def train_episode(decoder, support_idxs, query_idx,
 
     # ── Support P4 (cache first, then backbone fallback) ──
     if p4_cache_train is not None:
-        support_p4s = [p4_cache_train[int(si)].unsqueeze(0).to(device)
+        support_p4s = [p4_cache_train[int(si)].to(device)
                        for si in support_idxs]
     else:
         support_imgs = torch.stack([train_ds.load_image(int(si))
@@ -345,7 +345,7 @@ def validate_episode(decoder, train_ds, val_ds, query_class,
 
         # Support P4
         if p4_cache_train is not None:
-            support_p4s = [p4_cache_train[int(si)].unsqueeze(0).to(device)
+            support_p4s = [p4_cache_train[int(si)].to(device)
                           for si in support_idxs]
         else:
             support_imgs = torch.stack([train_ds.load_image(int(si))
@@ -404,7 +404,7 @@ def evaluate_trained(decoder, train_ds, val_ds, device,
 
         # Support P4
         if p4_cache_train is not None:
-            support_p4s = [p4_cache_train[int(si)].unsqueeze(0).to(device)
+            support_p4s = [p4_cache_train[int(si)].to(device)
                           for si in support_idxs]
         else:
             support_imgs = torch.stack([train_ds.load_image(int(si))
