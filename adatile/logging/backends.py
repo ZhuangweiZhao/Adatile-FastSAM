@@ -81,11 +81,10 @@ class ConsoleBackend(LogBackend):
         # tags 非空时显示在行尾 | show tags at end of line when present
         tags_str = f"  ({', '.join(record.tags)})" if record.tags else ""
 
-        # 固定宽度：step 6位，phase:scope 20位，方便对齐阅读
-        # Fixed-width fields: step=6, phase:scope=20 — for easy visual alignment
+        # step 定宽 6 位右对齐，phase:scope 自适应宽度 | step fixed 6-char right-align, phase:scope adaptive
         line = (
             f"{color}"
-            f"[{record.step:>6d}] [{scope_str:<20s}] "
+            f"[{record.step:>6d}] [{scope_str}] "
             f"{record.key} = {record.value}"
             f"{tags_str}"
             f"{_RESET if self._use_color else ''}"
