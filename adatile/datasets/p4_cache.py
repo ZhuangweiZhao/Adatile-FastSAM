@@ -303,14 +303,19 @@ class P4Cache:
         compute_device = backbone_device
         self.backbone.eval()
 
-        # ── Warmup: 跑一张全图确定 P4 feature shape ──
-        # Warmup: run one full image to determine P4 feature shape
+        # ── Warmup: 用小尺寸确定 P4 feature shape (避免大图 OOM) ──
+        # Warmup: use small crop to determine P4 shape (avoids full-image OOM)
         sample_img = tile_wrapper.load_full_image(0)
-        if sample_img.dim() == 3:
-            sample_img = sample_img.unsqueeze(0)
-        sample_img = sample_img.to(compute_device)
+        if sample_img.dim() == 4:
+            sample_img = sample_img[0]
+        # 只取 1024×1024 区域做 warmup | Only use 1024×1024 crop for warmup
+        _, h_full, w_full = sample_img.shape
+        crop_h = min(1024, h_full)
+        crop_w = min(1024, w_full)
+        sample_crop = sample_img[:, :crop_h, :crop_w].unsqueeze(0).to(compute_device)
         with torch.amp.autocast('cuda', enabled=self.fp16):
-            sample_p4 = self.backbone(sample_img)["p4"]  # [1, C, H/16, W/16]
+            sample_p4 = self.backbone(sample_crop)["p4"]
+        del sample_crop, sample_img
         self.feat_dim = sample_p4.shape[1]
         self.spatial_size = (tile_wrapper.tile_size // 16, tile_wrapper.tile_size // 16)
 
@@ -324,49 +329,75 @@ class P4Cache:
             f"({'fp16' if self.fp16 else 'fp32'}, storage={self.device})",
         )
 
-        # ── 逐源图像处理 | Per-source-image processing ──
+        # ── 逐源图像分块处理 | Per-source-image chunked processing ──
+        # 全图 > 2048px 时 OOM → 分块处理 (chunk=2048, overlap=tile_size)
+        # Full image > 2048px causes OOM → chunked processing
         t0 = time.perf_counter()
         ts = tile_wrapper.tile_size
-        pts = ts // 16  # P4 spatial tile size
+        pts = ts // 16  # P4 spatial tile size per tile
+        MAX_CHUNK = 2048  # 安全 chunk 尺寸: backbone 在此尺寸下不 OOM
+        CHUNK_OVERLAP = ts  # chunk 重叠 = tile_size, 确保边界 tile 完整
 
         for img_idx in tqdm(range(n_images), desc=desc, unit="img"):
-            # 获取该图像的所有 tile | Get all tiles for this image
             tiles = tile_wrapper.get_tiles_for_image(img_idx)
             if not tiles:
                 continue
 
-            # 加载全图 → backbone forward (一次!) | Load full image → backbone ONCE
-            full_img = tile_wrapper.load_full_image(img_idx)
-            if full_img.dim() == 3:
-                full_img = full_img.unsqueeze(0)
-            full_img = full_img.to(compute_device)
+            # ── 加载全图 (CPU) | Load full image (CPU) ──
+            full_img = tile_wrapper.load_full_image(img_idx)  # [3, H, W] on CPU
+            if full_img.dim() == 4:
+                full_img = full_img[0]
+            _, h, w = full_img.shape
 
-            with torch.amp.autocast('cuda', enabled=self.fp16):
-                full_p4 = self.backbone(full_img)["p4"]  # [1, C, H/16, W/16]
+            # ── 分块策略 | Chunking strategy ──
+            need_chunk = (h > MAX_CHUNK or w > MAX_CHUNK)
 
-            full_p4_fp = full_p4[0]  # [C, H/16, W/16]
-            if self.fp16 and full_p4_fp.dtype != torch.float16:
-                full_p4_fp = full_p4_fp.half()
+            if not need_chunk:
+                # 小图: 直接全图 backbone forward
+                batch = full_img.unsqueeze(0).to(compute_device)
+                with torch.amp.autocast('cuda', enabled=self.fp16):
+                    full_p4 = self.backbone(batch)["p4"][0]  # [C, H/16, W/16]
+                if self.fp16 and full_p4.dtype != torch.float16:
+                    full_p4 = full_p4.half()
+                self._store_tile_p4s(full_p4, tiles, pts, storage_device)
+                del batch, full_p4
+            else:
+                # 大图: 分块 backbone forward + 按 tile 裁剪
+                # Large image: chunked backbone forward + per-tile crop
+                # 预计算 chunk 网格 (在像素空间) | Precompute chunk grid (pixel space)
+                chunk_coords = []
+                for cy0 in range(0, h - ts + 1, MAX_CHUNK - CHUNK_OVERLAP):
+                    cy1 = min(cy0 + MAX_CHUNK, h)
+                    for cx0 in range(0, w - ts + 1, MAX_CHUNK - CHUNK_OVERLAP):
+                        cx1 = min(cx0 + MAX_CHUNK, w)
+                        chunk_coords.append((cx0, cy0, cx1, cy1))
 
-            # 裁剪每个 tile 的 P4 | Crop P4 for each tile
-            for tile_idx, x0, y0 in tiles:
-                px0, py0 = x0 // 16, y0 // 16
-                tile_p4 = full_p4_fp[:, py0:py0 + pts, px0:px0 + pts]  # [C, ts, ts]
+                # 对每个 chunk 跑 backbone | Backbone forward per chunk
+                for cx0, cy0, cx1, cy1 in chunk_coords:
+                    chunk = full_img[:, cy0:cy1, cx0:cx1].unsqueeze(0).to(compute_device)
+                    with torch.amp.autocast('cuda', enabled=self.fp16):
+                        chunk_p4 = self.backbone(chunk)["p4"][0]  # [C, cH/16, cW/16]
+                    if self.fp16 and chunk_p4.dtype != torch.float16:
+                        chunk_p4 = chunk_p4.half()
 
-                # 存入目标设备 | Store on target device
-                if storage_device.type == "cpu" and self.pin_memory:
-                    feat_cpu = torch.empty(
-                        tile_p4.shape, dtype=tile_p4.dtype,
-                        device="cpu", pin_memory=True,
-                    )
-                    feat_cpu.copy_(tile_p4, non_blocking=True)
-                    self._cache[tile_idx] = feat_cpu
-                elif storage_device.type == "cpu":
-                    self._cache[tile_idx] = tile_p4.cpu()
-                else:
-                    self._cache[tile_idx] = tile_p4.to(storage_device)
+                    # 裁剪属于此 chunk 的 tile | Crop tiles belonging to this chunk
+                    for tile_idx, x0, y0 in tiles:
+                        # Tile 必须完全在 chunk 内 | Tile must be fully inside chunk
+                        if (x0 >= cx0 and y0 >= cy0 and
+                            x0 + ts <= cx1 and y0 + ts <= cy1):
+                            px0 = (x0 - cx0) // 16
+                            py0 = (y0 - cy0) // 16
+                            if (py0 + pts <= chunk_p4.shape[1] and
+                                px0 + pts <= chunk_p4.shape[2]):
+                                tile_p4 = chunk_p4[:, py0:py0 + pts, px0:px0 + pts]
+                                self._store_one(tile_idx, tile_p4, storage_device)
 
-            del full_img, full_p4, full_p4_fp
+                    del chunk, chunk_p4
+
+            del full_img
+            # 定期清理 GPU 缓存 | Periodic GPU cache cleanup
+            if img_idx % 10 == 9 and compute_device.type == "cuda":
+                torch.cuda.empty_cache()
 
         dt = time.perf_counter() - t0
         self._built = True
@@ -386,6 +417,32 @@ class P4Cache:
                          tags=["p4_cache_fast", f"fp16={self.fp16}"])
 
         return self
+
+    # ── 内部存储辅助 | Internal Storage Helpers ────────────────────────
+
+    def _store_one(self, tile_idx: int, tile_p4: torch.Tensor,
+                   storage_device: torch.device) -> None:
+        """存储单个 tile P4 到目标设备 | Store single tile P4 to target device."""
+        if storage_device.type == "cpu" and self.pin_memory:
+            feat_cpu = torch.empty(
+                tile_p4.shape, dtype=tile_p4.dtype,
+                device="cpu", pin_memory=True,
+            )
+            feat_cpu.copy_(tile_p4, non_blocking=True)
+            self._cache[tile_idx] = feat_cpu
+        elif storage_device.type == "cpu":
+            self._cache[tile_idx] = tile_p4.cpu()
+        else:
+            self._cache[tile_idx] = tile_p4.to(storage_device)
+
+    def _store_tile_p4s(self, full_p4: torch.Tensor,
+                        tiles: list, pts: int,
+                        storage_device: torch.device) -> None:
+        """从小图/全图 P4 批量裁剪并存储 tile P4 | Batch crop & store from small/full P4."""
+        for tile_idx, x0, y0 in tiles:
+            px0, py0 = x0 // 16, y0 // 16
+            tile_p4 = full_p4[:, py0:py0 + pts, px0:px0 + pts]
+            self._store_one(tile_idx, tile_p4, storage_device)
 
     # ── 访问接口 | Access Interface ──────────────────────────────────────
 
