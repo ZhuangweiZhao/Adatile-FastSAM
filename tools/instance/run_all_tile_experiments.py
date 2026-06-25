@@ -10,8 +10,14 @@ Run all tile experiments sequentially, skip on error, skip completed.
     # 全部实验 (Phase 1-3)
     python tools/instance/run_all_tile_experiments.py
 
-    # 仅 Phase 1
+    # 仅 Phase 1: 3 类扫网
     python tools/instance/run_all_tile_experiments.py --phase 1
+
+    # 仅 Phase 2: 全 15 类
+    python tools/instance/run_all_tile_experiments.py --phase 2
+
+    # 仅 Phase 3: 多原型消融
+    python tools/instance/run_all_tile_experiments.py --phase 3
 
     # 带自定义 GPU / 输出目录
     python tools/instance/run_all_tile_experiments.py --device cuda:0 --output-dir runs/tile_sweep
@@ -74,55 +80,56 @@ def build_experiments(args: argparse.Namespace) -> list[dict[str, Any]]:
     # Phase 1: 3 类快速扫网 | Phase 1: 3-class quick sweep
     # ══════════════════════════════════════════════════════════
 
-    # P1.0: Non-Parametric Baseline (秒级)
-    exps.append({
-        "name": "P1.0_nonparam_3class",
-        "phase": 1,
-        "cmd": [
-            sys.executable, str(_PROJECT_ROOT / "tools/instance/eval_c04_full_fewshot.py"),
-            *BASE_ARGS,
-            "--tile-cache-size", cache,
-            "--device", device,
-            "--output-dir", f"{output_dir}/p1_nonparam",
-            "--shots", shots_3,
-            *CLASSES_3,
-            "--non-parametric",
-        ],
-    })
-
-    # Decoder 列表: (suffix, decoder_arg)
-    decoders_3class = [
-        ("baseline", "--decoder", "baseline"),
-    ]
-
-    if not args.skip_heavy:
-        decoders_3class += [
-            ("film", "--decoder", "film"),
-            ("crossattn_k1", "--decoder", "crossattn", "--num-prototypes", "1"),
-            ("crossattn_k4", "--decoder", "crossattn", "--num-prototypes", "4"),
-            ("contrastive", "--decoder", "contrastive"),
-        ]
-
-    for suffix, *dec_args in decoders_3class:
+    if args.phase in (0, 1):
+        # P1.0: Non-Parametric Baseline (秒级)
         exps.append({
-            "name": f"P1_{suffix}_3class",
+            "name": "P1.0_nonparam_3class",
             "phase": 1,
             "cmd": [
                 sys.executable, str(_PROJECT_ROOT / "tools/instance/eval_c04_full_fewshot.py"),
                 *BASE_ARGS,
                 "--tile-cache-size", cache,
                 "--device", device,
-                "--output-dir", f"{output_dir}/p1_{suffix}",
+                "--output-dir", f"{output_dir}/p1_nonparam",
                 "--shots", shots_3,
-                "--epochs", str(epochs_3),
-                "--episodes-per-epoch", str(args.episodes_3class),
-                "--eval-episodes", str(args.eval_3class),
-                *dec_args,
                 *CLASSES_3,
+                "--non-parametric",
             ],
         })
 
-    if args.phase >= 2:
+        # Decoder 列表: (suffix, decoder_arg)
+        decoders_3class = [
+            ("baseline", "--decoder", "baseline"),
+        ]
+
+        if not args.skip_heavy:
+            decoders_3class += [
+                ("film", "--decoder", "film"),
+                ("crossattn_k1", "--decoder", "crossattn", "--num-prototypes", "1"),
+                ("crossattn_k4", "--decoder", "crossattn", "--num-prototypes", "4"),
+                ("contrastive", "--decoder", "contrastive"),
+            ]
+
+        for suffix, *dec_args in decoders_3class:
+            exps.append({
+                "name": f"P1_{suffix}_3class",
+                "phase": 1,
+                "cmd": [
+                    sys.executable, str(_PROJECT_ROOT / "tools/instance/eval_c04_full_fewshot.py"),
+                    *BASE_ARGS,
+                    "--tile-cache-size", cache,
+                    "--device", device,
+                    "--output-dir", f"{output_dir}/p1_{suffix}",
+                    "--shots", shots_3,
+                    "--epochs", str(epochs_3),
+                    "--episodes-per-epoch", str(args.episodes_3class),
+                    "--eval-episodes", str(args.eval_3class),
+                    *dec_args,
+                    *CLASSES_3,
+                ],
+            })
+
+    if args.phase in (0, 2):
         # ══════════════════════════════════════════════════════
         # Phase 2: 全 15 类 | Phase 2: Full 15-class
         # ══════════════════════════════════════════════════════
@@ -149,7 +156,7 @@ def build_experiments(args: argparse.Namespace) -> list[dict[str, Any]]:
                 ],
             })
 
-    if args.phase >= 3:
+    if args.phase in (0, 3):
         # ══════════════════════════════════════════════════════
         # Phase 3: Multi-Prototype Ablation (1-shot, 3-class)
         # ══════════════════════════════════════════════════════
@@ -260,8 +267,8 @@ def main():
         description="Automated Tile Experiment Runner | 自动实验运行器"
     )
     # ── 实验范围 | Experiment scope ──
-    parser.add_argument("--phase", type=int, default=3,
-                       help="运行的 Phase 编号 (1/2/3, 默认全部=3) | Phase number to run")
+    parser.add_argument("--phase", type=int, default=0,
+                       help="Phase to run (0=all, 1=3-class sweep, 2=15-class, 3=proto ablation)")
     parser.add_argument("--skip-heavy", action="store_true",
                        help="跳过 FiLM/Contrastive, 仅跑 baseline+crossattn | Skip heavy decoders")
 
