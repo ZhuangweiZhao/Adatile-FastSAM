@@ -51,7 +51,8 @@ Decoder 变体 | Decoder Variants:
         --shots 1,3,5 --eval-only --checkpoint runs/c04/decoder_1shot_best.pt
 """
 
-import sys, argparse, time, json, datetime, warnings
+import sys, argparse, time, json, warnings
+from datetime import datetime
 from pathlib import Path
 from collections import defaultdict
 from typing import Dict, List, Tuple, Optional
@@ -387,9 +388,116 @@ def train_episode(decoder, backbone, support_idxs, query_idx,
 
 
 @torch.no_grad()
+def validate_all_classes_batched(decoder, backbone, train_ds, val_ds,
+                                  target_classes, shot, device, rng,
+                                  n_val_per_class=10, batch_size=32):
+    """
+    批量验证所有类 | Batched validation for all classes.
+
+    一次 backbone forward 处理所有验证 episode, 替代逐类逐 episode 的 N×2 次 backbone forward。
+    One backbone forward for all validation episodes, replacing N×2 sequential forwards.
+
+    加速比 | Speedup: ~5-10× for validation phase (90→1 backbone forwards per epoch).
+    """
+    num_proto = getattr(decoder, 'num_prototypes', 1)
+
+    # Phase 1: 预采样所有 episode 的 (support_idxs, query_idx, class)
+    # Pre-sample all episodes: (support_idxs, query_idx, class)
+    episodes = []  # list of (support_idxs: list[int], query_idx: int, cls: int)
+    for cls_id in sorted(target_classes):
+        train_candidates = train_ds.class_to_images(cls_id)
+        val_candidates = val_ds.class_to_images(cls_id)
+        if len(train_candidates) < shot or not val_candidates:
+            continue
+        for _ in range(n_val_per_class):
+            s_idxs = rng.choice(train_candidates, shot, replace=False).tolist()
+            q_idx = int(rng.choice(val_candidates))
+            episodes.append((s_idxs, q_idx, cls_id))
+
+    if not episodes:
+        return {c: 0.0 for c in target_classes}
+
+    # Phase 2: 收集 train/val unique tile indices + 加载图像 + backbone forward
+    # Collect train/val unique tile indices (separate index spaces!) + backbone forward
+    train_tiles = set()
+    val_tiles = set()
+    for s_idxs, q_idx, _ in episodes:
+        train_tiles.update(s_idxs)
+        val_tiles.add(q_idx)
+
+    # 分别加载 train/val 图像并过 backbone | Load train/val images separately
+    tile_to_p4 = {}  # (ds, tile_idx) -> P4 tensor, ds: 'train' or 'val'
+
+    for ds_tag, ds, tile_set in [("train", train_ds, train_tiles),
+                                  ("val", val_ds, val_tiles)]:
+        unique_tiles = sorted(tile_set)
+        for batch_start in range(0, len(unique_tiles), batch_size):
+            batch_tiles = unique_tiles[batch_start:batch_start + batch_size]
+            batch_imgs = torch.stack([ds.load_image(ti) for ti in batch_tiles]).to(device)
+            batch_feats = backbone(batch_imgs)["p4"]
+            for i, ti in enumerate(batch_tiles):
+                tile_to_p4[(ds_tag, ti)] = batch_feats[i]  # [1280, 56, 56]
+
+    # Phase 3: 计算 prototypes + decoder forward + IoU
+    # Compute prototypes + decoder forward + IoU per episode
+    per_cls_ious = {c: [] for c in target_classes}
+
+    for batch_start in range(0, len(episodes), batch_size):
+        batch_eps = episodes[batch_start:batch_start + batch_size]
+
+        # 收集 batch 内所有 query P4 | Collect query P4s within batch
+        query_p4s, query_masks, query_classes = [], [], []
+        proto_list = []
+
+        for s_idxs, q_idx, cls_id in batch_eps:
+            # Support → prototype (indices from train_ds)
+            s_p4s = [tile_to_p4[("train", si)] for si in s_idxs]
+            s_masks = [train_ds.render_class_mask(si, cls_id).to(device) for si in s_idxs]
+
+            if num_proto > 1:
+                proto = compute_multi_prototype(s_p4s, s_masks, num_prototypes=num_proto)
+                if (proto.dim() == 1 and proto.sum() == 0) or \
+                   (proto.dim() == 2 and proto.sum() == 0):
+                    continue
+            else:
+                proto = compute_fg_prototype(s_p4s, s_masks)
+                if proto.sum() == 0:
+                    continue
+
+            # Query (indices from val_ds)
+            q_p4 = tile_to_p4[("val", q_idx)]
+            q_mask = val_ds.render_class_mask(q_idx, cls_id).to(device)
+
+            proto_list.append(proto)
+            query_p4s.append(q_p4)
+            query_masks.append(q_mask)
+            query_classes.append(cls_id)
+
+        if not query_p4s:
+            continue
+
+        # Batch query_p4s: list of [1280,56,56] → [B,1280,56,56]
+        q_p4_batch = torch.stack(query_p4s)
+        q_mask_batch = torch.stack(query_masks).unsqueeze(1)  # [B,1,H,W]
+
+        # Decoder — process one at a time since prototypes differ
+        # (each episode has different prototype, can't batch decoder easily)
+        for i, (proto, q_p4, q_mask, cls_id) in enumerate(
+            zip(proto_list, query_p4s, query_masks, query_classes)):
+            logit = decoder(q_p4.unsqueeze(0), proto,
+                          target_size=tuple(q_mask.shape))
+            pred = (logit.squeeze(0).squeeze(0).cpu() > 0)
+            gt = (q_mask.cpu() > 0)
+            per_cls_ious[cls_id].append(binary_iou(pred, gt))
+
+    return {c: float(np.mean(per_cls_ious[c])) if per_cls_ious[c] else 0.0
+            for c in target_classes}
+
+
+@torch.no_grad()
 def validate_episode(decoder, backbone, train_ds, val_ds, query_class,
                      shot, device, rng, n_val=30):
-    """Validation: fixed episodes per class."""
+    """Validation: fixed episodes per class (legacy, use validate_all_classes_batched)."""
     train_candidates = train_ds.class_to_images(query_class)
     val_candidates = val_ds.class_to_images(query_class)
     if len(train_candidates) < shot or not val_candidates:
@@ -398,6 +506,7 @@ def validate_episode(decoder, backbone, train_ds, val_ds, query_class,
     num_proto = getattr(decoder, 'num_prototypes', 1)
 
     ious = []
+    n_skipped = 0
     for _ in range(n_val):
         support_idxs = rng.choice(train_candidates, shot, replace=False)
         qi = int(rng.choice(val_candidates))
@@ -414,10 +523,12 @@ def validate_episode(decoder, backbone, train_ds, val_ds, query_class,
                                                 num_prototypes=num_proto)
             if (fg_proto.dim() == 1 and fg_proto.sum() == 0) or \
                (fg_proto.dim() == 2 and fg_proto.sum() == 0):
+                n_skipped += 1
                 continue
         else:
             fg_proto = compute_fg_prototype(support_p4s, support_masks)
             if fg_proto.sum() == 0:
+                n_skipped += 1
                 continue
 
         logit = decoder(backbone(query_img)["p4"], fg_proto,
@@ -426,6 +537,8 @@ def validate_episode(decoder, backbone, train_ds, val_ds, query_class,
         gt = (query_mask.cpu() > 0)
         ious.append(binary_iou(pred, gt))
 
+    if n_skipped == n_val:
+        return 0.0  # 全部空 proto: 返回 0.0 而非 NaN, 让调用方感知到低值
     return float(np.mean(ious)) if ious else 0.0
 
 
@@ -616,7 +729,7 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
 
     for epoch in range(1, args.epochs + 1):
         decoder.train()
-        total_loss, n_eps = 0.0, 0
+        total_loss, n_eps, n_empty = 0.0, 0, 0
 
         pbar = tqdm(range(args.episodes_per_epoch),
                     desc=f"  E{epoch}/{args.epochs}", leave=False)
@@ -638,17 +751,26 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
                 total_loss += loss
                 n_eps += 1
                 pbar.set_postfix({"loss": f"{loss:.4f}"})
+            else:
+                n_empty += 1
 
         sch.step()
         avg_loss = total_loss / max(n_eps, 1)
 
-        # Per-class validation (skip zero-shot classes)
+        # 空原型率过高告警 | Warn if empty prototype rate is high
+        if n_empty > args.episodes_per_epoch * 0.1:
+            logger.log_warn(f"{tag}/train",
+                          f"E{epoch}: {n_empty}/{args.episodes_per_epoch} episodes had empty prototype "
+                          f"({n_empty/args.episodes_per_epoch*100:.1f}%) — check data/mask rendering")
+
+        # Per-class validation — batched: one backbone forward for all episodes
+        # 批量验证: 所有 episode 共享一次 backbone forward
         decoder.eval()
-        per_cls_val = {}
-        for cls_id in valid_classes:
-            per_cls_val[cls_id] = validate_episode(
-                decoder, backbone, train_ds, val_ds,
-                cls_id, shot, device, rng_val, n_val=args.val_episodes_per_class)
+        per_cls_val = validate_all_classes_batched(
+            decoder, backbone, train_ds, val_ds,
+            valid_classes, shot, device, rng_val,
+            n_val_per_class=args.val_episodes_per_class,
+            batch_size=args.val_batch_size)
         for cls_id in zero_shot_classes:
             per_cls_val[cls_id] = 0.0
 
@@ -738,7 +860,8 @@ class NonParametricMatcher(nn.Module):
 
 def parse_args():
     p = argparse.ArgumentParser(description="C-04: Full-Category Few-Shot on iSAID")
-    p.add_argument("--src-root", type=str, default="data/iSAID_processed")
+    p.add_argument("--src-root", type=str, required=True,
+                   help="iSAID 数据根目录 (e.g. data/iSAID_processed, /root/autodl-tmp/iSAID_processed)")
     p.add_argument("--classes", type=str, default="all",
                    help="Comma-separated class IDs, or 'all' for all 15")
     p.add_argument("--shots", type=str, default="1,3,5")
@@ -747,7 +870,10 @@ def parse_args():
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--episodes-per-epoch", type=int, default=200)
     p.add_argument("--eval-episodes", type=int, default=200)
-    p.add_argument("--val-episodes-per-class", type=int, default=30)
+    p.add_argument("--val-episodes-per-class", type=int, default=10,
+                   help="每类每 epoch 验证 episode 数 (默认 10, 30ep 已足够稳定)")
+    p.add_argument("--val-batch-size", type=int, default=32,
+                   help="批量验证时每批处理的图像数 (默认 32, 根据显存调整)")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--warmup-epochs", type=int, default=3)
@@ -766,8 +892,8 @@ def parse_args():
                    help="Tile 模式: 切分全图为 896x896 tiles (stride=512, overlap=384)")
     p.add_argument("--tile-size", type=int, default=896)
     p.add_argument("--tile-stride", type=int, default=512)
-    p.add_argument("--tile-cache-size", type=int, default=64,
-                   help="Tile wrapper 原图 LRU 缓存大小 (默认 64)")
+    p.add_argument("--tile-cache-size", type=int, default=0,
+                   help="Tile wrapper 原图 LRU 缓存大小 (0=auto: GPU VRAM/2GB, 默认 32)")
     return p.parse_args()
 
 
@@ -799,6 +925,17 @@ def main():
     logger.log_info("c04/config",
                    f"Training: {args.epochs} epochs x {args.episodes_per_epoch} episodes "
                    f"(warmup={args.warmup_epochs}, grad_clip={args.grad_clip}, AMP={args.amp})")
+
+    # Auto-detect tile cache size from GPU VRAM | 根据显存自动选择缓存大小
+    if args.tile and args.tile_cache_size == 0:
+        if torch.cuda.is_available():
+            vram_gb = torch.cuda.get_device_properties(device).total_memory / (1024**3)
+            args.tile_cache_size = max(16, int(vram_gb / 2))  # 1 cache slot ≈ 2GB full image
+            logger.log_info("c04/config",
+                           f"Auto tile-cache-size={args.tile_cache_size} (VRAM={vram_gb:.1f}GB)")
+        else:
+            args.tile_cache_size = 16
+            logger.log_info("c04/config", "Auto tile-cache-size=16 (CPU mode)")
 
     # Load data
     train_ds = ISAIDInstanceDataset(args.src_root, split="train")
@@ -849,7 +986,7 @@ def main():
             "experiment": "C-04 Non-Parametric Baseline",
             "decoder": "non_parametric",
             "target_classes": {str(k): v for k, v in target_classes.items()},
-            "timestamp": datetime.datetime.now().isoformat(),
+            "timestamp": datetime.now().isoformat(),
             "results": {k: {"miou_mean": v["miou_mean"], "miou_std": v["miou_std"],
                            "n_valid": v["n_valid"], "per_class_iou": v["per_class_iou"]}
                        for k, v in nonparam_results.items()},
@@ -901,9 +1038,10 @@ def main():
                         if lines:
                             last = json.loads(lines[-1])
                             if last.get("epoch", 0) >= args.epochs:
+                                best_skip = max(json.loads(l)["val_miou"] for l in lines)
                                 logger.log_info(f"c04/{decoder_type}/{shot}shot/skip",
                                                f"Already complete (epoch {last['epoch']}/{args.epochs}), "
-                                               f"best_val_mIoU={last.get('val_miou', '?'):.4f}. Skipping.")
+                                               f"best_val_mIoU={best_skip:.4f}. Skipping.")
                                 skip = True
                     except Exception:
                         pass
@@ -915,7 +1053,9 @@ def main():
                                            shot, args.eval_episodes, target_classes,
                                            logger, f"c04/{decoder_type}/{shot}shot/eval")
                     all_results[decoder_type][f"{shot}shot"] = result
-                    best_val = last.get("val_miou", 0.0)
+                    # 扫描所有 epoch 取最佳 | Scan all epochs for best val_mIoU
+                    best_val = max(json.loads(l)["val_miou"] for l in lines)
+                    result["best_val_miou"] = best_val
                 else:
                     decoder, result, best_val = train_and_evaluate(
                         decoder, backbone, train_ds, val_ds, device,
@@ -989,7 +1129,7 @@ def main():
         "experiment": "C-04 Full-Category Few-Shot Instance Segmentation",
         "dataset": "iSAID",
         "target_classes": {str(k): v for k, v in target_classes.items()},
-        "timestamp": datetime.datetime.now().isoformat(),
+        "timestamp": datetime.now().isoformat(),
         "environment": get_env_info(),
         "shots": shots,
         "decoders": decoder_types,

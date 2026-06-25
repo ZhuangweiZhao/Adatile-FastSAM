@@ -8,22 +8,25 @@ Run all tile experiments sequentially, skip on error, skip completed.
 
 用法 | Usage::
     # 全部实验 (Phase 1-3)
-    python tools/instance/run_all_tile_experiments.py
+    python tools/instance/run_all_tile_experiments.py --src-root data/iSAID_processed
 
     # 仅 Phase 1: 3 类扫网
-    python tools/instance/run_all_tile_experiments.py --phase 1
+    python tools/instance/run_all_tile_experiments.py --src-root data/iSAID_processed --phase 1
 
     # 仅 Phase 2: 全 15 类
-    python tools/instance/run_all_tile_experiments.py --phase 2
+    python tools/instance/run_all_tile_experiments.py --src-root data/iSAID_processed --phase 2
 
     # 仅 Phase 3: 多原型消融
-    python tools/instance/run_all_tile_experiments.py --phase 3
+    python tools/instance/run_all_tile_experiments.py --src-root data/iSAID_processed --phase 3
+
+    # 云服务器
+    python tools/instance/run_all_tile_experiments.py --src-root /root/autodl-tmp/iSAID_processed --phase 2
 
     # 带自定义 GPU / 输出目录
-    python tools/instance/run_all_tile_experiments.py --device cuda:0 --output-dir runs/tile_sweep
+    python tools/instance/run_all_tile_experiments.py --src-root data/iSAID_processed --device cuda:0 --output-dir runs/tile_sweep
 
     # 干运行 (仅打印命令，不执行)
-    python tools/instance/run_all_tile_experiments.py --dry-run
+    python tools/instance/run_all_tile_experiments.py --src-root data/iSAID_processed --dry-run
 """
 
 from __future__ import annotations
@@ -44,9 +47,9 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # 实验定义 | Experiment Definitions
 # ═══════════════════════════════════════════════════════════════════
 
-# 公共基础参数 | Common base args
-BASE_ARGS = [
-    "--src-root", "data/iSAID_processed",
+# 公共基础参数占位 | Common base args placeholder
+# --src-root 由 CLI 参数注入 | --src-root injected from CLI arg
+_BASE_TILE_ARGS = [
     "--tile", "--tile-size", "896", "--tile-stride", "512",
     "--warmup-epochs", "3",
     "--amp",
@@ -69,7 +72,10 @@ def build_experiments(args: argparse.Namespace) -> list[dict[str, Any]]:
 
     device = args.device
     output_dir = args.output_dir
+    src_root = args.src_root
     cache = str(args.tile_cache_size)
+    # 构建基础参数 | Build base args with configured src-root
+    base_args = ["--src-root", src_root, *_BASE_TILE_ARGS]
     shots_3 = args.shots_3class
     shots_all = args.shots_all
     epochs_3 = args.epochs_3class
@@ -87,7 +93,7 @@ def build_experiments(args: argparse.Namespace) -> list[dict[str, Any]]:
             "phase": 1,
             "cmd": [
                 sys.executable, str(_PROJECT_ROOT / "tools/instance/eval_c04_full_fewshot.py"),
-                *BASE_ARGS,
+                *base_args,
                 "--tile-cache-size", cache,
                 "--device", device,
                 "--output-dir", f"{output_dir}/p1_nonparam",
@@ -116,7 +122,7 @@ def build_experiments(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "phase": 1,
                 "cmd": [
                     sys.executable, str(_PROJECT_ROOT / "tools/instance/eval_c04_full_fewshot.py"),
-                    *BASE_ARGS,
+                    *base_args,
                     "--tile-cache-size", cache,
                     "--device", device,
                     "--output-dir", f"{output_dir}/p1_{suffix}",
@@ -143,7 +149,7 @@ def build_experiments(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "phase": 2,
                 "cmd": [
                     sys.executable, str(_PROJECT_ROOT / "tools/instance/eval_c04_full_fewshot.py"),
-                    *BASE_ARGS,
+                    *base_args,
                     "--tile-cache-size", cache,
                     "--device", device,
                     "--output-dir", f"{output_dir}/p2_{suffix}",
@@ -167,10 +173,10 @@ def build_experiments(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "phase": 3,
                 "cmd": [
                     sys.executable, str(_PROJECT_ROOT / "tools/instance/eval_c04_full_fewshot.py"),
-                    *BASE_ARGS,
+                    *base_args,
                     "--tile-cache-size", cache,
                     "--device", device,
-                    "--output-dir", f"{output_dir}/p3_proto",
+                    "--output-dir", f"{output_dir}/p3_proto_k{K}",
                     "--shots", "1",
                     "--epochs", str(epochs_3),
                     "--episodes-per-epoch", str(args.episodes_3class),
@@ -207,7 +213,7 @@ def is_completed(exp: dict, output_dir: str) -> bool:
     return False
 
 
-def run_one(exp: dict, dry_run: bool = False) -> tuple[str, bool, str]:
+def run_one(exp: dict, dry_run: bool = False, timeout: int = 43200) -> tuple[str, bool, str]:
     """
     运行单个实验 | Run a single experiment.
 
@@ -238,6 +244,7 @@ def run_one(exp: dict, dry_run: bool = False) -> tuple[str, bool, str]:
             cwd=str(_PROJECT_ROOT),
             capture_output=False,  # 实时输出到终端 | stream to terminal
             text=True,
+            timeout=timeout,
         )
         dt = time.perf_counter() - t0
 
@@ -253,6 +260,12 @@ def run_one(exp: dict, dry_run: bool = False) -> tuple[str, bool, str]:
     except KeyboardInterrupt:
         print(f"\n[STOP] {name}: User interrupt")
         raise
+
+    except subprocess.TimeoutExpired:
+        dt = time.perf_counter() - t0
+        msg = f"TIMEOUT after {dt/60:.1f} min (limit: {timeout/60:.0f} min)"
+        print(f"\n[TIMEOUT] {name}: {msg}")
+        return (name, False, msg)
 
     except Exception as e:
         dt = time.perf_counter() - t0
@@ -271,23 +284,25 @@ def main():
                        help="Phase to run (0=all, 1=3-class sweep, 2=15-class, 3=proto ablation)")
     parser.add_argument("--skip-heavy", action="store_true",
                        help="跳过 FiLM/Contrastive, 仅跑 baseline+crossattn | Skip heavy decoders")
+    parser.add_argument("--src-root", type=str, required=True,
+                       help="iSAID 数据根目录 (e.g. data/iSAID_processed, /root/autodl-tmp/iSAID_processed)")
 
     # ── 超参数 | Hyperparameters ──
     parser.add_argument("--device", type=str, default="cuda",
                        help="运行设备 | Device (default: cuda)")
     parser.add_argument("--output-dir", type=str, default="runs/tile_sweep",
                        help="输出根目录 | Output root directory")
-    parser.add_argument("--tile-cache-size", type=int, default=32,
-                       help="原图 LRU 缓存大小 (RTX 3060=32) | Tile cache size")
+    parser.add_argument("--tile-cache-size", type=int, default=0,
+                       help="原图 LRU 缓存大小 (0=auto: GPU VRAM/2GB) | Tile cache size")
 
     # ── 3 类配置 | 3-class config ──
     parser.add_argument("--shots-3class", type=str, default="1,3,5",
                        help="3 类 shot 数 | Shots for 3-class experiments")
     parser.add_argument("--epochs-3class", type=int, default=30,
                        help="3 类 epoch 数 | Epochs for 3-class")
-    parser.add_argument("--episodes-3class", type=int, default=100,
+    parser.add_argument("--episodes-3class", type=int, default=50,
                        help="3 类每 epoch episode 数 | Episodes/epoch for 3-class")
-    parser.add_argument("--eval-3class", type=int, default=200,
+    parser.add_argument("--eval-3class", type=int, default=100,
                        help="3 类评估 episode 数 | Eval episodes for 3-class")
 
     # ── 全 15 类配置 | Full 15-class config ──
@@ -307,10 +322,10 @@ def main():
     # ── 运行控制 | Run control ──
     parser.add_argument("--dry-run", action="store_true",
                        help="仅打印命令不执行 | Print commands without running")
-    parser.add_argument("--force", action="store_true",
-                       help="强制重跑已完成实验 | Force re-run completed experiments")
     parser.add_argument("--no-skip", action="store_true",
                        help="重跑所有，包括已完成 | Re-run all, including completed")
+    parser.add_argument("--timeout", type=int, default=43200,
+                       help="单个实验超时秒数 (默认 12h) | Per-experiment timeout in seconds")
 
     args = parser.parse_args()
 
@@ -318,7 +333,7 @@ def main():
     experiments = build_experiments(args)
 
     # ── 过滤已完成 | Filter completed ──
-    if not args.no_skip and not args.force:
+    if not args.no_skip:
         skipped = 0
         filtered = []
         for exp in experiments:
@@ -340,7 +355,7 @@ def main():
     print(f"\n{'='*70}")
     print(f"  Experiment Plan: {len(experiments)} to run")
     print(f"  Device: {args.device} | Output: {args.output_dir}")
-    print(f"  Dry-run: {args.dry_run} | Force: {args.force}")
+    print(f"  Dry-run: {args.dry_run} | No-skip: {args.no_skip}")
     print(f"{'='*70}")
     for exp in experiments:
         print(f"  [{exp['phase']}] {exp['name']}")
@@ -356,7 +371,7 @@ def main():
         print(f"{'#'*70}")
 
         try:
-            name, ok, msg = run_one(exp, dry_run=args.dry_run)
+            name, ok, msg = run_one(exp, dry_run=args.dry_run, timeout=args.timeout)
             results.append((name, ok, msg))
         except KeyboardInterrupt:
             print("\n\nUser interrupt. Saving partial results...")
