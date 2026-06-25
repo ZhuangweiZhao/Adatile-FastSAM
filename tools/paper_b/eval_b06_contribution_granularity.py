@@ -57,10 +57,10 @@ def load_dataset(tile_root, dataset_name, split="val"):
         use_split = "test"
     if dataset_name == "isaid":
         from adatile.datasets.isaid_tiles import FastISAIDTileDataset
-        return FastISAIDTileDataset(tile_root, split=use_split, semantic=True)
+        return FastISAIDTileDataset(tile_root, split=use_split, dense_labels=True)
     elif dataset_name == "vaihingen":
         from adatile.datasets.vaihingen_tiles import VaihingenTileDataset
-        return VaihingenTileDataset(tile_root, split=use_split, semantic=True)
+        return VaihingenTileDataset(tile_root, split=use_split, dense_labels=True)
     raise ValueError(f"Unknown dataset: {dataset_name}")
 
 
@@ -285,7 +285,7 @@ def main():
     logger.log_info("conclusion",
         f"       512px Ret@50={all_results[512]['ret50']*100:.0f}% (dropping 2 tiles loses 36%)")
     logger.log_info("conclusion",
-        "        → Coarse tiles carry more semantic coverage per tile")
+        "        → Coarse tiles carry more category coverage per tile")
     logger.log_info("conclusion",
         "  Obs3 | Contribution imbalance exists across ALL granularities")
     logger.log_info("conclusion",

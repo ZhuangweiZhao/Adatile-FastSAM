@@ -51,7 +51,7 @@ Cross-Attention 细节 | CA Details:
         --shots 1,3,5 --epochs 30
 """
 
-import sys, argparse, time, json, datetime
+import sys, argparse, time, json, datetime, cv2
 from pathlib import Path
 from collections import defaultdict
 import numpy as np
@@ -148,9 +148,7 @@ def compute_multi_prototype(
     fg_norm = F.normalize(fg_all, dim=1, p=2)
 
     for _ in range(n_iter):
-        # 余弦相似度分配 | Cosine similarity assignment
-        sim = torch.mm(fg_norm, centroids.T)  # [N, K] (centroids are already ~normalized)
-        # 额外归一化 centroids 保证余弦相似度范围 | normalize centroids for cosine sim
+        # 余弦相似度分配: L2-normalize centroids 保证余弦相似度范围 | Cosine similarity assignment with normalized centroids
         centroids_norm = F.normalize(centroids, dim=1, p=2)
         sim = torch.mm(fg_norm, centroids_norm.T)  # [N, K]
         assignments = sim.argmax(dim=1)  # [N]
@@ -276,7 +274,8 @@ def train_episode_optimized(decoder, support_idxs, query_idx,
             return None
 
     # ── AMP forward + backward ──
-    with torch.amp.autocast('cuda', enabled=use_amp):
+    amp_device = 'cuda' if device.startswith('cuda') else device
+    with torch.amp.autocast(amp_device, enabled=use_amp):
         logit = decoder(query_p4, fg_proto, target_size=tuple(query_mask.shape[2:]))
         bce_loss = F.binary_cross_entropy_with_logits(logit, query_mask)
         prob = torch.sigmoid(logit)
@@ -287,6 +286,8 @@ def train_episode_optimized(decoder, support_idxs, query_idx,
 
     opt.zero_grad()
     scaler.scale(loss).backward()
+    scaler.unscale_(opt)  # 梯度裁剪前必须先 unscale | Must unscale before gradient clipping
+    torch.nn.utils.clip_grad_norm_(decoder.parameters(), max_norm=1.0)
     scaler.step(opt)
     scaler.update()
     return loss.item()
@@ -348,7 +349,7 @@ def validate_episode_optimized(decoder, train_ds, val_ds, query_class,
             if fg_proto.sum() == 0:
                 continue
 
-        with torch.amp.autocast('cuda', enabled=use_amp):
+        with torch.amp.autocast(amp_device, enabled=use_amp):
             logit = decoder(query_p4, fg_proto, target_size=tuple(query_mask.shape))
         pred = (logit.squeeze().cpu() > 0).numpy()
         gt = query_mask.cpu().numpy() > 0
@@ -382,6 +383,8 @@ class CATFewShotDecoder(nn.Module):
     ~1.1M trainable params. Frozen FastSAM backbone.
     Cross-Attention has 0 learned params (parameter-free operation).
     """
+
+    _logger = get_logger("CATFewShotDecoder")  # 模块级 logger | Module-level logger
 
     def __init__(self, feat_dim: int = 1280, hidden_dim: int = 256,
                  num_prototypes: int = 1):
@@ -431,9 +434,13 @@ class CATFewShotDecoder(nn.Module):
             *self.up3.parameters(), *self.mask_head.parameters(),
         ])
         # Cross-Attention: 0 参数 (纯计算操作)
-        print(f"[CATFewShotDecoder] Total: {n_proto+n_proj+n_dec:,} params "
-              f"(ProtoMLP: {n_proto:,}, Proj: {n_proj:,}, "
-              f"CrossAttn: 0, Decoder: {n_dec:,})")
+        # Cross-Attention: 0 params (parameter-free operation)
+        CATFewShotDecoder._logger.log_info(
+            "init",
+            f"CATFewShotDecoder: {n_proto+n_proj+n_dec:,} params "
+            f"(ProtoMLP: {n_proto:,}, Proj: {n_proj:,}, "
+            f"CrossAttn: 0, Decoder: {n_dec:,})"
+        )
 
     def _cross_attention(self, x: torch.Tensor,
                          proto_tokens: torch.Tensor) -> torch.Tensor:
@@ -545,6 +552,104 @@ def precompute_p4_cache(dataset, backbone, device, desc="P4 cache"):
     return cache
 
 
+# ═══════════════════════════════════════════════════════════════════
+# Instance Segmentation Helpers | 实例分割辅助函数
+# ═══════════════════════════════════════════════════════════════════
+
+def connected_components_to_instances(mask: np.ndarray,
+                                       min_area: int = 16) -> list[np.ndarray]:
+    """
+    二值 mask → 连通域拆分 → 实例 mask 列表。
+    Binary mask → connected components → list of instance masks.
+
+    :param mask: [H, W] bool array (FG=True, BG=False)
+    :param min_area: 最小连通域面积（像素），过滤噪声
+    :return: list of [H, W] bool arrays, one per instance
+    """
+    mask_u8 = mask.astype(np.uint8) * 255
+    n_labels, labels = cv2.connectedComponents(mask_u8, connectivity=8)
+    instances = []
+    for label_id in range(1, n_labels):  # skip 0 (background)
+        inst = labels == label_id
+        if inst.sum() >= min_area:
+            instances.append(inst)
+    return instances
+
+
+def compute_instance_ap(pred_instances: list[np.ndarray],
+                         gt_instances: list[np.ndarray],
+                         iou_thresh: float = 0.5) -> float:
+    """
+    计算 per-image 实例分割 AP。
+    Compute per-image instance segmentation AP.
+
+    对每张图: 预测实例 + GT 实例 → IoU 匹配 → precision/recall → AP。
+
+    :param pred_instances: list of [H, W] bool arrays (pred FG masks)
+    :param gt_instances: list of [H, W] bool arrays (GT instance masks)
+    :param iou_thresh: IoU 匹配阈值
+    :return: AP score in [0, 1]
+    """
+    if not pred_instances or not gt_instances:
+        return 0.0 if not gt_instances else 0.0  # no preds + has GTs → AP=0
+
+    n_gt = len(gt_instances)
+    gt_matched = np.zeros(n_gt, dtype=bool)
+
+    # Sort preds by area (proxy for confidence)
+    pred_areas = [p.sum() for p in pred_instances]
+    sorted_idx = np.argsort(pred_areas)[::-1]
+    tp = np.zeros(len(pred_instances), dtype=int)
+    fp = np.zeros(len(pred_instances), dtype=int)
+
+    for rank, pi in enumerate(sorted_idx):
+        pm = pred_instances[pi]
+        best_iou, best_gi = 0.0, -1
+        for gi, gm in enumerate(gt_instances):
+            if gt_matched[gi]:
+                continue
+            inter = (pm & gm).sum()
+            union = (pm | gm).sum()
+            iou = inter / union if union > 0 else 0.0
+            if iou > best_iou:
+                best_iou, best_gi = iou, gi
+        if best_iou >= iou_thresh:
+            tp[rank] = 1
+            gt_matched[best_gi] = True
+        else:
+            fp[rank] = 1
+
+    # Precision-Recall → AP
+    tp_cum = np.cumsum(tp).astype(float)
+    fp_cum = np.cumsum(fp).astype(float)
+    recall = tp_cum / max(n_gt, 1)
+    precision = tp_cum / np.maximum(tp_cum + fp_cum, 1e-8)
+
+    # 101-point interpolated AP
+    ap = 0.0
+    for t in np.linspace(0, 1, 101):
+        mask_r = recall >= t
+        if np.any(mask_r):
+            ap += float(np.max(precision[mask_r]))
+    return ap / 101.0
+
+
+def get_gt_instance_masks(dataset, idx: int, class_id: int
+                          ) -> list[np.ndarray]:
+    """
+    获取单张图/单张 tile 上目标类别的 GT 实例 mask 列表。
+    Get list of GT instance masks for target class on one image/tile.
+
+    优先使用 dataset.render_instance_masks()（TileWrapper），
+    否则回退到渲染全图级 mask 列表（ISAIDInstanceDataset）。
+    """
+    if hasattr(dataset, 'render_instance_masks'):
+        return dataset.render_instance_masks(idx, class_id)
+    # Fallback for ISAIDInstanceDataset: use render_class_mask → connected components
+    union = dataset.render_class_mask(idx, class_id).numpy() > 0
+    return connected_components_to_instances(union)
+
+
 @torch.no_grad()
 def evaluate_trained(decoder, train_ds, val_ds, device,
                      shot, n_episodes, target_classes, logger, tag,
@@ -554,6 +659,7 @@ def evaluate_trained(decoder, train_ds, val_ds, device,
     class_to_images = {c: train_ds.class_to_images(c) for c in target_classes}
     rng = np.random.RandomState(42)
     all_ious, per_cls_ious = [], defaultdict(list)
+    all_ap50, per_cls_ap50 = [], defaultdict(list)  # Instance AP
     t0 = time.perf_counter()
     log_every = max(10, n_episodes // 10)
 
@@ -611,28 +717,42 @@ def evaluate_trained(decoder, train_ds, val_ds, device,
         all_ious.append(iou)
         per_cls_ious[query_class].append(iou)
 
+        # ── Instance AP: 二值 mask → 连通域 → 实例 → AP ──
+        pred_instances = connected_components_to_instances(pred)
+        gt_instances = get_gt_instance_masks(val_ds, qi, query_class)
+        ap50 = compute_instance_ap(pred_instances, gt_instances, iou_thresh=0.5)
+        per_cls_ap50[query_class].append(ap50)
+        all_ap50.append(ap50)
+
         if (ep + 1) % log_every == 0 and all_ious:
-            running = float(np.mean(all_ious[-log_every:]))
-            total = float(np.mean(all_ious))
+            running_iou = float(np.mean(all_ious[-log_every:]))
+            running_ap = float(np.mean(all_ap50[-log_every:]))
             logger.log_info(f'{tag}/progress',
-                           f'  Ep {ep+1}/{n_episodes}: running={running:.4f} total={total:.4f}')
+                           f'  Ep {ep+1}/{n_episodes}: IoU={running_iou:.4f} AP@50={running_ap:.4f}')
 
     dt = time.perf_counter() - t0
     per_cls_avg = {}
+    per_cls_ap = {}
     for c in sorted(per_cls_ious.keys()):
-        avg = float(np.mean(per_cls_ious[c]))
-        per_cls_avg[str(c)] = avg
+        avg_iou = float(np.mean(per_cls_ious[c]))
+        avg_ap = float(np.mean(per_cls_ap50.get(c, [0])))
+        per_cls_avg[str(c)] = avg_iou
+        per_cls_ap[str(c)] = avg_ap
         logger.log_info(f'{tag}/per_cls',
-                       f'  {target_classes[c]:<20} IoU={avg:.4f} ({len(per_cls_ious[c])} eps)')
+                       f'  {target_classes[c]:<20} IoU={avg_iou:.4f} AP@50={avg_ap:.4f} ({len(per_cls_ious[c])} eps)')
 
     result = {
         'miou_mean': float(np.mean(all_ious)) if all_ious else 0.0,
         'miou_std': float(np.std(all_ious)) if all_ious else 0.0,
+        'map50_mean': float(np.mean(all_ap50)) if all_ap50 else 0.0,
+        'map50_std': float(np.std(all_ap50)) if all_ap50 else 0.0,
         'n_valid': len(all_ious),
         'per_class_iou': per_cls_avg,
+        'per_class_ap50': per_cls_ap,
     }
     logger.log_info(f'{tag}/done',
-                   f'  {shot}-shot: mIoU={result["miou_mean"]:.4f}±{result["miou_std"]:.4f} '
+                   f'  {shot}-shot: mIoU={result["miou_mean"]:.4f} '
+                   f'mAP@50={result["map50_mean"]:.4f}±{result["map50_std"]:.4f} '
                    f'({len(all_ious)} eps, {dt:.0f}s)')
     return result
 
@@ -681,14 +801,20 @@ def main():
     args = parse_args()
     device = args.device
 
-    # ── CUDA 优化 (必须在 set_seed 之前: benchmark 覆盖 deterministic) ──
-    # CUDA optimizations (MUST be before set_seed: benchmark overrides deterministic)
-    use_amp = args.amp and not args.no_amp and device == "cuda"
-    setup_cuda_optimizations(device)
-
-    # set_seed 设置 deterministic=True, 但 benchmark=True 需要 deterministic=False
-    # setup_cuda_optimizations 已正确覆盖此设置
+    # ── 随机种子 (必须在 CUDA 优化之前: set_seed 设置 deterministic=True) ──
+    # Random seed (MUST be before CUDA opts: set_seed sets deterministic=True)
     set_seed(args.seed)
+
+    # ── CUDA 优化 (必须在 set_seed 之后: benchmark=True 覆盖 deterministic=False) ──
+    # CUDA optimizations (MUST be after set_seed: benchmark overrides deterministic)
+    use_amp = args.amp and not args.no_amp and device == "cuda"
+    if use_amp:
+        setup_cuda_optimizations(device)
+    else:
+        # 无 AMP 时保持 set_seed 的 deterministic 设置以保证可复现性
+        # Without AMP, keep set_seed's deterministic setting for reproducibility
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
     shots = [int(x.strip()) for x in args.shots.split(',')]
 
     output_dir = Path(args.output_dir)
@@ -765,7 +891,10 @@ def main():
         # ── Training ──
         decoder = CATFewShotDecoder(num_prototypes=args.num_prototypes).to(device)
         decoder.train()
-        opt = torch.optim.AdamW(decoder.parameters(), lr=args.lr, weight_decay=1e-4)
+        # beta2=0.95 适合少样本: 有效记忆 ~20 步 (vs 默认 0.999 的 ~1000 步)
+        # beta2=0.95 for few-shot: effective memory ~20 steps (vs default 0.999 ~1000)
+        opt = torch.optim.AdamW(decoder.parameters(), lr=args.lr,
+                                betas=(0.9, 0.95), weight_decay=1e-4)
         sch = torch.optim.lr_scheduler.CosineAnnealingLR(
             opt, T_max=args.epochs, eta_min=1e-6)
         scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
@@ -867,7 +996,7 @@ def main():
     logger.log_info('c03/summary', '  C-03: CAT-SAM Lite — Cross-Attention + InstanceDecoder')
     logger.log_info('c03/summary', '=' * 80)
     logger.log_info('c03/summary',
-                   f'  {"Method":<14} {"Shot":<8} {"mIoU":>10} {"±std":>8}  '
+                   f'  {"Method":<14} {"Shot":<8} {"mIoU":>10} {"mAP@50":>10}  '
                    f'{"ship":>8} {"smallV":>8} {"s.tank":>8}')
 
     # Load baselines for comparison table
@@ -881,7 +1010,7 @@ def main():
         # C-03
         r = all_results[f'{shot}shot']
         line = f'  {"C-03 CAT-SAM":<14} {shot:<8} '
-        line += f'{r["miou_mean"]*100:>9.2f}% {r["miou_std"]*100:>7.2f}%'
+        line += f'{r["miou_mean"]*100:>9.2f}% {r.get("map50_mean", 0)*100:>9.2f}%'
         for c in sorted(TARGET_CLASSES):
             line += f' {r["per_class_iou"].get(str(c), 0)*100:>7.2f}%'
         logger.log_info('c03/summary', line)
@@ -903,10 +1032,11 @@ def main():
         'target_classes': {str(k): v for k, v in TARGET_CLASSES.items()},
         'timestamp': datetime.datetime.now().isoformat(),
         'shots': shots, 'epochs': args.epochs, 'lr': args.lr,
-        'decoder': 'CATFewShotDecoder',
-        'decoder_params': sum(p.numel() for p in CATFewShotDecoder().parameters()),
+        'decoder': f'CATFewShotDecoder (K={args.num_prototypes})',
         'results': {k: {'miou_mean': v['miou_mean'], 'miou_std': v['miou_std'],
-                       'n_valid': v['n_valid'], 'per_class_iou': v['per_class_iou']}
+                       'map50_mean': v.get('map50_mean', 0),
+                       'n_valid': v['n_valid'], 'per_class_iou': v['per_class_iou'],
+                       'per_class_ap50': v.get('per_class_ap50', {})}
                    for k, v in all_results.items()},
     }
     with open(output_dir / 'c03_results.json', 'w') as f:

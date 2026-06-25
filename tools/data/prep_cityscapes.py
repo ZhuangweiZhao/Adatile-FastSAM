@@ -204,7 +204,7 @@ def main():
 
     # ── 完成 | Done ──
     print(f"\n  ✅ Done! Output: {dst}/ | 完成！输出: {dst}/")
-    print(f"  Use: FastISAIDTileDataset(root_dir='{dst}', split='train', semantic=True)")
+    print(f"  Use: FastISAIDTileDataset(root_dir='{dst}', split='train', dense_labels=True)")
 
 
 if __name__ == "__main__":

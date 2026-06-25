@@ -351,9 +351,9 @@ def main():
         # 加载数据 | Load pre-cut tiles
         try:
             train_ds = FastISAIDTileDataset(root_dir=data_dir, split="train",
-                                            semantic=True)
+                                            dense_labels=True)
             val_ds = FastISAIDTileDataset(root_dir=data_dir, split="val",
-                                          semantic=True)
+                                          dense_labels=True)
         except FileNotFoundError:
             logger.log_info(f"data/tile{ts}/missing",
                             f"Data not found: {data_dir}. "

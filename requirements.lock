@@ -1,0 +1,61 @@
+# ════════════════════════════════════════════════════════════════
+# AdaTile-FastSAM — 锁定依赖 | Locked Dependencies
+# ════════════════════════════════════════════════════════════════
+#
+# 用途: 学术可复现性 — 确保所有合作者/审稿人使用相同的依赖版本。
+# Purpose: Academic reproducibility — ensures all collaborators/reviewers
+#          use identical dependency versions.
+#
+# 生成方式 | How to regenerate:
+#   pip install -e ".[dev,viz]"
+#   pip freeze | grep -iE "torch|numpy|opencv|pillow|pyyaml|tqdm|ultralytics|shapely|tifffile|wandb|matplotlib|seaborn|tensorboard|pytest|mypy|ruff|black" > requirements.lock
+#
+# 生成日期 | Generated: 2026-06-24
+# 生成环境 | Environment: Windows 11, Python 3.13, CPU-only PyTorch
+# 注意: GPU 环境 (CUDA 12.x) 的 torch/torchvision 版本可能不同，
+#       请按需重新生成。
+# Note: GPU environments (CUDA 12.x) may have different torch/torchvision
+#       versions. Please regenerate as needed.
+# ════════════════════════════════════════════════════════════════
+
+# ── 深度学习框架 | Deep Learning Framework ─────────────────────
+torch==2.12.0
+torchvision==0.27.0
+
+# ── FastSAM (YOLOv8-based) ─────────────────────────────────────
+ultralytics==8.4.68
+ultralytics-thop==2.0.20
+
+# ── 数值计算 & 图像处理 | Numerical & Image Processing ─────────
+numpy==2.4.6
+opencv-python==4.13.0.92
+pillow==12.2.0
+pyyaml==6.0.3
+tqdm==4.67.1           # conda-forge build; version may vary by channel
+shapely==2.1.2
+tifffile==2026.6.1
+
+# ── 可视化 (可选) | Visualization (Optional) ──────────────────
+# wandb>=0.15.0       # 未安装在当前环境 | Not installed in current env
+matplotlib==3.11.0
+# seaborn>=0.12.0     # 未安装在当前环境 | Not installed in current env
+# tensorboard>=2.13.0 # 未安装在当前环境 | Not installed in current env
+
+# ── 开发工具 (可选) | Development Tools (Optional) ─────────────
+pytest==9.0.3
+pytest-cov==7.1.0
+mypy==2.1.0
+mypy_extensions==1.1.0
+ruff==0.15.17
+black==26.5.1
+
+# ════════════════════════════════════════════════════════════════
+# 安装命令 | Install Commands:
+#
+#   # 核心依赖 (Core):
+#   pip install -r requirements.lock
+#
+#   # 完整安装 (Full, incl. dev + viz):
+#   pip install -e ".[dev,viz]" -c requirements.lock
+#
+# ════════════════════════════════════════════════════════════════

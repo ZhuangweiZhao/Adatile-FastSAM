@@ -41,7 +41,7 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 
 from adatile.logging import get_logger
 from adatile.logging.backends import ConsoleBackend
-from adatile.utils.seed import set_seed
+from adatile.utils.seed import set_seed, get_worker_init_fn
 from adatile.sparse.spatial_router import (
     ForegroundDensityRouter, DualStreamRouter, TinyCNNRouter, DensityHead,
 )
@@ -105,10 +105,10 @@ class MV3BaselineRouter(nn.Module):
 # Data
 # ═══════════════════════════════════════════════════════════════════
 
-def render_semantic_mask(annotations, h, w):
-    """渲染语义掩码 [H,W] uint8 (category_id values) | Render semantic mask."""
+def render_category_mask(annotations, h, w):
+    """渲染密集类别掩码 [H,W] uint8 (category_id values) | Render dense category mask."""
     import cv2
-    sem = np.zeros((h, w), dtype=np.uint8)
+    dense = np.zeros((h, w), dtype=np.uint8)
     # 遍历所有标注 | Iterate over all annotations
     for ann in annotations:
         cat_id = ann.get("category_id", 0)
@@ -117,7 +117,7 @@ def render_semantic_mask(annotations, h, w):
         if not seg:
             # 没有多边形, 使用 bbox 填充 | No polygon, use bbox fill
             bbox = ann.get("bbox", [0, 0, 0, 0])
-            sem[max(0, int(bbox[1])):min(h, int(bbox[1]+bbox[3])),
+            dense[max(0, int(bbox[1])):min(h, int(bbox[1]+bbox[3])),
                 max(0, int(bbox[0])):min(w, int(bbox[0]+bbox[2]))] = cat_id
             continue
         if isinstance(seg, dict): continue  # RLE 格式, 跳过 | RLE format, skip
@@ -127,8 +127,8 @@ def render_semantic_mask(annotations, h, w):
             # 裁剪到图像边界 | Clip to image bounds
             pts[:, :, 0] = np.clip(pts[:, :, 0], 0, w-1)
             pts[:, :, 1] = np.clip(pts[:, :, 1], 0, h-1)
-            cv2.fillPoly(sem, [pts], cat_id)
-    return sem
+            cv2.fillPoly(dense, [pts], cat_id)
+    return dense
 
 
 def _preprocess_worker(args_tuple):
@@ -138,8 +138,8 @@ def _preprocess_worker(args_tuple):
         from PIL import Image
         img = np.array(Image.open(img_path).convert("RGB"))
         H, W = img.shape[:2]
-        # 渲染语义掩码 | Render semantic mask
-        mask = render_semantic_mask(anns, H, W)
+        # 渲染密集类别掩码 | Render dense category mask
+        mask = render_category_mask(anns, H, W)
         # Resize: 保持宽高比 | Keep aspect ratio
         scale = image_size / max(H, W)
         nH, nW = int(H*scale), int(W*scale)
@@ -370,12 +370,15 @@ def main():
 
     train_paths = preprocess_to_cache(train_imgs, os.path.join(cache_root, "train"))
     eval_paths = preprocess_to_cache(eval_imgs, os.path.join(cache_root, "eval"))
+    wif = get_worker_init_fn(args.seed)
     train_loader = DataLoader(CachedDataset(train_paths), batch_size=args.batch_size,
                               shuffle=True, num_workers=args.num_workers,
-                              pin_memory=(device=="cuda"), persistent_workers=(args.num_workers>0))
+                              pin_memory=(device=="cuda"), persistent_workers=(args.num_workers>0),
+                              worker_init_fn=wif)
     eval_loader = DataLoader(CachedDataset(eval_paths), batch_size=args.batch_size,
                              shuffle=False, num_workers=args.num_workers,
-                             pin_memory=(device=="cuda"), persistent_workers=(args.num_workers>0))
+                             pin_memory=(device=="cuda"), persistent_workers=(args.num_workers>0),
+                             worker_init_fn=wif)
 
     # ── Router Ablation: 实例化各变体 → 训练 → 评估 | Instantiate each variant → train → evaluate ──
     all_results = []

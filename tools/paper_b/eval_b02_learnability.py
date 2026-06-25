@@ -36,7 +36,7 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 
 from adatile.logging import get_logger
 from adatile.logging.backends import ConsoleBackend, FileBackend
-from adatile.utils.seed import set_seed
+from adatile.utils.seed import set_seed, get_worker_init_fn
 
 logger = get_logger("b02_learnability")
 logger.add_backend(ConsoleBackend())  # 终端实时输出 | Real-time console output
@@ -66,11 +66,11 @@ def parse_args():
     return p.parse_args()
 
 
-def render_semantic_mask(annotations: list, h: int, w: int) -> np.ndarray:
-    """渲染语义掩码 [H,W] uint8 (0-15) | Render semantic mask.
+def render_category_mask(annotations: list, h: int, w: int) -> np.ndarray:
+    """渲染密集类别掩码 [H,W] uint8 (0-15) | Render dense category mask.
     直接使用 ann["category_id"]（映射已在预处理中完成 | mapping done in preprocessing）."""
     import cv2
-    sem = np.zeros((h, w), dtype=np.uint8)
+    dense = np.zeros((h, w), dtype=np.uint8)
     for ann in annotations:
         cat_id = ann.get("category_id", 0)
         if cat_id <= 0:
@@ -81,7 +81,7 @@ def render_semantic_mask(annotations: list, h: int, w: int) -> np.ndarray:
             x, y, bw, bh = bbox
             x1, y1 = max(0, int(x)), max(0, int(y))
             x2, y2 = min(w, int(x + bw)), min(h, int(y + bh))
-            sem[y1:y2, x1:x2] = cat_id
+            dense[y1:y2, x1:x2] = cat_id
             continue
         if isinstance(seg, dict):
             continue
@@ -90,8 +90,8 @@ def render_semantic_mask(annotations: list, h: int, w: int) -> np.ndarray:
             pts = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
             pts[:, :, 0] = np.clip(pts[:, :, 0], 0, w - 1)
             pts[:, :, 1] = np.clip(pts[:, :, 1], 0, h - 1)
-            cv2.fillPoly(sem, [pts], cat_id)
-    return sem
+            cv2.fillPoly(dense, [pts], cat_id)
+    return dense
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -106,8 +106,8 @@ def _preprocess_worker(args_tuple):
         from PIL import Image
         img = np.array(Image.open(img_path).convert("RGB"))
         H, W = img.shape[:2]
-        # 渲染语义分割掩码 (0=BG, 1-15=classes) | Render semantic mask
-        mask = render_semantic_mask(anns, H, W)
+        # 渲染密集类别掩码 (0=BG, 1-15=classes) | Render dense category mask
+        mask = render_category_mask(anns, H, W)
 
         # Resize: 保持宽高比, 缩放到固定方形尺寸 | Resize: keep aspect ratio, scale to fixed square
         scale = image_size / max(H, W)
@@ -410,14 +410,17 @@ def main():
     train_ds = CachedSpatialDataset(train_paths)
     eval_ds = CachedSpatialDataset(eval_paths)
 
+    wif = get_worker_init_fn(args.seed)
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, pin_memory=(device == "cuda"),
-        persistent_workers=(args.num_workers > 0), drop_last=False)
+        persistent_workers=(args.num_workers > 0), drop_last=False,
+        worker_init_fn=wif)
     eval_loader = DataLoader(
         eval_ds, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=(device == "cuda"),
-        persistent_workers=(args.num_workers > 0), drop_last=False)
+        persistent_workers=(args.num_workers > 0), drop_last=False,
+        worker_init_fn=wif)
 
     # ── 模型: MobileNetV3-Small backbone (frozen) + Conv Head (trainable) | Model: MV3 backbone (frozen) + Conv Head (trainable) ──
     model = MobileNetSpatialRouter(pretrained=True).to(device)

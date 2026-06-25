@@ -63,7 +63,7 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 
 from adatile.logging import get_logger
 from adatile.logging.backends import ConsoleBackend, FileBackend
-from adatile.utils.seed import set_seed
+from adatile.utils.seed import set_seed, get_worker_init_fn
 from adatile.backbone import FastSAMBackbone
 from adatile.decoder.light_decoder import LightDecoder
 
@@ -100,7 +100,7 @@ def load_tile_dataset(tile_root, dataset_name, split="train"):
     DSClass = ds_map.get(dataset_name)
     if DSClass is None:
         raise ValueError(f"Unknown dataset: {dataset_name}")
-    return DSClass(tile_root, split=split, semantic=True)
+    return DSClass(tile_root, split=split, dense_labels=True)
 
 
 def compute_miou(pred_mask, gt_mask, num_classes):
@@ -179,10 +179,13 @@ def train_decoder(args, device, log):
     train_ds._tiles = fg5_tiles if fg5_tiles else train_ds._tiles
     log("decoder", f"Train FG>5% tiles: {len(train_ds._tiles)} ({len(train_ds._tiles)/max(n_train_orig,1)*100:.0f}pct of original {n_train_orig})")
 
+    wif = get_worker_init_fn(args.seed)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.num_workers, pin_memory=True)
+                              num_workers=args.num_workers, pin_memory=True,
+                              worker_init_fn=wif)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                            num_workers=min(2, args.num_workers), pin_memory=True)
+                            num_workers=min(2, args.num_workers), pin_memory=True,
+                            worker_init_fn=wif)
 
     backbone = FastSAMBackbone(freeze_backbone=True).eval()
     decoder = LightDecoder(1280, num_classes).to(device)

@@ -43,6 +43,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+from adatile.logging import get_logger
+
+_logger = get_logger("InstanceDecoder")
+
+
 class InstanceDecoder(nn.Module):
     """
     Light U-Net decoder for few-shot instance segmentation.
@@ -99,9 +104,13 @@ class InstanceDecoder(nn.Module):
         self._log_params()
 
     def _log_params(self):
+        """记录参数统计 (使用 logger 而非 print) | Log param stats via logger (not print)."""
         total = sum(p.numel() for p in self.parameters())
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        print(f'[InstanceDecoder] Total params: {total/1e6:.2f}M | Trainable: {trainable/1e6:.2f}M')
+        _logger.log_info(
+            "init",
+            f"InstanceDecoder: total={total/1e6:.2f}M, trainable={trainable/1e6:.2f}M"
+        )
 
     def forward(
         self,
@@ -170,7 +179,7 @@ def build_instance_decoder(
     if pretrained is not None:
         state = torch.load(pretrained, map_location='cpu', weights_only=True)
         model.load_state_dict(state)
-        print(f'[InstanceDecoder] Loaded pretrained weights from {pretrained}')
+        _logger.log_info("load", f"InstanceDecoder: loaded pretrained from {pretrained}")
     return model
 
 

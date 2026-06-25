@@ -38,10 +38,11 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 
 from adatile.logging import get_logger
 from adatile.logging.backends import ConsoleBackend, FileBackend
-from adatile.utils.seed import set_seed
+from adatile.utils.seed import set_seed, get_worker_init_fn
+from adatile.utils.env import get_env_info, save_env_info
 from adatile.backbone import FastSAMBackbone
 from adatile.datasets.isaid_tiles import FastISAIDTileDataset
-from adatile.utils.render import render_semantic_mask
+from adatile.utils.render import render_category_mask
 from tools.train.fdr_predictor import FDRPredictor
 from adatile.decoder.light_decoder import LightDecoder
 
@@ -106,13 +107,15 @@ def train_decoder(args, device, log):
     log("b04/decoder", f"Step 1: Train LightDecoder ({args.decoder_epochs} epochs) | 训练解码器")
 
     train_ds = build_train_dataset(args.tile_root, log)
-    val_ds = FastISAIDTileDataset(args.tile_root, split="val", semantic=True)
+    val_ds = FastISAIDTileDataset(args.tile_root, split="val", dense_labels=True)
     log("b04/decoder", f"Val tiles: {len(val_ds)}")
 
+    # worker_init_fn 保证数据增强可复现 | worker_init_fn ensures reproducible data augmentation
+    wif = get_worker_init_fn(args.seed)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=4, pin_memory=True)
+                              num_workers=4, pin_memory=True, worker_init_fn=wif)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                            num_workers=2, pin_memory=True)
+                            num_workers=2, pin_memory=True, worker_init_fn=wif)
 
     # 过滤 val 为 FG>5% 用于训练监控 | Filter val to FG>5% for training monitor
     from PIL import Image
@@ -123,10 +126,10 @@ def train_decoder(args, device, log):
             val_fg5_tiles.append(fname)
     log("b04/decoder", f"Val FG>5% tiles: {len(val_fg5_tiles)}/{len(val_ds)} "
                        f"({len(val_fg5_tiles)/len(val_ds)*100:.1f}%)")
-    val_fg5_ds = FastISAIDTileDataset(args.tile_root, split="val", semantic=True)
+    val_fg5_ds = FastISAIDTileDataset(args.tile_root, split="val", dense_labels=True)
     val_fg5_ds._tiles = val_fg5_tiles
     val_fg5_loader = DataLoader(val_fg5_ds, batch_size=args.batch_size, shuffle=False,
-                                num_workers=2, pin_memory=True)
+                                num_workers=2, pin_memory=True, worker_init_fn=wif)
 
     backbone = FastSAMBackbone(freeze_backbone=True).eval()
     decoder = LightDecoder(1280, NUM_OUT_CH).to(device)
@@ -302,7 +305,7 @@ def train_fdr(args, device, log):
             from PIL import Image
             img = np.array(Image.open(img_path).convert("RGB"))
             H, W = img.shape[:2]
-            mask = render_semantic_mask(anns, H, W)
+            mask = render_category_mask(anns, H, W)
 
             scale = args.image_size / max(H, W)
             nH, nW = int(H*scale), int(W*scale)
@@ -407,7 +410,7 @@ def evaluate_dynamic(args, fdr, decoder, backbone, device, log):
         from PIL import Image
         img_np = np.array(Image.open(img_path).convert("RGB"))
         H, W = img_np.shape[:2]
-        gt_mask = render_semantic_mask(anns, H, W)
+        gt_mask = render_category_mask(anns, H, W)
 
         # FDR 预测 tile 重要性 | FDR predicts tile importance
         tile_scores = fdr.predict_tile_scores(img_np, device)
@@ -549,18 +552,22 @@ def main():
     # Step 3: Dynamic Selection Evaluation | 动态选择评估
     results, base_miou = evaluate_dynamic(args, fdr, decoder, backbone, device, log)
 
-    # 保存结果 | Save results
+    # 保存结果 + 环境信息 | Save results + environment info
     summary = {
         "experiment": "B-04 Dynamic Tile Selection",
         "timestamp": datetime.datetime.now().isoformat(),
         "config": vars(args),
+        "environment": get_env_info(),
         "decoder_val_miou": float(dec_miou),
         "per_k": {str(k): {"miou": float(np.mean(results[k]["mious"])),
                             "time_ms": float(np.mean(results[k]["times_s"])*1000)}
                   for k in [int(x) for x in args.top_k_list.split(",")]},
     }
     with open(output_dir/"results.json","w") as f:
-        json.dump(summary, f, indent=2)
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+
+    # 单独保存环境信息供快速查阅 | Save environment info separately for quick reference
+    save_env_info(str(output_dir / "env_info.json"))
 
     log("b04/done", f"Saved: {output_dir}/ | 保存完成: {output_dir}/")
 

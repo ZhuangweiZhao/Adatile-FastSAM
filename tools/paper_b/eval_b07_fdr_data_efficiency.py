@@ -43,7 +43,7 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 
 from adatile.logging import get_logger
 from adatile.logging.backends import ConsoleBackend, FileBackend
-from adatile.utils.seed import set_seed
+from adatile.utils.seed import set_seed, get_worker_init_fn
 from adatile.sparse.spatial_router import DensityHead
 
 TILE_SIZE = 1024
@@ -75,17 +75,17 @@ class FDRModel(nn.Module):
 # Helpers
 # ═══════════════════════════════════════════════════
 
-def render_semantic_mask(annotations, h, w):
-    """Render semantic mask [H,W] uint8 from COCO annotations."""
+def render_category_mask(annotations, h, w):
+    """Render dense category mask [H,W] uint8 from COCO annotations."""
     import cv2
-    sem = np.zeros((h, w), dtype=np.uint8)
+    dense = np.zeros((h, w), dtype=np.uint8)
     for ann in annotations:
         cat_id = ann.get("category_id", 0)
         if cat_id <= 0: continue
         seg = ann.get("segmentation", [])
         if not seg:
             bbox = ann.get("bbox", [0, 0, 0, 0])
-            sem[max(0, int(bbox[1])):min(h, int(bbox[1]+bbox[3])),
+            dense[max(0, int(bbox[1])):min(h, int(bbox[1]+bbox[3])),
                 max(0, int(bbox[0])):min(w, int(bbox[0]+bbox[2]))] = cat_id
             continue
         if isinstance(seg, dict): continue
@@ -93,8 +93,8 @@ def render_semantic_mask(annotations, h, w):
             pts = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
             pts[:, :, 0] = np.clip(pts[:, :, 0], 0, w-1)
             pts[:, :, 1] = np.clip(pts[:, :, 1], 0, h-1)
-            cv2.fillPoly(sem, [pts], int(cat_id))
-    return sem
+            cv2.fillPoly(dense, [pts], int(cat_id))
+    return dense
 
 
 def compute_gt_tile_scores(mask, tile_size=TILE_SIZE):
@@ -143,8 +143,8 @@ class CachedFDRDataset(Dataset):
         img_r = np.array(Image.fromarray(img).resize((nW, nH), Image.BILINEAR))
 
         # Render + resize mask to same coordinate space
-        from adatile.utils.render import render_semantic_mask
-        mask = render_semantic_mask(anns, H, W)
+        from adatile.utils.render import render_category_mask
+        mask = render_category_mask(anns, H, W)
         mask_r = np.array(Image.fromarray(mask).resize((nW, nH), Image.NEAREST))
 
         # Pad to stride
@@ -220,7 +220,7 @@ def build_cache(image_items, cache_dir):
             continue
         img = np.array(Image.open(img_path).convert("RGB"))
         H, W = img.shape[:2]
-        mask = render_semantic_mask(anns, H, W)
+        mask = render_category_mask(anns, H, W)
         gt_scores = compute_gt_tile_scores(mask)
         np.savez_compressed(cache_path, gt_scores=gt_scores,
                             n_ty=gt_scores.shape[0], n_tx=gt_scores.shape[1])
@@ -500,9 +500,11 @@ def main():
     run_idx = 0
     all_results = {}
     eval_ds = CachedFDRDataset(eval_images, cache_dir)
+    wif_eval = get_worker_init_fn(args.seed)
     eval_loader = DataLoader(eval_ds, batch_size=args.batch_size,
                              shuffle=False, num_workers=min(2, args.num_workers),
-                             pin_memory=True, collate_fn=pad_collate)
+                             pin_memory=True, collate_fn=pad_collate,
+                             worker_init_fn=wif_eval)
 
     for data_pct in data_fractions:
         sr_list, fg_list = [], []
@@ -531,10 +533,12 @@ def main():
 
             # DataLoader
             train_ds = CachedFDRDataset(train_items, cache_dir)
+            wif = get_worker_init_fn(seed)
             train_loader = DataLoader(train_ds, batch_size=args.batch_size,
                                       shuffle=True, num_workers=args.num_workers,
                                       pin_memory=True, drop_last=False,
-                                      collate_fn=pad_collate)
+                                      collate_fn=pad_collate,
+                                      worker_init_fn=wif)
 
             # 训练 | Train
             model = FDRModel().to(device)

@@ -69,14 +69,14 @@ adatile/
 │   ├── isaid_tiles.py       ✅ FastISAIDTileDataset (pre-cut 1024x1024 tiles)
 │   ├── loveda_tiles.py      ✅ LoveDA land-cover tiles (7-class dense, SSI<50)
 │   ├── nwpu.py              ✅ NWPU-VHR-10 bbox-based weak masks (10-class)
-│   └── vaihingen_tiles.py   ✅ Vaihingen tiles (6-class dense semantic)
+│   └── vaihingen_tiles.py   ✅ Vaihingen tiles (6-class dense land-cover)
 ├── sparse/
 │   └── spatial_router.py    ✅ ForegroundDensityRouter, DensityHead, EdgeHead, TinyCNNRouter
 ├── losses/           ✅ FocalLoss, DiceLoss, CombinedLoss
 └── utils/
     ├── seed.py             ✅ Unified set_seed() with cuDNN deterministic
     ├── label_mapping.py    ✅ Per-split category ID mapping for iSAID
-    └── render.py           ✅ Shared render_semantic_mask() (canonical def)
+    └── render.py           ✅ Shared render_category_mask() (canonical def)
 
 tools/
 ├── data/                            # Data preprocessing
@@ -111,7 +111,7 @@ tools/
 │   ├── eval_b06_decoder_diag.py            Decoder diagnostics: per-class IoU
 │   ├── eval_b07_contribution_gt.py          GT contribution analysis
 │   ├── eval_b07_fdr_data_efficiency.py      FDR sample efficiency (1%-100% data)
-│   ├── eval_b08_fastsam_fewshot.py          FastSAM-FSS: few-shot semantic (LoveDA/Vaihingen)
+│   ├── eval_b08_fastsam_fewshot.py          FastSAM-FSS: few-shot on dense land-cover (LoveDA/Vaihingen)
 │   ├── eval_b09_nwpu_fewshot.py             FastSAM-FSS on NWPU-VHR-10 (bbox weak masks)
 │   └── eval_paper_b_pipeline.py             Unified Paper B pipeline (multi-dataset)
 ├── instance/                        # C-series few-shot instance segmentation
@@ -157,7 +157,7 @@ B-04: End-to-End Integration       �?Decoder verified (val_fg5��0.47, E13)
 B-05: Oracle Importance            �?What defines "important" tiles? Multi-metric analysis.
 B-06: Contribution Granularity     �?Contribution imbalance across tile sizes + decoder diagnostics.
 B-07: FDR Data Efficiency          �?1%-100% data scaling, FDR-SES score.
-B-08: FastSAM Few-Shot (Semantic)  �?LoveDA/Vaihingen: FastSAM + Prototype + Decoder, K=1/3/5.
+B-08: FastSAM Few-Shot (Dense Land-Cover)  �?LoveDA/Vaihingen: FastSAM + Prototype + Decoder, K=1/3/5.
 B-09: FastSAM Few-Shot (Instance)  �?NWPU-VHR-10: bbox weak masks, K-shot prototype matching.
 C-01��C-04: Full Few-Shot Pipeline  �?iSAID 15-class instance seg, CAT-SAM baseline, Phase D sweep.
 ```
@@ -186,7 +186,7 @@ Image �?Frozen MV3 backbone �?Feature Map �?DensityHead (75K) �?Importan
 - Learns: objectness / instance density, category-agnostic
 - `adatile/sparse/spatial_router.py` �?`ForegroundDensityRouter`, `DensityHead`, `EdgeHead` (ablation only), `TinyCNNRouter` (lower-bound)
 
-**B-04 LightDecoder (for binary segmentation):**
+**B-04 LightDecoder (for binary/multi-class dense segmentation):**
 ```
 P4 [B,1280,H/16,W/16] �?Conv(1280�?4) �?Upsample×2 �?Conv(64�?4) �?Upsample×2
                       �?Conv(64�?2) �?Upsample×2 �?Conv(32�?2) �?Upsample �?Conv(32�?)
@@ -194,7 +194,7 @@ P4 [B,1280,H/16,W/16] �?Conv(1280�?4) �?Upsample×2 �?Conv(64�?4) �?
 ~800K params. See `adatile/decoder/light_decoder.py`.
 
 **Critical B-04 findings (revised 2026-06-21):**
-- **Double-mapping bug (ROOT CAUSE of val�?.001)**: `prep_isaid.py` fixed annotations to standard ISAID IDs, but `render_semantic_mask()` applied `ACTUAL_TO_CODE_ID` a second time, permuting val class IDs into wrong semantic space. Train/val used different original numbering �?single hardcoded table couldn't work for both. **Fixed**: per-split `build_mapping()` via name matching. After fix: E1 val_fg5=0.345, E13=0.472 �?normal training curve.
+- **Double-mapping bug (ROOT CAUSE of val�?.001)**: `prep_isaid.py` fixed annotations to standard ISAID IDs, but `render_category_mask()` applied `ACTUAL_TO_CODE_ID` a second time, permuting val class IDs into wrong label space. Train/val used different original numbering �?single hardcoded table couldn't work for both. **Fixed**: per-split `build_mapping()` via name matching. After fix: E1 val_fg5=0.345, E13=0.472 �?normal training curve.
 - **FG>5% filter (real but secondary)**: FG>1% filter keeps 34% BG-dominated tiles �?noise dilutes foreground signal. FG>5% �?12% meaningful tiles. True contribution: ~0.05-0.10 mIoU improvement, NOT the 0.001�?.801 jump.
 - **Focal γ=5.0 + Dice**: For extreme class imbalance in remote sensing.
 - **Rare class oversampling**: basketball/pool/helicopter ×5. Note: pre-fix class counts were corrupted by double-mapping (e.g., pool appeared as 24 tiles, actually 189 after fix). True rare classes post-fix: helicopter=14 tiles, pool=189, basketball=189.
@@ -208,10 +208,10 @@ iSAID COCO JSON                    Cityscapes
       �?                               �?prep_isaid_tiles.py       鉁?FastISAIDTileDataset (pre-cut 1024×1024 tiles)
 鈹?  鈹溾攢鈹€ loveda_tiles.py      鉁?LoveDA land-cover tiles (7-class dense, SSI<50)
 鈹?  鈹溾攢鈹€ nwpu.py              鉁?NWPU-VHR-10 bbox-based weak masks (10-class)
-鈹?  鈹斺攢鈹€ vaihingen_tiles.py   鉁?Vaihingen tiles (6-class dense semantic)
+鈹?  鈹斺攢鈹€ vaihingen_tiles.py   鉁?Vaihingen tiles (6-class dense land-cover)
   ├─┢� Step 2: cut 1024×1024 tiles �?images/ + masks/
   └─┢� Step 3: metadata JSON �?metadata/{split}.json
-      �?FastISAIDTileDataset(root_dir, split, semantic=bool)
+      �?FastISAIDTileDataset(root_dir, split, dense_labels=bool)
   �?{"image": [3,1024,1024], "mask": [1024,1024], "image_id": str}
 ```
 
@@ -249,11 +249,11 @@ Full-size iSAID images (4000×4000+) cause OOM on GPUs < 12GB. Use `--max-image-
 If `prep_isaid_tiles.py       鉁?FastISAIDTileDataset (pre-cut 1024×1024 tiles)
 鈹?  鈹溾攢鈹€ loveda_tiles.py      鉁?LoveDA land-cover tiles (7-class dense, SSI<50)
 鈹?  鈹溾攢鈹€ nwpu.py              鉁?NWPU-VHR-10 bbox-based weak masks (10-class)
-鈹?  鈹斺攢鈹€ vaihingen_tiles.py   鉁?Vaihingen tiles (6-class dense semantic)
+鈹?  鈹斺攢鈹€ vaihingen_tiles.py   鉁?Vaihingen tiles (6-class dense land-cover)
 
 ### Decoder FG-mIoU stuck near 0 (train=0.71, val�?.001)
 
-**Root cause: Double category ID mapping.** `render_semantic_mask()` applied `ACTUAL_TO_CODE_ID` on already-mapped annotations, permuting val class IDs. Train/val used different semantic spaces �?model correctly learned train classes but val labels were gibberish. **Fix**: per-split `build_mapping()` in `prep_isaid.py`, remove second mapping in all `render_semantic_mask()` calls. After fix: E1 val_fg5=0.345.
+**Root cause: Double category ID mapping.** `render_category_mask()` applied `ACTUAL_TO_CODE_ID` on already-mapped annotations, permuting val class IDs. Train/val used different label spaces �?model correctly learned train classes but val labels were gibberish. **Fix**: per-split `build_mapping()` in `prep_isaid.py`, remove second mapping in all `render_category_mask()` calls. After fix: E1 val_fg5=0.345.
 
 **Contributing factor**: FG>1% filter kept 34% BG-dominated tiles as noise. FG>5% filter �?12% meaningful tiles. Diagnosis: `tools/diag/diag_b04_exp12.py`, `tools/diag/diag_trace_labels.py`.
 
@@ -282,7 +282,7 @@ python tools/data/prep_isaid.py                         # Step 0: fix COCO JSON 
 python tools/data/prep_isaid_tiles.py       鉁?FastISAIDTileDataset (pre-cut 1024×1024 tiles)
 鈹?  鈹溾攢鈹€ loveda_tiles.py      鉁?LoveDA land-cover tiles (7-class dense, SSI<50)
 鈹?  鈹溾攢鈹€ nwpu.py              鉁?NWPU-VHR-10 bbox-based weak masks (10-class)
-鈹?  鈹斺攢鈹€ vaihingen_tiles.py   鉁?Vaihingen tiles (6-class dense semantic)
+鈹?  鈹斺攢鈹€ vaihingen_tiles.py   鉁?Vaihingen tiles (6-class dense land-cover)
     --src-root data/iSAID_processed \
     --dst-root data/iSAID_tiles \
     --steps 1,2,3 --splits train,val

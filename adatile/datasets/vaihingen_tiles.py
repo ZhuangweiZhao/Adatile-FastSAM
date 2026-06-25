@@ -3,7 +3,7 @@
 Reads pre-cut 1024x1024 tiles from ISPRS Vaihingen.
 Images: TIFF RGB uint8. Masks: PNG class IDs.
 
-Classes (dense semantic, fg_ratio ~60%):
+Classes (dense land-cover, fg_ratio ~60%):
   0: Impervious surfaces / background
   1: Building
   2: Low vegetation
@@ -12,7 +12,9 @@ Classes (dense semantic, fg_ratio ~60%):
   5: Clutter (test only)
   6: Clutter variant (test only)
 
-Key: dense semantic => NO empty tiles. Different from iSAID.
+Note: Vaihingen is a dense land-cover dataset (semantic by nature),
+used as an auxiliary testbed for cross-paradigm few-shot generalization.
+Key: dense labels => NO empty tiles. Different from iSAID instance segmentation.
 """
 
 from __future__ import annotations
@@ -31,10 +33,10 @@ VAIHINGEN_CLASSES = {0:"impervious",1:"building",2:"low_veg",3:"tree",4:"car",5:
 class VaihingenTileDataset(Dataset):
     CLASS_NAMES = VAIHINGEN_CLASSES
 
-    def __init__(self, root_dir="data/Vaihingen", split="train", semantic=True):
+    def __init__(self, root_dir="data/Vaihingen", split="train", dense_labels=True):
         self.root = Path(root_dir)
         self.split = split
-        self.semantic = semantic
+        self.dense_labels = dense_labels
         self._img_dir = self.root / split / "images_1024"
         self._mask_dir = self.root / split / "masks_1024"
         self._tiles = sorted(p.stem for p in self._img_dir.glob("*.tif"))
@@ -63,7 +65,7 @@ class VaihingenTileDataset(Dataset):
             return self.__getitem__((index + 1) % len(self._tiles))
 
         img_t = torch.from_numpy(img_np).permute(2, 0, 1)
-        if self.semantic:
+        if self.dense_labels:
             mask_np = np.where(mask_np <= 6, mask_np, 0).astype(np.int64)
             mask_t = torch.from_numpy(mask_np)
         else:

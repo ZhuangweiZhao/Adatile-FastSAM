@@ -34,7 +34,7 @@ Wrapped dataset 必须实现以下接口 | Required interface:
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from typing import Any
 
 import cv2
@@ -96,8 +96,10 @@ class ISAIDTileWrapper:
 
         # ── LRU 图像缓存: 避免每张 tile 都从磁盘加载 4000×4000 原图 ──
         # LRU image cache: avoid re-reading full images from disk per tile
+        # OrderedDict 实现真正的 LRU: 访问时将 key 移到末尾, 淘汰时从开头移除
+        # OrderedDict implements true LRU: move accessed key to end, evict from front
         # 可外部调节 _cache_max: RTX 5090=64, RTX 3060=32, default=8
-        self._img_cache: dict[int, np.ndarray] = {}  # img_idx → [H, W, 3]
+        self._img_cache: OrderedDict[int, np.ndarray] = OrderedDict()
         self._cache_max: int = 8  # ~8 × 48MB = 384MB RAM (for 4000×4000 images)
 
         # ── 预计算全部 tile 坐标 & class→tile 映射 ──
@@ -247,7 +249,9 @@ class ISAIDTileWrapper:
             - 存储 copy，返回引用 — 调用方不应修改返回值
             - Store a copy, return reference — caller must not mutate
         """
+        # LRU: 缓存命中 → 移到末尾 (最近使用) | Cache hit → move to end (most recently used)
         if img_idx in self._img_cache:
+            self._img_cache.move_to_end(img_idx)
             return self._img_cache[img_idx]
 
         img_info = self.ds._img_infos[img_idx]
@@ -259,10 +263,9 @@ class ISAIDTileWrapper:
             raise FileNotFoundError(f"Cannot load image: {img_path}")
         img = img[..., ::-1]  # BGR → RGB
 
-        # LRU 淘汰 | LRU eviction
+        # LRU 淘汰: 从开头移除最久未使用的条目 | LRU eviction: remove least recently used from front
         if len(self._img_cache) >= self._cache_max:
-            oldest = next(iter(self._img_cache))
-            del self._img_cache[oldest]
+            self._img_cache.popitem(last=False)
 
         # 缓存副本: cv2.imread 返回的 buffer 可能被后续 imread 复用
         # Store copy: cv2.imread buffer may be reused by subsequent imread calls
@@ -374,6 +377,53 @@ class ISAIDTileWrapper:
             pts[:, :, 1] = np.clip(pts[:, :, 1], 0, ts - 1)
             if len(pts) >= 3:
                 cv2.fillPoly(mask, [pts.astype(np.int32)], 1)
+
+    # ── 实例级 Mask 渲染 | Instance-level Mask Rendering ──────────
+
+    def render_instance_masks(self, tile_idx: int, class_id: int
+                              ) -> list[np.ndarray]:
+        """
+        渲染单张 tile 上目标类别的每个实例独立 mask。
+        Render individual instance masks for target class on a tile.
+        返回列表，每个元素是一个二值 mask [tile_size, tile_size]。
+        Returns list of binary masks, one per instance.
+        """
+        tile_idx = int(tile_idx)
+        img_idx, x0, y0 = self._tiles[tile_idx]
+        img_info = self.ds._img_infos[img_idx]
+        anns = self.ds._img_anns.get(img_info["id"], [])
+        ts = self.tile_size
+        masks = []
+
+        for ann in anns:
+            if ann["category_id"] != int(class_id):
+                continue
+            inst_mask = np.zeros((ts, ts), dtype=np.uint8)
+            seg = ann.get("segmentation", [])
+            if isinstance(seg, dict):
+                img = self._load_original_image(img_idx)
+                h, w = img.shape[:2]
+                from pycocotools import mask as coco_mask
+                rle = coco_mask.frPyObjects(seg, h, w)
+                if isinstance(rle, list):
+                    rle = coco_mask.merge(rle)
+                full_mask = coco_mask.decode(rle).astype(np.uint8)
+                inst_mask = full_mask[y0:y0+ts, x0:x0+ts]
+            elif seg and isinstance(seg[0], (int, float)):
+                self._fill_polygon_on_tile(inst_mask, [seg], x0, y0, ts)
+            elif seg and isinstance(seg[0], list):
+                self._fill_polygon_on_tile(inst_mask, seg, x0, y0, ts)
+            else:
+                bbox = ann.get("bbox", [0, 0, 0, 0])
+                bx, by, bw, bh = bbox
+                ix0 = int(max(0, bx - x0)); iy0 = int(max(0, by - y0))
+                ix1 = int(min(ts, bx+bw - x0)); iy1 = int(min(ts, by+bh - y0))
+                if ix1 > ix0 and iy1 > iy0:
+                    inst_mask[iy0:iy1, ix0:ix1] = 1
+            if inst_mask.sum() > 0:
+                masks.append(inst_mask.astype(bool))
+
+        return masks
 
     # ── Tile 坐标查询 | Tile coordinate query ──────────────────────
 

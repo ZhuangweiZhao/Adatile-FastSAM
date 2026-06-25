@@ -27,6 +27,7 @@ from adatile.backbone import FastSAMBackbone
 from adatile.logging import get_logger
 from adatile.logging.backends import ConsoleBackend
 from adatile.decoder.light_decoder import LightDecoder
+from adatile.utils.seed import get_worker_init_fn
 
 logger = get_logger("b04_diag")
 logger.add_backend(ConsoleBackend())
@@ -137,7 +138,7 @@ def overfit_test(args, device):
     logger.log_info("diag", "=" * 50)
     logger.log_info("diag", "Overfit Test: 20 tiles × 100 epochs | 过拟合测试: 20 tile × 100 epoch")
 
-    train_ds = FastISAIDTileDataset(args.tile_root, split="train", semantic=True)
+    train_ds = FastISAIDTileDataset(args.tile_root, split="train", dense_labels=True)
 
     # 选 20 个有前景的 tile | Pick 20 tiles with foreground
     fg_tiles = []
@@ -153,7 +154,8 @@ def overfit_test(args, device):
     train_ds._tiles = fg_tiles
     logger.log_info("diag", f"Overfit set: {len(train_ds)} tiles")
 
-    loader = DataLoader(train_ds, batch_size=4, shuffle=True)
+    _wif = get_worker_init_fn(42)  # 固定种子保证数据增强可复现 | Fixed seed for reproducible augmentation
+    loader = DataLoader(train_ds, batch_size=4, shuffle=True, worker_init_fn=_wif)
     backbone = FastSAMBackbone(freeze_backbone=True).eval()
     decoder = LightDecoder(1280, NUM_OUT_CH).to(device)
     n_p = sum(p.numel() for p in decoder.parameters())
@@ -250,7 +252,7 @@ def main():
     decoder, backbone = overfit_test(args, device)
 
     # ═══ 可视化预测结果 | Visualize predictions ═══
-    val_ds = FastISAIDTileDataset(args.tile_root, split="val", semantic=True)
+    val_ds = FastISAIDTileDataset(args.tile_root, split="val", dense_labels=True)
     # 选取验证集中有前景的 tile | Select val tiles with foreground
     fg_val_tiles = []
     for fname in val_ds._tiles:
@@ -260,7 +262,7 @@ def main():
         if len(fg_val_tiles) >= 10:
             break
     val_ds._tiles = fg_val_tiles
-    val_loader = DataLoader(val_ds, batch_size=1, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=1, shuffle=True, worker_init_fn=_wif)
     visualize(decoder, backbone, val_loader, output_dir, device, n=5)
 
     logger.log_info("diag", f"Done | 完成. Check {output_dir}/")

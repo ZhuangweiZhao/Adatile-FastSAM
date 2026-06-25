@@ -6,7 +6,7 @@ iSAID 离线切 Tile + 元数据 | Offline Tile Preprocessing + Metadata
 三步流水线 | Three-step pipeline:
 
     Step 1: 生成全图语义掩码 (一次性, 只跑一次)
-            render_semantic_mask() → P0001_mask.png
+            render_category_mask() → P0001_mask.png
             后续切 tile 不再渲染 COCO。
     Step 2: 图像 + 掩码 → 切 1024×1024 tile + 保存
             可选 --format jpg (训练用, 更快更小)。
@@ -90,17 +90,17 @@ def _step1_worker(args_tuple: tuple) -> dict:
     H, W = img.shape[:2]
 
     if split != "test" and anns:
-        sem = render_semantic_mask(anns, H, W)
+        dense = render_category_mask(anns, H, W)
     else:
-        sem = np.zeros((H, W), dtype=np.uint8)
+        dense = np.zeros((H, W), dtype=np.uint8)
 
-    cv2.imwrite(mask_path, sem)
+    cv2.imwrite(mask_path, dense)
     return {"img_path": img_path, "status": "rendered"}
 
 
 def step1_render_masks(src_root: Path, dst_root: Path, splits: list,
                        max_images: int, workers: int, dry_run: bool):
-    """Step 1: 生成全图语义掩码 | Step 1: Render full-image semantic masks.
+    """Step 1: 生成全图密集类别掩码 | Step 1: Render full-image dense category masks.
 
     对每张原图，将 COCO 标注渲染为语义分割 mask，保存到 masks_full/ 目录。
     后续切 tile 时直接读取 mask 不再重复渲染 COCO 多边形。
@@ -413,4 +413,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-from adatile.utils.render import render_semantic_mask
+from adatile.utils.render import render_category_mask

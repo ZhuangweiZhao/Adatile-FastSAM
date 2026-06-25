@@ -67,16 +67,16 @@ STRIDE = 32  # FastSAM stride
 # Helpers
 # ═══════════════════════════════════════════════════════════════
 
-def render_semantic_mask(annotations, h, w):
+def render_category_mask(annotations, h, w):
     import cv2
-    sem = np.zeros((h, w), dtype=np.uint8)
+    dense = np.zeros((h, w), dtype=np.uint8)
     for ann in annotations:
         cat_id = ann.get("category_id", 0)
         if cat_id <= 0: continue
         seg = ann.get("segmentation", [])
         if not seg:
             bbox = ann.get("bbox", [0, 0, 0, 0])
-            sem[max(0, int(bbox[1])):min(h, int(bbox[1]+bbox[3])),
+            dense[max(0, int(bbox[1])):min(h, int(bbox[1]+bbox[3])),
                 max(0, int(bbox[0])):min(w, int(bbox[0]+bbox[2]))] = cat_id
             continue
         if isinstance(seg, dict): continue
@@ -84,8 +84,8 @@ def render_semantic_mask(annotations, h, w):
             pts = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
             pts[:, :, 0] = np.clip(pts[:, :, 0], 0, w-1)
             pts[:, :, 1] = np.clip(pts[:, :, 1], 0, h-1)
-            cv2.fillPoly(sem, [pts], int(cat_id))
-    return sem
+            cv2.fillPoly(dense, [pts], int(cat_id))
+    return dense
 
 
 def compute_miou(pred_mask, gt_mask):
@@ -377,7 +377,7 @@ def main():
         for img_info, img_path, anns in tqdm(images, desc=f"  TS={ts}"):
             img_np = np.array(Image.open(img_path).convert("RGB"))
             H, W = img_np.shape[:2]
-            gt_full = render_semantic_mask(anns, H, W)
+            gt_full = render_category_mask(anns, H, W)
 
             tiles, n_ty, n_tx = analyze_one_image(
                 img_np, gt_full, ts, backbone, decoder, device

@@ -27,6 +27,7 @@ from adatile.backbone import FastSAMBackbone
 from adatile.logging import get_logger
 from adatile.logging.backends import ConsoleBackend, FileBackend
 from adatile.decoder.light_decoder import LightDecoder
+from adatile.utils.seed import get_worker_init_fn
 
 from PIL import Image
 import matplotlib
@@ -224,7 +225,7 @@ def main():
     log("exp12/start", f"B-04 Exp1&2 | output={output_dir} | log={log_path}")
     log("exp12/device", f"Device: {device}")
 
-    train_ds = FastISAIDTileDataset(args.tile_root, split="train", semantic=True)
+    train_ds = FastISAIDTileDataset(args.tile_root, split="train", dense_labels=True)
     log("exp12/data", f"Train tiles: {len(train_ds)}")
 
     # ═══════════════════════════════════════════════════════════════
@@ -261,7 +262,8 @@ def main():
         f"({len(all_cls)}/{16} present)")
 
     train_ds._tiles = fg5_tiles
-    loader = DataLoader(train_ds, batch_size=8, shuffle=True)
+    _wif = get_worker_init_fn(42)  # 固定种子保证数据增强可复现 | Fixed seed for reproducible augmentation
+    loader = DataLoader(train_ds, batch_size=8, shuffle=True, worker_init_fn=_wif)
     backbone = FastSAMBackbone(freeze_backbone=True).eval()
 
     # ═══════════════════════════════════════════════════════════════
@@ -281,14 +283,14 @@ def main():
     log("exp12/exp1", f"FINAL: FG-mIoU={h1['miou']:.4f} loss={h1['loss']:.4f}")
 
     # Viz
-    val_ds = FastISAIDTileDataset(args.tile_root, split="val", semantic=True)
+    val_ds = FastISAIDTileDataset(args.tile_root, split="val", dense_labels=True)
     val_fg = []
     for fname in val_ds._tiles:
         mask = np.array(Image.open(val_ds._mask_dir / fname))
         if (mask > 0).sum() / mask.size > 0.05:
             val_fg.append(fname)
     val_ds._tiles = val_fg[:10]
-    val_loader = DataLoader(val_ds, batch_size=1, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=1, shuffle=True, worker_init_fn=_wif)
     viz_pred(decoder1, backbone, val_loader, str(output_dir / "exp1_viz"), device, False, log)
 
     # ═══════════════════════════════════════════════════════════════
@@ -299,7 +301,7 @@ def main():
     log("exp12/exp2", "=" * 60)
 
     train_ds._tiles = fg5_tiles
-    loader_bin = DataLoader(train_ds, batch_size=8, shuffle=True)
+    loader_bin = DataLoader(train_ds, batch_size=8, shuffle=True, worker_init_fn=_wif)
     decoder2 = LightDecoder(1280, 2).to(device)
     log("exp12/exp2", f"Decoder: {n_p:,} params, 2 output channels (BG, FG)")
 

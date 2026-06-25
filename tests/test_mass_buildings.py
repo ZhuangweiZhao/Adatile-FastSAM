@@ -2,11 +2,11 @@
 Massachusetts Buildings 数据集测试 | Massachusetts Buildings dataset tests.
 ==============================================================================
 
-验证二值语义分割数据集加载器。
-Verify binary semantic segmentation dataset loader.
+验证二值分割数据集加载器。
+Verify binary instance segmentation dataset loader.
 
 数据集特点 | Dataset characteristics:
-    - 二值语义分割（建筑 vs 背景）| Binary semantic segmentation (building vs background)
+    - 二值分割（建筑 vs 背景）| Binary instance segmentation (building vs background)
     - 图像和标注都是 1500×1500 RGB PNG
     - 标注是 RGB：255=建筑, 0=背景 → 需转为二值 mask
     - 训练 137 / 验证 4 / 测试 10 张图像
@@ -106,7 +106,7 @@ class TestMassBuildingsSample:
         masks = sample["masks"]
         assert isinstance(masks, torch.Tensor)
         assert masks.dim() == 3  # [1, H, W]
-        assert masks.shape[0] == 1  # 单通道语义分割 | single-channel semantic
+        assert masks.shape[0] == 1  # 单通道二值分割 | single-channel binary
         assert masks.shape[1] == 1500
         assert masks.shape[2] == 1500
 

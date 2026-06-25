@@ -338,6 +338,11 @@ class P4Cache:
         # ── 逐源图像分块处理 | Per-source-image chunked processing ──
         # 全图 > 2048px 时 OOM → 分块处理 (chunk=2048, overlap=tile_size)
         # Full image > 2048px causes OOM → chunked processing
+        # 分块重叠量 = tile_size, 保证边界 tile 完整 (chunk 边界处 tile 不会被遗漏)
+        # Chunk overlap = tile_size ensures boundary tiles are covered in at least one chunk.
+        # Example: tile_size=896, MAX_CHUNK=2048, step = 2048-896 = 1152.
+        # A tile at x0=2560 (col 5): Chunk 2 covers [1152, 3200] → misses (2560+896=3456>3200)
+        # Chunk 3 covers [2304, 4352] → captures it. Overlap guarantees coverage.
         t0 = time.perf_counter()
         ts = tile_wrapper.tile_size
         pts = ts // 16  # P4 spatial tile size per tile

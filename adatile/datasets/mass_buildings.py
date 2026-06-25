@@ -1,9 +1,11 @@
 """
-MassachusettsBuildingsDataset — 马萨诸塞州建筑语义分割数据集。
-================================================================
-Massachusetts Buildings semantic segmentation dataset.
+MassachusettsBuildingsDataset — 马萨诸塞州建筑二值分割数据集。
+==================================================================
+Massachusetts Buildings binary building segmentation dataset.
 
 二值分类：背景 (0) vs 建筑 (1)。| Binary: background (0) vs building (1).
+注：本数据集是密集二值分割（区别于 iSAID 的实例分割），在 Paper A 中用作预实验平台。
+Note: Dense binary segmentation (vs iSAID instance seg), used as pre-experiment testbed in Paper A.
 
 数据集特性 | Dataset characteristics:
     - 图像：1500×1500 RGB PNG 航拍图 | Images: 1500×1500 RGB PNG aerial
@@ -40,10 +42,10 @@ from adatile.datasets.base import BaseSegDataset
 
 class MassachusettsBuildingsDataset(BaseSegDataset):
     """
-    马萨诸塞州建筑语义分割数据集 | Massachusetts Buildings semantic segmentation dataset.
+    马萨诸塞州建筑二值分割数据集 | Massachusetts Buildings binary segmentation dataset.
 
     与 iSAID 的关键区别：
-    - 语义分割（单通道 [1,H,W]），不是实例分割（多通道 [N,H,W]）
+    - 密集二值分割（单通道 [1,H,W]），不是实例分割（多通道 [N,H,W]）
     - RGB 标注 → 自动转为二值 mask
     - 无 COCO JSON，直接使用目录中的 PNG 文件
 

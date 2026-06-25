@@ -38,7 +38,7 @@ def diagnose(root: str):
     """
     for split in ["train", "val"]:
         # 加载数据集 | Load dataset
-        ds = FastISAIDTileDataset(root, split=split, semantic=True)
+        ds = FastISAIDTileDataset(root, split=split, dense_labels=True)
         n = len(ds)
         print(f"\n{'='*60}")
         print(f"  [{split.upper()}] {n} tiles")

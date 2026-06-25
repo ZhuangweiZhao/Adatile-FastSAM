@@ -2,8 +2,13 @@
 LoveDA Pre-cut Tile Dataset | LoveDA 预切 Tile 数据集.
 =========================================================
 
-读取预切 1024x1024 tile，ISPRS LoveDA 土地覆盖语义分割。
-Reads pre-cut 1024x1024 tiles, ISPRS LoveDA land-cover semantic segmentation.
+读取预切 1024x1024 tile，ISPRS LoveDA 土地覆盖密集分割。
+Reads pre-cut 1024x1024 tiles, ISPRS LoveDA land-cover dense segmentation.
+
+注：LoveDA 是密集土地覆盖数据集（语义分割性质），在本项目中作为
+辅助测试平台，用于验证 few-shot 方法在不同分割范式下的泛化能力。
+Note: LoveDA is a dense land-cover dataset (semantic by nature), used here
+as an auxiliary testbed for few-shot generalization across segmentation paradigms.
 
 目录结构 | Directory structure:
     LoveDA/
@@ -18,7 +23,7 @@ Reads pre-cut 1024x1024 tiles, ISPRS LoveDA land-cover semantic segmentation.
     └── Test/Test/{Rural,Urban}/
         └── images_png/  (无标注 | no masks)
 
-类别 | Classes (7-class dense semantic):
+类别 | Classes (7-class dense land-cover):
     0: Background   / 背景
     1: Building     / 建筑
     2: Road         / 道路
@@ -28,7 +33,7 @@ Reads pre-cut 1024x1024 tiles, ISPRS LoveDA land-cover semantic segmentation.
     6: Agriculture  / 农田
 
 特点 | Characteristics:
-    - 密集语义标注 (类似 Vaihingen, 不同于 iSAID) | Dense semantic (like Vaihingen)
+    - 密集土地覆盖标注 (类似 Vaihingen, 不同于 iSAID 实例分割) | Dense land-cover (like Vaihingen)
     - SSI < 50 → Spatial Router 不适用 (B-02.5) | Router NOT applicable
     - Rural + Urban 域 | Rural + Urban domains
     - 土地覆盖 → fg_ratio 失效 → Contribution Routing 需要新的重要性定义
@@ -87,8 +92,8 @@ class LoveDATileDataset(Dataset):
         LoveDA 根目录 (含 Train/Val/Test) | Root directory.
     split : str
         "train", "val", or "test".
-    semantic : bool
-        True → 返回语义掩码 int64 | return semantic mask int64.
+    dense_labels : bool
+        True → 返回密集类别标签 int64 | return dense category labels int64.
         False → 返回二值掩码 float32 | return binary mask float32.
     domains : tuple[str] | None
         加载的域 ("Rural", "Urban"). None → 全部 | None → all.
@@ -100,12 +105,12 @@ class LoveDATileDataset(Dataset):
         self,
         root_dir: str = "data/LoveDA",
         split: str = "train",
-        semantic: bool = True,
+        dense_labels: bool = True,
         domains: tuple[str, ...] | None = None,
     ):
         self.root = Path(root_dir)
         self.split = split.lower()
-        self.semantic = semantic
+        self.dense_labels = dense_labels
 
         # LoveDA 使用 PascalCase 目录名 | LoveDA uses PascalCase dir names
         split_map = {"train": "Train", "val": "Val", "test": "Test"}
@@ -151,7 +156,7 @@ class LoveDATileDataset(Dataset):
         logger.log_info(
             "dataset/loveda_init",
             f"LoveDATile {split}: {len(self)} tiles "
-            f"(domains={self._domains}, semantic={semantic})",
+            f"(domains={self._domains}, dense_labels={dense_labels})",
         )
 
     def __len__(self) -> int:
@@ -162,7 +167,7 @@ class LoveDATileDataset(Dataset):
         """
         加载单个 tile → {image, mask, image_id} | Load single tile.
 
-        :return: image:    [3, 1024, 1024] float32, 值域 [0,1] | values in [0,1] mask:     [1024, 1024] int64 (semantic) or float32 (binary) image_id: str  "{domain}/{stem}" domain:   str  "Rural" or "Urban"
+        :return: image:    [3, 1024, 1024] float32, 值域 [0,1] | values in [0,1] mask:     [1024, 1024] int64 (dense) or float32 (binary) image_id: str  "{domain}/{stem}" domain:   str  "Rural" or "Urban"
         :rtype: dict
         """
         sample = self._samples[index]
@@ -193,8 +198,8 @@ class LoveDATileDataset(Dataset):
                                f"Skipping corrupted mask: {sample['mask_path']}")
                 return self.__getitem__((index + 1) % len(self))
 
-            if self.semantic:
-                # 语义模式: int64 类别 ID | Semantic mode: int64 class IDs
+            if self.dense_labels:
+                # 密集标签模式: int64 类别 ID | Dense label mode: int64 class IDs
                 mask_t = torch.from_numpy(mask_np.astype(np.int64))
             else:
                 # 二值模式: >0 = 前景 | Binary mode: >0 = foreground
@@ -243,7 +248,7 @@ if __name__ == "__main__":
 
     for split in ["train", "val", "test"]:
         try:
-            ds = LoveDATileDataset(root_dir=args.root, split=split, semantic=True)
+            ds = LoveDATileDataset(root_dir=args.root, split=split, dense_labels=True)
             s = ds[0]
             domains = set(ds._samples[i]["domain"] for i in range(len(ds)))
             unique_classes = torch.unique(s["mask"]).tolist()

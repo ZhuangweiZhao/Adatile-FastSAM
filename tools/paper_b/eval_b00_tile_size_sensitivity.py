@@ -70,11 +70,11 @@ def parse_args():
     return p.parse_args()
 
 
-def render_semantic_mask(annotations: list, h: int, w: int) -> np.ndarray:
-    """渲染语义掩码 [H,W] uint8 (0-15) | Render semantic mask.
+def render_category_mask(annotations: list, h: int, w: int) -> np.ndarray:
+    """渲染密集类别掩码 [H,W] uint8 (0-15) | Render dense category mask.
     直接使用 ann["category_id"]（映射已在预处理中完成 | mapping done in preprocessing）."""
     import cv2
-    sem = np.zeros((h, w), dtype=np.uint8)
+    dense = np.zeros((h, w), dtype=np.uint8)
 
     # 遍历所有标注，逐实例渲染 | Iterate all annotations, render per instance
     for ann in annotations:
@@ -89,7 +89,7 @@ def render_semantic_mask(annotations: list, h: int, w: int) -> np.ndarray:
             x, y, bw, bh = bbox
             x1, y1 = max(0, int(x)), max(0, int(y))
             x2, y2 = min(w, int(x + bw)), min(h, int(y + bh))
-            sem[y1:y2, x1:x2] = cat_id
+            dense[y1:y2, x1:x2] = cat_id
             continue
         # RLE 格式暂不支持 | RLE format not yet supported
         if isinstance(seg, dict):
@@ -102,9 +102,9 @@ def render_semantic_mask(annotations: list, h: int, w: int) -> np.ndarray:
             pts = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
             pts[:, :, 0] = np.clip(pts[:, :, 0], 0, w - 1)
             pts[:, :, 1] = np.clip(pts[:, :, 1], 0, h - 1)
-            cv2.fillPoly(sem, [pts], cat_id)  # OpenCV 多边形填充 | OpenCV polygon fill
+            cv2.fillPoly(dense, [pts], cat_id)  # OpenCV 多边形填充 | OpenCV polygon fill
 
-    return sem
+    return dense
 
 
 def _analyze_single_image(args_tuple: tuple) -> dict:
@@ -114,8 +114,8 @@ def _analyze_single_image(args_tuple: tuple) -> dict:
     """
     (img_id, anns, h, w, tile_sizes) = args_tuple
 
-    # 渲染全图语义掩码 | Render full-image semantic mask
-    sem = render_semantic_mask(anns, h, w)
+    # 渲染全图密集类别掩码 | Render full-image dense category mask
+    dense = render_category_mask(anns, h, w)
 
     results = {"img_id": img_id, "h": h, "w": w, "tile_sizes": {}}
 
@@ -126,7 +126,7 @@ def _analyze_single_image(args_tuple: tuple) -> dict:
         for y in range(0, h, ts):
             for x in range(0, w, ts):
                 th, tw = min(ts, h - y), min(ts, w - x)  # 处理边缘 tile | Handle boundary tiles
-                tile_mask = sem[y:y+th, x:x+tw]
+                tile_mask = dense[y:y+th, x:x+tw]
 
                 total_px = th * tw
                 fg_px = int((tile_mask > 0).sum())  # 前景像素数 | Foreground pixel count

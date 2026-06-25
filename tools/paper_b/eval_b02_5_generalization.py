@@ -57,7 +57,7 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 
 from adatile.logging import get_logger
 from adatile.logging.backends import ConsoleBackend, FileBackend
-from adatile.utils.seed import set_seed
+from adatile.utils.seed import set_seed, get_worker_init_fn
 
 logger = get_logger("b02_5_gen")
 logger.add_backend(ConsoleBackend())  # 终端实时输出 | Real-time console output
@@ -133,10 +133,10 @@ class MobileNetSpatialRouter(nn.Module):
 # 数据准备 | Data preparation
 # ═══════════════════════════════════════════════════════════════════
 
-def render_semantic_mask(annotations: list, h: int, w: int) -> np.ndarray:
-    """渲染语义掩码 | Render semantic mask [H, W] uint8 (0-15)."""
+def render_category_mask(annotations: list, h: int, w: int) -> np.ndarray:
+    """渲染密集类别掩码 | Render dense category mask [H, W] uint8 (0-15)."""
     import cv2
-    sem = np.zeros((h, w), dtype=np.uint8)
+    dense = np.zeros((h, w), dtype=np.uint8)
     for ann in annotations:
         cat_id = ann.get("category_id", 0)
         if cat_id <= 0:
@@ -146,7 +146,7 @@ def render_semantic_mask(annotations: list, h: int, w: int) -> np.ndarray:
             bbox = ann.get("bbox", [0, 0, 0, 0])
             x, y, bw, bh = bbox
             x1, y1, y2, x2 = max(0, int(x)), max(0, int(y)), min(h, int(y+bh)), min(w, int(x+bw))
-            sem[y1:y2, x1:x2] = cat_id
+            dense[y1:y2, x1:x2] = cat_id
             continue
         if isinstance(seg, dict):
             continue
@@ -155,8 +155,8 @@ def render_semantic_mask(annotations: list, h: int, w: int) -> np.ndarray:
             pts = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
             pts[:, :, 0] = np.clip(pts[:, :, 0], 0, w - 1)
             pts[:, :, 1] = np.clip(pts[:, :, 1], 0, h - 1)
-            cv2.fillPoly(sem, [pts], cat_id)
-    return sem
+            cv2.fillPoly(dense, [pts], cat_id)
+    return dense
 
 
 def _preprocess_worker(args_tuple):
@@ -166,8 +166,8 @@ def _preprocess_worker(args_tuple):
         from PIL import Image
         img = np.array(Image.open(img_path).convert("RGB"))
         H, W = img.shape[:2]
-        # 渲染语义分割掩码 | Render semantic mask
-        mask = render_semantic_mask(anns, H, W)
+        # 渲染密集类别掩码 | Render dense category mask
+        mask = render_category_mask(anns, H, W)
 
         # Resize: 保持宽高比缩放到固定尺寸 | Resize: keep aspect ratio, scale to fixed square
         scale = image_size / max(H, W)
@@ -410,15 +410,18 @@ def run_exp_a(args, all_images, cache_dir):
     train_ds = CachedDataset(train_paths)
     eval_ds = CachedDataset(eval_paths)
 
+    wif = get_worker_init_fn(args.seed)
     # DataLoader: 训练集 shuffle + pin_memory (GPU) | Train: shuffle + pin_memory for GPU
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers,
                               pin_memory=(args.device == "cuda"),
-                              persistent_workers=(args.num_workers > 0))
+                              persistent_workers=(args.num_workers > 0),
+                              worker_init_fn=wif)
     eval_loader = DataLoader(eval_ds, batch_size=args.batch_size, shuffle=False,
                              num_workers=args.num_workers,
                              pin_memory=(args.device == "cuda"),
-                             persistent_workers=(args.num_workers > 0))
+                             persistent_workers=(args.num_workers > 0),
+                             worker_init_fn=wif)
 
     # 模型: MV3 backbone (frozen) + Conv Head (trainable)
     model = MobileNetSpatialRouter(pretrained=True).to(args.device)
@@ -490,14 +493,17 @@ def run_exp_b(args, all_images, cache_dir):
     train_ds = CachedDataset(train_paths)
     test_ds = CachedDataset(test_paths)
 
+    wif = get_worker_init_fn(args.seed)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers,
                               pin_memory=(args.device == "cuda"),
-                              persistent_workers=(args.num_workers > 0))
+                              persistent_workers=(args.num_workers > 0),
+                              worker_init_fn=wif)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
                              num_workers=args.num_workers,
                              pin_memory=(args.device == "cuda"),
-                             persistent_workers=(args.num_workers > 0))
+                             persistent_workers=(args.num_workers > 0),
+                             worker_init_fn=wif)
 
     # 模型 + 优化器 | Model + optimizer
     model = MobileNetSpatialRouter(pretrained=True).to(args.device)
@@ -754,10 +760,12 @@ def run_exp_c(args, isaid_all_images, cache_dir):
     train_cache = os.path.join(cache_dir, "C_train_isaid")
     train_paths = preprocess_to_cache(train_imgs, IMAGE_SIZE, train_cache)
     train_ds = CachedDataset(train_paths)
+    wif = get_worker_init_fn(args.seed)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers,
                               pin_memory=(args.device == "cuda"),
-                              persistent_workers=(args.num_workers > 0))
+                              persistent_workers=(args.num_workers > 0),
+                              worker_init_fn=wif)
 
     # ── 预处理目标测试集 (使用数据集专属的 worker) | Preprocess target test set (dataset-specific worker) ──
     test_cache = os.path.join(cache_dir, f"C_test_{test_dataset}")
@@ -778,10 +786,12 @@ def run_exp_c(args, isaid_all_images, cache_dir):
                     f"{test_dataset} cached: {len(test_paths)}/{len(target_images)}")
 
     test_ds = CachedDataset(test_paths)
+    wif_test = get_worker_init_fn(args.seed)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
                              num_workers=args.num_workers,
                              pin_memory=(args.device == "cuda"),
-                             persistent_workers=(args.num_workers > 0))
+                             persistent_workers=(args.num_workers > 0),
+                             worker_init_fn=wif_test)
 
     # ── 训练 (仅在 iSAID 上) + 跨域测试 | Train (iSAID only) + cross-domain test ──
     model = MobileNetSpatialRouter(pretrained=True).to(args.device)

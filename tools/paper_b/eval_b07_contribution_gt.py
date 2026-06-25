@@ -64,9 +64,9 @@ def load_dataset(tile_root, dataset_name, split="val"):
         use_split = "test"
     if dataset_name == "isaid":
         from adatile.datasets.isaid_tiles import FastISAIDTileDataset
-        return FastISAIDTileDataset(tile_root, split=use_split, semantic=True)
+        return FastISAIDTileDataset(tile_root, split=use_split, dense_labels=True)
     from adatile.datasets.vaihingen_tiles import VaihingenTileDataset
-    return VaihingenTileDataset(tile_root, split=use_split, semantic=True)
+    return VaihingenTileDataset(tile_root, split=use_split, dense_labels=True)
 
 
 def compute_miou(pred, gt, num_classes):

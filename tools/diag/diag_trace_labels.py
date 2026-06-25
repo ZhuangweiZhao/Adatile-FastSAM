@@ -7,7 +7,7 @@ Trace a single instance through the entire pipeline to verify label consistency.
 追踪链路 | Trace chain:
     ① 原始 iSAID JSON: ann["category_id"] = ?
     ② prep_isaid.py fix_annotations → instances_{split}.json: ann["category_id"] = ?
-    ③ prep_isaid_tiles.py render_semantic_mask → masks_full/*.png: pixel value = ?
+    ③ prep_isaid_tiles.py render_category_mask → masks_full/*.png: pixel value = ?
     ④ prep_isaid_tiles.py step2 cut tiles → masks/{split}/*.png: pixel value = ?
 
 用法 | Usage::
@@ -204,13 +204,13 @@ def trace(args):
     # 选 plane (ISAID code id=3) 验证 | Verify with plane (code id=3)
     # In ACTUAL_TO_CODE_ID: 3→1, 4→3
     # So if original JSON has plane=?, after fix_annotations it becomes 3
-    # Then render_semantic_mask maps it again: ACTUAL_TO_CODE_ID[3] = 1
+    # Then render_category_mask maps it again: ACTUAL_TO_CODE_ID[3] = 1
     # But 1 in ISAID_CATEGORIES is small_vehicle!
 
     print(f"""
     If plane in ORIGINAL JSON has category_id = X:
       fix_annotations:  X → ACTUAL_TO_CODE_ID[X] = Y
-      render_semantic_mask: Y → ACTUAL_TO_CODE_ID[Y] = Z
+      render_category_mask: Y → ACTUAL_TO_CODE_ID[Y] = Z
       Final pixel value = Z
 
     ISAID_CATEGORIES: plane = 3
@@ -220,9 +220,9 @@ def trace(args):
 
     DOUBLE mapping danger:
       If fix_annotations maps to 3 (correct plane):
-        render_semantic_mask maps 3 → 1 (small_vehicle!) ← WRONG
+        render_category_mask maps 3 → 1 (small_vehicle!) ← WRONG
       If fix_annotations maps to 1 (small_vehicle):
-        render_semantic_mask maps 1 → 4 (storage_tank!) ← WRONG
+        render_category_mask maps 1 → 4 (storage_tank!) ← WRONG
 
     Only idempotent IDs survive: {2, 5, 11}
       2→2→2 (large_vehicle), 5→5→5 (ship), 11→11→11 (road)

@@ -6,7 +6,7 @@
 测试内容 | Tests performed:
     - train/val/test 三 split 数据加载 | Three-split data loading
     - tile 模式下的 image/mask 形状验证 | Image/mask shape verification under tile mode
-    - semantic vs instance 模式切换      | Semantic vs instance mode switching
+    - dense vs instance 模式切换      | Dense vs instance mode switching
     - 大尺寸图像 (up to 5500×3875) 兼容  | Large image (up to 5500×3875) compatibility
 
 用途 | Purpose:
@@ -31,11 +31,11 @@ for split in ["train", "val", "test"]:
     try:
         # iSAID 图像大 (up to 5500×3875), 需 tile 模式 | Large images need tile mode
         # test 无标注, 使用 instance 模式 | test has no labels, use instance mode
-        use_semantic = (split != "test")
+        use_dense_labels = (split != "test")
         ds = ISAIDDataset(root_dir=DATA, split=split, tile_size=1024,
-                          semantic=use_semantic)
+                          dense_labels=use_dense_labels)
         s = ds[0]
-        key = "mask" if use_semantic else "masks"
+        key = "mask" if use_dense_labels else "masks"
         print(f"[{split:5s}] {len(ds):5d} tiles  "
               f"sample: image={list(s['image'].shape)}  "
               f"{key}={list(s[key].shape)}  "

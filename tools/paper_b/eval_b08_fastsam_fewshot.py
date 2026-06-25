@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-B-08: FastSAM-FSS — FastSAM for Few-Shot Segmentation
-=======================================================
+B-08: FastSAM-FSS — FastSAM for Few-Shot Dense Segmentation
+==============================================================
 
-回答最基础的问题：冻结的 FastSAM Backbone 能否支持少样本语义分割？
-Answer the foundational question: can a frozen FastSAM backbone support few-shot segmentation?
+回答最基础的问题：冻结的 FastSAM Backbone 能否支持少样本密集分割？
+Answer the foundational question: can a frozen FastSAM backbone support few-shot dense segmentation?
+
+作为实例分割项目的辅助验证，在密集土地覆盖数据集上测试 few-shot 泛化能力。
+Auxiliary validation for the instance-seg project: testing few-shot generalization on dense land-cover datasets.
 
 实验设计 | Design:
     - 冻结 FastSAM → P4 特征 | Frozen FastSAM → P4 features
     - Support: K-shot images → per-class prototype (mean P4 feature)
     - Query: P4 → cosine similarity with prototypes → LightDecoder → mask
-    - 数据集: LoveDA (7-class) or Vaihingen (6-class)
+    - 数据集: LoveDA (7-class dense land-cover) or Vaihingen (6-class dense land-cover)
     - K = 1, 3, 5 shot
 
 对比基线 | Baselines:
@@ -55,16 +58,16 @@ def load_dataset(tile_root, dataset_name):
                           (Path(tile_root) / "images" / "val").exists()) else "test"
     if dataset_name == "isaid":
         from adatile.datasets.isaid_tiles import FastISAIDTileDataset
-        return (FastISAIDTileDataset(tile_root, split="train", semantic=True),
-                FastISAIDTileDataset(tile_root, split=val_split, semantic=True))
+        return (FastISAIDTileDataset(tile_root, split="train", dense_labels=True),
+                FastISAIDTileDataset(tile_root, split=val_split, dense_labels=True))
     elif dataset_name == "vaihingen":
         from adatile.datasets.vaihingen_tiles import VaihingenTileDataset
-        return (VaihingenTileDataset(tile_root, split="train", semantic=True),
-                VaihingenTileDataset(tile_root, split=val_split, semantic=True))
+        return (VaihingenTileDataset(tile_root, split="train", dense_labels=True),
+                VaihingenTileDataset(tile_root, split=val_split, dense_labels=True))
     elif dataset_name == "loveda":
         from adatile.datasets.loveda_tiles import LoveDATileDataset
-        return (LoveDATileDataset(tile_root, split="train", semantic=True),
-                LoveDATileDataset(tile_root, split=val_split, semantic=True))
+        return (LoveDATileDataset(tile_root, split="train", dense_labels=True),
+                LoveDATileDataset(tile_root, split=val_split, dense_labels=True))
     raise ValueError(f"Unknown dataset: {dataset_name}")
 
 

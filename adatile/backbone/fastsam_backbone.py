@@ -128,9 +128,29 @@ class FastSAMBackbone(nn.Module):
         from fastsam import FastSAM  # type: ignore[import-not-found]
 
         model = FastSAM(self._checkpoint)
-        # 将底层 YOLO 模型移到目标设备 | Move underlying YOLO model to target device
-        model.model.to(self._device)
-        self.logger.log_info("backbone/load", f"FastSAM loaded: {self._checkpoint}")
+
+        # FastSAM 内部可能在加载时自动将权重迁移到 CUDA（即使无 GPU 仍标记为 cuda tensor）
+        # FastSAM may auto-move weights to CUDA during load (even if no GPU, marked as cuda tensor)
+        # 注意: FastSAM 不是 nn.Module，实际模型在 model.model (YOLO wrapper)
+        # Note: FastSAM is NOT nn.Module; real model is model.model (YOLO wrapper)
+        target = torch.device(self._device)
+        model.model.to(target)
+
+        # 额外安全: 显式检查并迁移残余 CUDA 参数 (处理 .to() 可能遗漏的边缘情况)
+        # Extra safety: explicitly check & migrate residual CUDA params
+        # FastSAM 非标准 __getattr__ → 必须直接访问 model.model
+        yolo = model.model
+        for p in yolo.parameters():
+            if p.device != target:
+                p.data = p.data.to(target)
+        for b in yolo.buffers():
+            if b.device != target:
+                b.data = b.data.to(target)
+
+        self.logger.log_info(
+            "backbone/load",
+            f"FastSAM loaded: {self._checkpoint} → {self._device}"
+        )
         return model
 
     # ── 钩子管理 | Hook Management ────────────────────────────

@@ -71,14 +71,14 @@ class ISAIDDataset(BaseSegDataset):
         - COCO JSON 格式标注解析 | COCO JSON annotation parsing
         - 大图瓦片处理 | Large-image tile-based processing
         - 掩码归一化（{0,255} → {0,1}）| Mask normalization
-        - 语义模式：返回 [H,W] 类别标签 | Semantic mode: returns [H,W] class labels
+        - 密集标签模式：返回 [H,W] 类别标签 | Dense label mode: returns [H,W] class labels
         - 日志系统集成 | Logging system integration
 
     两种输出模式 | Two output modes:
-        semantic=False (默认 | default):
+        dense_labels=False (默认 | default):
             sample["masks"] → [N_inst, H, W] 实例二值掩码 | instance binary masks
-        semantic=True:
-            sample["mask"]  → [H, W] 语义类别标签 | semantic class labels (0=bg, 1-15)
+        dense_labels=True:
+            sample["mask"]  → [H, W] 密集类别标签 | dense category labels (0=bg, 1-15)
             sample["masks"] → 不可用 | not available
 
     ----------
@@ -92,8 +92,8 @@ class ISAIDDataset(BaseSegDataset):
         Tile size. None = full-image loading. Recommended 1024 for large images.
     tile_overlap : float
         瓦片重叠比例 (0.0 ~ 1.0) | Tile overlap ratio.
-    semantic : bool
-        True = 语义模式 (返回[H,W]标签) | semantic mode (returns [H,W] labels).
+    dense_labels : bool
+        True = 密集标签模式 (返回[H,W]类别标签) | dense label mode (returns [H,W] category labels).
     transforms : callable | None
         数据增强变换 | Optional data augmentation transforms.
     """
@@ -104,23 +104,23 @@ class ISAIDDataset(BaseSegDataset):
         split: str = "train",
         tile_size: int | None = None,
         tile_overlap: float = 0.0,
-        semantic: bool = False,
+        dense_labels: bool = False,
         transforms=None,
     ) -> None:
         """
         ----------
-        semantic : bool
-            True = 返回语义标签 [H, W] (category IDs)
-                   Return semantic label map [H, W] (category IDs).
+        dense_labels : bool
+            True = 返回密集类别标签 [H, W] (category IDs)
+                   Return dense category label map [H, W] (category IDs).
             False = 返回实例掩码 [N, H, W] (二值 per-instance)
                     Return instance masks [N, H, W] (binary per-instance).
         """
         super().__init__(root_dir=root_dir, split=split, transforms=transforms)
         self._tile_size = tile_size
         self._tile_overlap = tile_overlap
-        # 语义模式：返回 [H,W] 类别标签 而非 [N,H,W] 实例掩码
-        # Semantic mode: return [H,W] class labels instead of [N,H,W] instance masks
-        self._semantic = semantic
+        # 密集标签模式：返回 [H,W] 类别标签 而非 [N,H,W] 实例掩码
+        # Dense label mode: return [H,W] category labels instead of [N,H,W] instance masks
+        self._dense_labels = dense_labels
 
         # 加载 COCO 标注 | Load COCO annotations
         self._coco_data = self._load_coco()
@@ -149,7 +149,7 @@ class ISAIDDataset(BaseSegDataset):
             f"{len(self._annotations)} instances, "
             f"{len(self._categories)} categories, "
             f"tile_size={tile_size}, "
-            f"semantic={semantic}",
+            f"dense_labels={dense_labels}",
         )
 
     def _build_tile_index(self) -> None:
@@ -260,9 +260,9 @@ class ISAIDDataset(BaseSegDataset):
         masks = torch.stack(masks_list, dim=0)
         return masks
 
-    def _load_semantic_mask(self, index: int) -> torch.Tensor:
+    def _load_dense_mask(self, index: int) -> torch.Tensor:
         """
-        加载语义分割掩码 [H, W] | Load semantic segmentation mask.
+        加载密集类别标签掩码 [H, W] | Load dense category label mask (instance→dense).
 
         将同一图像的所有实例按 category_id 渲染到单通道标签图。
         Renders all instances into a single-channel label map by category_id.
@@ -278,7 +278,7 @@ class ISAIDDataset(BaseSegDataset):
         :param index: 图像在 self._image_infos 中的索引
         :type index: int
 
-        :return: torch.Tensor [H, W] int64, 语义标签 | semantic labels
+        :return: torch.Tensor [H, W] int64, 密集类别标签 | dense category labels
         :rtype: torch.Tensor
         """
         info = self._image_infos[index]
@@ -294,7 +294,7 @@ class ISAIDDataset(BaseSegDataset):
         # 按 category_id 分层渲染 | Layer-by-category rendering
         # 后渲染的覆盖先渲染的 (处理重叠实例)
         # Later renders overwrite earlier (handles overlapping instances)
-        sem = np.zeros((h, w), dtype=np.int32)
+        dense = np.zeros((h, w), dtype=np.int32)
 
         for ann in anns:
             cat_id = ann.get("category_id", 0)  # 1-15, 0 为无效
@@ -303,9 +303,9 @@ class ISAIDDataset(BaseSegDataset):
             # 渲染单实例二值掩码 | Render single-instance binary mask
             mask = self._render_mask(ann, h, w)  # [H, W] float32, {0, 1}
             # 将该实例的像素赋值为类别 ID | Assign category ID to instance pixels
-            sem = np.where(mask.numpy() > 0.5, cat_id, sem)
+            dense = np.where(mask.numpy() > 0.5, cat_id, dense)
 
-        return torch.from_numpy(sem.astype(np.int64))
+        return torch.from_numpy(dense.astype(np.int64))
 
     def _load_image_id(self, index: int) -> int:
         """返回 COCO image_id | Return COCO image_id."""
@@ -333,15 +333,15 @@ class ISAIDDataset(BaseSegDataset):
         if self._tile_size is not None:
             img_idx, x, y, _ = self._tile_index[index]
 
-            if self._semantic:
+            if self._dense_labels:
                 image = self._load_image(img_idx)
-                sem_mask = self._load_semantic_mask(img_idx)
+                dense_mask = self._load_dense_mask(img_idx)
                 image_id = self._load_image_id(img_idx)
                 ts = self._tile_size
                 _, h, w = image.shape
                 th, tw = min(ts, h - y), min(ts, w - x)
                 tile_img = image[:, y:y+th, x:x+tw]
-                tile_mask = sem_mask[y:y+th, x:x+tw]
+                tile_mask = dense_mask[y:y+th, x:x+tw]
                 # 边界补零 | Pad edge tiles to ts×ts
                 if th < ts or tw < ts:
                     tile_img = F.pad(tile_img, (0, ts-tw, 0, ts-th), value=0)
@@ -371,13 +371,13 @@ class ISAIDDataset(BaseSegDataset):
             return self._apply_transforms(sample)
 
         # 非 tile 模式 | Non-tile mode
-        if self._semantic:
+        if self._dense_labels:
             image = self._load_image(index)
-            sem_mask = self._load_semantic_mask(index)
+            dense_mask = self._load_dense_mask(index)
             image_id = self._load_image_id(index)
             sample = {
                 "image": image,
-                "mask": sem_mask,       # [H, W] long, category IDs
+                "mask": dense_mask,       # [H, W] long, category IDs
                 "image_id": image_id,
                 "image_size": tuple(image.shape[1:]),
             }

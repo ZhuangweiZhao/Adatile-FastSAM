@@ -10,7 +10,7 @@
 
 修复 | Fix:
     1. 为 train 和 val 分别建立正确的原始ID→ISAID_ID 映射
-    2. 删除 prep_isaid_tiles.py 中 render_semantic_mask 的二次映射
+    2. 删除 prep_isaid_tiles.py 中 render_category_mask 的二次映射
     3. 重新生成所有 tile
 
 用法 | Usage::
@@ -129,7 +129,7 @@ def main():
         print(f"    python tools/prep_isaid_tiles.py --steps 1,2,3 --splits train,val")
     else:
         print(f"  ✅ JSON files fixed. Next step:")
-        print(f"    1. Fix render_semantic_mask in prep_isaid_tiles.py (remove ACTUAL_TO_CODE_ID)")
+        print(f"    1. Fix render_category_mask in prep_isaid_tiles.py (remove ACTUAL_TO_CODE_ID)")
         print(f"    2. Regenerate all tiles")
         print(f"    3. Run diag_quick_check.py to verify consistency")
 

@@ -382,8 +382,8 @@ def main():
 
     # ── Data ──
     logger.log_info("phase", "[2] iSAID Tiles (pre-cut)")
-    train_ds = FastISAIDTileDataset(root_dir=args.data_root, split="train", semantic=True)
-    val_ds = FastISAIDTileDataset(root_dir=args.data_root, split="val", semantic=True)
+    train_ds = FastISAIDTileDataset(root_dir=args.data_root, split="train", dense_labels=True)
+    val_ds = FastISAIDTileDataset(root_dir=args.data_root, split="val", dense_labels=True)
     if args.max_tiles > 0:
         train_ds._tiles = train_ds._tiles[:args.max_tiles]
         val_ds._tiles = val_ds._tiles[:max(1, args.max_tiles // 4)]

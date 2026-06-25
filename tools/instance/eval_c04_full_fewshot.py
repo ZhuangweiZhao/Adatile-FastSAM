@@ -67,8 +67,10 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 from adatile.logging import get_logger
 from adatile.logging.backends import ConsoleBackend, FileBackend
 from adatile.utils.seed import set_seed
+from adatile.utils.env import get_env_info
 from adatile.backbone import FastSAMBackbone
 from adatile.utils.label_mapping import ISAID_CATEGORIES
+from adatile.datasets.isaid_tile_wrapper import ISAIDTileWrapper
 
 # ── 复用 C-02A 的数据集 | Reuse C-02A dataset ──
 from tools.instance.eval_c02a_fastsam_fewshot import (
@@ -108,6 +110,8 @@ class ProtoRefineDecoder(nn.Module):
     与 C-02B 相同 | Same as C-02B. ~10K params.
     """
 
+    _logger = get_logger("ProtoRefineDecoder")
+
     def __init__(self, feat_dim: int = 1280, temperature: float = 0.1):
         super().__init__()
         self.feat_dim = feat_dim
@@ -121,7 +125,7 @@ class ProtoRefineDecoder(nn.Module):
             nn.Conv2d(32, 1, 1, bias=True),
         )
         n = sum(p.numel() for p in self.parameters())
-        print(f"[ProtoRefineDecoder] Trainable: {n:,}")
+        ProtoRefineDecoder._logger.log_info("init", f"ProtoRefineDecoder: {n:,} trainable params")
 
     def forward(self, query_p4, fg_prototype, target_size=None):
         q_norm = F.normalize(query_p4, dim=1, p=2)
@@ -137,9 +141,11 @@ class ProtoRefineDecoder(nn.Module):
 
 class FiLMFewShotDecoder(nn.Module):
     """
-    CAT-SAM Lite: FiLM-conditioned InstanceDecoder.
+    FiLM-conditioned InstanceDecoder.
     C-04 FiLM 变体 | C-04 FiLM variant. ~1.1M params.
     """
+
+    _logger = get_logger("FiLMFewShotDecoder")
 
     def __init__(self, feat_dim: int = 1280):
         super().__init__()
@@ -173,7 +179,9 @@ class FiLMFewShotDecoder(nn.Module):
 
         n_film = sum(p.numel() for p in self.film_mlp.parameters())
         n_total = sum(p.numel() for p in self.parameters())
-        print(f"[FiLMFewShotDecoder] Total: {n_total:,} (FiLM: {n_film:,})")
+        FiLMFewShotDecoder._logger.log_info(
+            "init", f"FiLMFewShotDecoder: {n_total:,} params (FiLM: {n_film:,})"
+        )
 
     def forward(self, query_p4, fg_prototype, target_size=None):
         x = self.proj(query_p4)
@@ -204,13 +212,15 @@ class FiLMFewShotDecoder(nn.Module):
 class ContrastiveProtoDecoder(nn.Module):
     """
     Contrastive Prototype Decoder | 对比原型解码器.
-    
+
     核心创新 | Core Innovation (Phase C 预备):
         Proto → Projection MLP → contrastive-friendly space
         Query P4 → Projection → cosine_sim(projected_proto) → Refine CNN → mask
-    
+
     ~1.3M params (projection ~394K + decoder ~900K).
     """
+
+    _logger = get_logger("ContrastiveProtoDecoder")
 
     def __init__(self, feat_dim: int = 1280, proj_dim: int = 256,
                  temperature: float = 0.1):
@@ -219,6 +229,8 @@ class ContrastiveProtoDecoder(nn.Module):
         self.proj_dim = proj_dim
         self.temperature = temperature
 
+        # 投影到 contrastive-friendly 空间 (输出保持 feat_dim 以便与原始原型维度对齐)
+        # Project to contrastive-friendly space (output feat_dim for alignment with original proto dim)
         self.proto_proj = nn.Sequential(
             nn.Linear(feat_dim, proj_dim),
             nn.ReLU(inplace=True),
@@ -241,7 +253,9 @@ class ContrastiveProtoDecoder(nn.Module):
 
         n_proj = sum(p.numel() for p in self.proto_proj.parameters())
         n_total = sum(p.numel() for p in self.parameters())
-        print(f"[ContrastiveProtoDecoder] Total: {n_total:,} (Proj: {n_proj:,})")
+        ContrastiveProtoDecoder._logger.log_info(
+            "init", f"ContrastiveProtoDecoder: {n_total:,} params (Proj: {n_proj:,})"
+        )
 
     def project_prototype(self, proto: torch.Tensor) -> torch.Tensor:
         return F.normalize(self.proto_proj(proto), dim=0, p=2)
@@ -350,7 +364,7 @@ def train_episode(decoder, backbone, support_idxs, query_idx,
 
     # Forward - query decoder (grad only through decoder)
     if use_amp:
-        with torch.amp.autocast('cuda'):
+        with torch.amp.autocast(device.type):
             logit = decoder(query_p4, fg_proto, target_size=tuple(query_mask.shape[2:]))
             loss, components = focal_dice_loss(logit, query_mask)
     else:
@@ -527,10 +541,15 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
                    f"{'='*60}")
 
     # Optimizer & Scheduler
-    opt = torch.optim.AdamW(decoder.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # beta2=0.95 适合少样本: 有效记忆 ~20 步 (vs 默认 0.999 的 ~1000 步)
+    # beta2=0.95 for few-shot: effective memory ~20 steps (vs default 0.999 ~1000 steps)
+    opt = torch.optim.AdamW(decoder.parameters(), lr=args.lr,
+                            betas=(0.9, 0.95), weight_decay=args.weight_decay)
 
     from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-    if args.warmup_epochs > 0:
+    # warmup_epochs >= epochs 时 T_max=0 会导致 ZeroDivisionError，回退到纯 Cosine
+    # When warmup_epochs >= epochs, T_max=0 causes ZeroDivisionError → fallback to pure Cosine
+    if args.warmup_epochs > 0 and args.warmup_epochs < args.epochs:
         warmup = LinearLR(opt, start_factor=0.1, end_factor=1.0,
                          total_iters=args.warmup_epochs)
         cosine = CosineAnnealingLR(opt, T_max=args.epochs - args.warmup_epochs,
@@ -538,10 +557,14 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
         sch = SequentialLR(opt, schedulers=[warmup, cosine],
                           milestones=[args.warmup_epochs])
     else:
+        if args.warmup_epochs >= args.epochs and args.warmup_epochs > 0:
+            logger.log_info(f"{tag}/sched",
+                           f"warmup ({args.warmup_epochs}) >= epochs ({args.epochs}), "
+                           f"skipping warmup to avoid ZeroDivisionError")
         sch = CosineAnnealingLR(opt, T_max=args.epochs, eta_min=args.lr * 0.01)
 
     use_amp = args.amp and device.type == "cuda"
-    scaler = torch.amp.GradScaler('cuda') if use_amp else None
+    scaler = torch.amp.GradScaler(device.type) if use_amp else None
 
     # Class sampling weights (rare class oversampling)
     # 排除零样本类（如 iSAID 的 road 在 train 中可能为 0）| Exclude zero-sample classes
@@ -739,6 +762,12 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num-prototypes", type=int, default=1,
                    help="多原型数量 (仅 crossattn decoder, 默认 1=mean pool)")
+    p.add_argument("--tile", action="store_true",
+                   help="Tile 模式: 切分全图为 896x896 tiles (stride=512, overlap=384)")
+    p.add_argument("--tile-size", type=int, default=896)
+    p.add_argument("--tile-stride", type=int, default=512)
+    p.add_argument("--tile-cache-size", type=int, default=64,
+                   help="Tile wrapper 原图 LRU 缓存大小 (默认 64)")
     return p.parse_args()
 
 
@@ -774,8 +803,22 @@ def main():
     # Load data
     train_ds = ISAIDInstanceDataset(args.src_root, split="train")
     val_ds = ISAIDInstanceDataset(args.src_root, split="val")
-    logger.log_info("c04/data",
-                   f"iSAID: {len(train_ds)} train, {len(val_ds)} val images")
+
+    use_tile = args.tile
+    if use_tile:
+        train_ds = ISAIDTileWrapper(train_ds, tile_size=args.tile_size,
+                                     stride=args.tile_stride)
+        train_ds._cache_max = args.tile_cache_size
+        val_ds = ISAIDTileWrapper(val_ds, tile_size=args.tile_size,
+                                   stride=args.tile_stride)
+        val_ds._cache_max = args.tile_cache_size
+        logger.log_info("c04/data",
+                       f"iSAID Tile: {len(train_ds)} train tiles, {len(val_ds)} val tiles "
+                       f"({args.tile_size}x{args.tile_size}, stride={args.tile_stride}, "
+                       f"LRU cache={args.tile_cache_size})")
+    else:
+        logger.log_info("c04/data",
+                       f"iSAID: {len(train_ds)} train, {len(val_ds)} val images")
 
     for c in sorted(target_classes):
         n_train = len(train_ds.class_to_images(c))
@@ -848,11 +891,37 @@ def main():
                                        logger, f"c04/{decoder_type}/{shot}shot/eval")
                 all_results[decoder_type][f"{shot}shot"] = result
             else:
-                decoder, result, best_val = train_and_evaluate(
-                    decoder, backbone, train_ds, val_ds, device,
-                    shot, target_classes, args, logger, output_dir,
-                    decoder_type=decoder_type)
-                all_results[decoder_type][f"{shot}shot"] = result
+                # ── 跳过已完成实验 | Skip already-completed experiments ──
+                metrics_path = output_dir / f"decoder_{decoder_type}_{shot}shot_metrics.jsonl"
+                best_path = output_dir / f"decoder_{decoder_type}_{shot}shot_best.pt"
+                skip = False
+                if metrics_path.exists():
+                    try:
+                        lines = open(metrics_path).readlines()
+                        if lines:
+                            last = json.loads(lines[-1])
+                            if last.get("epoch", 0) >= args.epochs:
+                                logger.log_info(f"c04/{decoder_type}/{shot}shot/skip",
+                                               f"Already complete (epoch {last['epoch']}/{args.epochs}), "
+                                               f"best_val_mIoU={last.get('val_miou', '?'):.4f}. Skipping.")
+                                skip = True
+                    except Exception:
+                        pass
+                if skip:
+                    if best_path.exists():
+                        decoder.load_state_dict(torch.load(best_path, map_location=device, weights_only=True))
+                    decoder.eval()
+                    result = evaluate_full(decoder, backbone, train_ds, val_ds, device,
+                                           shot, args.eval_episodes, target_classes,
+                                           logger, f"c04/{decoder_type}/{shot}shot/eval")
+                    all_results[decoder_type][f"{shot}shot"] = result
+                    best_val = last.get("val_miou", 0.0)
+                else:
+                    decoder, result, best_val = train_and_evaluate(
+                        decoder, backbone, train_ds, val_ds, device,
+                        shot, target_classes, args, logger, output_dir,
+                        decoder_type=decoder_type)
+                    all_results[decoder_type][f"{shot}shot"] = result
                 logger.log_metric(f"c04/{decoder_type}_miou_{shot}shot",
                                 result["miou_mean"],
                                 tags=["c04", decoder_type, f"{shot}shot", "trained"])
@@ -906,16 +975,22 @@ def main():
             miou_5 = res["5shot"]["miou_mean"]
             if miou_5 > 0:
                 ses = miou_1 / miou_5
+                ses_note = ""
+                if ses > 1.0:
+                    ses_note = " (WARN: 1-shot > 5-shot — 5-shot may be undertrained or noisy)"
+                elif ses < 0.5:
+                    ses_note = " (WARN: 1-shot << 5-shot — few-shot adaptation weak)"
                 logger.log_info("c04/ses",
                                f"  [{decoder_type}] SES(1-shot/5-shot) = {ses:.3f} "
-                               f"-> 1-shot retains {ses*100:.0f}% of 5-shot mIoU")
+                               f"-> 1-shot retains {ses*100:.0f}% of 5-shot mIoU{ses_note}")
 
-    # Save results
+    # Save results + environment info | 保存结果 + 环境信息
     summary = {
         "experiment": "C-04 Full-Category Few-Shot Instance Segmentation",
         "dataset": "iSAID",
         "target_classes": {str(k): v for k, v in target_classes.items()},
         "timestamp": datetime.datetime.now().isoformat(),
+        "environment": get_env_info(),
         "shots": shots,
         "decoders": decoder_types,
         "epochs": args.epochs,

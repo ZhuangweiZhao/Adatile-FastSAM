@@ -211,7 +211,7 @@ def compute_miou(pred: torch.Tensor, target: torch.Tensor,
     :param pred: [B, H, W] 预测标签 | predicted class labels or [B, C, H, W] logits (会取 argmax)
     :type pred: torch.Tensor
 
-    :param target: [B, H, W] GT 语义标签 | ground truth semantic labels
+    :param target: [B, H, W] GT 密集类别标签 | ground truth dense category labels
     :type target: torch.Tensor
 
     :param num_classes: 
@@ -301,7 +301,7 @@ def train_head(head: nn.Module, backbone: nn.Module,
             # 逐样本加载 (few-shot 风格, 不 shuffle) | Per-sample loading (few-shot style, no shuffle)
             sample = train_ds[idx]
             image = sample["image"].unsqueeze(0).to(device)  # [1, 3, H, W]
-            target = sample["mask"].unsqueeze(0).to(device)   # [1, H, W] semantic
+            target = sample["mask"].unsqueeze(0).to(device)   # [1, H, W] dense category
 
             # 冻结 Backbone 提取特征 | Frozen backbone feature extraction
             with torch.no_grad():
@@ -343,7 +343,7 @@ def train_head(head: nn.Module, backbone: nn.Module,
             for idx in range(len(val_ds)):
                 sample = val_ds[idx]
                 image = sample["image"].unsqueeze(0).to(device)  # [1, 3, H, W]
-                target = sample["mask"].unsqueeze(0).to(device)  # [1, H, W] semantic
+                target = sample["mask"].unsqueeze(0).to(device)  # [1, H, W] dense category
 
                 # 冻结 Backbone 提取特征 | Frozen backbone feature extraction
                 features = backbone(image)
@@ -403,7 +403,7 @@ def main():
 
     三阶段流水线 | Three-stage pipeline:
     [1] 加载冻结 FastSAM Backbone | Load frozen FastSAM backbone
-    [2] 加载 iSAID tile 数据集 (语义模式) | Load iSAID tile dataset (semantic mode)
+    [2] 加载 iSAID tile 数据集 (密集标签模式) | Load iSAID tile dataset (dense label mode)
     [3] 训练 MultiClassProtoHead | Train MultiClassProtoHead
     """
     args = parse_args()
@@ -440,11 +440,11 @@ def main():
     logger.log_info("model/backbone", "FastSAM backbone loaded (frozen, eval mode) | backbone 已加载 (冻结, eval 模式)")
 
     # ── [2] 数据 | Data ──
-    # 使用预切 tile 数据集 (semantic=True: mask 为语义标签而非实例)
-    # Uses pre-cut tile dataset (semantic=True: mask is semantic label, not instance)
-    logger.log_info("phase", "[2/3] Loading iSAID data (semantic mode) | 加载 iSAID 数据 (语义模式)")
-    train_ds = FastISAIDTileDataset(root_dir=args.data_root, split="train", semantic=True)
-    val_ds = FastISAIDTileDataset(root_dir=args.data_root, split="val", semantic=True)
+    # 使用预切 tile 数据集 (dense_labels=True: mask 为语义标签而非实例)
+    # Uses pre-cut tile dataset (dense_labels=True: mask is semantic label, not instance)
+    logger.log_info("phase", "[2/3] Loading iSAID data (dense label mode) | 加载 iSAID 数据 (密集标签模式)")
+    train_ds = FastISAIDTileDataset(root_dir=args.data_root, split="train", dense_labels=True)
+    val_ds = FastISAIDTileDataset(root_dir=args.data_root, split="val", dense_labels=True)
 
     # 限制 tile 数 (调试/快速验证) | Limit tiles (debug/quick validation)
     if args.max_images > 0:
@@ -455,7 +455,7 @@ def main():
                     f"Train: {len(train_ds)} tiles, "
                     f"Val: {len(val_ds)} tiles, "
                     f"Classes: {args.num_classes}, "
-                    f"Mode: semantic, pre-cut (~20ms/sample)" +
+                    f"Mode: dense labels, pre-cut (~20ms/sample)" +
                     (f" [LIMITED]" if args.max_images > 0 else ""))
 
     # ── [3] 训练 ProtoHead | Train ProtoHead ──

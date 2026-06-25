@@ -2,18 +2,18 @@
 LightDecoder — 轻量解码器 | Lightweight Segmentation Decoder.
 ===============================================================
 
-P4 特征 → 渐进上采样 + 多层 Conv → 分割掩码。
-P4 features → gradual upsampling + multi-layer Conv → segmentation mask.
+P4 特征 → 渐进上采样 + 多层 Conv → 密集分割掩码。
+P4 features → gradual upsampling + multi-layer Conv → dense segmentation mask.
 
 支持两种模式 | Two modes:
     Binary (num_classes=1):  1280→64→64→32→32→1, ~716K params
     Multi-class (num_classes>1): 1280→256→128→64→32→C, ~716K params
 
 用法 | Usage::
-    # Binary segmentation (Paper A, MassBuildings)
+    # Binary mode (pre-experiments, MassBuildings)
     decoder = LightDecoder(in_channels=1280, num_classes=1)
 
-    # Multi-class (Paper B, iSAID 15-class)
+    # Multi-class (iSAID 15-class dense label prediction)
     decoder = LightDecoder(in_channels=1280, num_classes=16)
 """
 
@@ -44,7 +44,7 @@ class LightDecoder(nn.Module):
         self._is_binary = (num_classes == 1)
 
         if self._is_binary:
-            # Binary mode: thinner, deeper (Paper A) | 二值模式
+            # Binary mode: thinner, deeper | 二值掩码模式
             self.stage1 = nn.Sequential(
                 nn.Conv2d(in_channels, 64, kernel_size=3, padding=1, bias=False),
                 nn.BatchNorm2d(64),
@@ -67,7 +67,7 @@ class LightDecoder(nn.Module):
             )
             self.head = nn.Conv2d(32, 1, kernel_size=1, bias=True)
         else:
-            # Multi-class mode: wider Stage1, fewer upsamples (Paper B) | 多类模式
+            # Multi-class mode: wider Stage1, fewer upsamples | 多类别密集标签模式
             self.stage1 = nn.Sequential(
                 nn.Conv2d(in_channels, 256, kernel_size=1, bias=False),
                 nn.BatchNorm2d(256),
