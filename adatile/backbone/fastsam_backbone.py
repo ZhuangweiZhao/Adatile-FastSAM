@@ -67,6 +67,7 @@ class FastSAMBackbone(nn.Module):
     """
 
     # ── 候选步长范围 | Candidate stride ranges ──
+    TARGET_STRIDE_8  = (7, 9)     # stride 8 的容许范围 | tolerance for stride 8
     TARGET_STRIDE_16 = (14, 18)   # stride 16 的容许范围 | tolerance for stride 16
     TARGET_STRIDE_32 = (28, 36)   # stride 32 的容许范围 | tolerance for stride 32
 
@@ -85,6 +86,7 @@ class FastSAMBackbone(nn.Module):
         self._features: dict[str, torch.Tensor] = {}
 
         # 钩子层索引（首次 forward 时自动探测）| Hooked layer indices (auto-detected on first forward)
+        self._hook_p3_idx: int | None = None
         self._hook_p4_idx: int | None = None
         self._hook_p8_idx: int | None = None
         self._hook_handles: list = []  # 钩子句柄 | Hook handles
@@ -220,8 +222,9 @@ class FastSAMBackbone(nn.Module):
                 self.model.model(x)
 
         # 分析各层输出的步长 | Analyze strides of each layer's output
-        candidates_16 = []  # 可能的 stride-16 候选 | stride-16 candidates
-        candidates_32 = []  # 可能的 stride-32 候选 | stride-32 candidates
+        candidates_8  = []  # stride-8 candidates
+        candidates_16 = []  # stride-16 candidates
+        candidates_32 = []  # stride-32 candidates
 
         for key, feat in self._features.items():
             _, _, h_out, w_out = feat.shape
@@ -229,10 +232,23 @@ class FastSAMBackbone(nn.Module):
             stride_w = w_in / w_out
             avg_stride = (stride_h + stride_w) / 2
 
+            if self.TARGET_STRIDE_8[0] <= avg_stride <= self.TARGET_STRIDE_8[1]:
+                candidates_8.append((int(key), avg_stride, feat.shape[1]))
             if self.TARGET_STRIDE_16[0] <= avg_stride <= self.TARGET_STRIDE_16[1]:
                 candidates_16.append((int(key), avg_stride, feat.shape[1]))
             if self.TARGET_STRIDE_32[0] <= avg_stride <= self.TARGET_STRIDE_32[1]:
                 candidates_32.append((int(key), avg_stride, feat.shape[1]))
+
+        # P3 (stride≈8) — 按通道数降序选择最佳匹配 | pick best by channel count
+        if candidates_8:
+            candidates_8.sort(key=lambda t: -t[2])
+            self._hook_p3_idx = candidates_8[0][0]
+            self.logger.log_info(
+                "backbone/probe",
+                f"P3 hook: layer {self._hook_p3_idx}, "
+                f"stride={candidates_8[0][1]:.1f}, "
+                f"channels={candidates_8[0][2]}",
+            )
 
         # 选择最佳匹配：优先选择通道数多的（通常更有信息量）
         # Select best match: prefer layers with more channels (usually more informative)
@@ -279,6 +295,13 @@ class FastSAMBackbone(nn.Module):
         仅在探测完成后调用。| Only called after probing is complete.
         """
         sequential = self.model.model.model
+
+        # P3 钩子 | P3 hook (stride≈8)
+        if self._hook_p3_idx is not None:
+            handle = sequential[self._hook_p3_idx].register_forward_hook(
+                self._make_feature_hook("p3")
+            )
+            self._hook_handles.append(handle)
 
         # P4 钩子 | P4 hook
         if self._hook_p4_idx is not None:
@@ -422,7 +445,7 @@ class FastSAMBackbone(nn.Module):
         :rtype: dict[str, torch.Tensor]
         """
         # 首次调用：探测钩子位置 | First call: probe hook locations
-        if self._hook_p4_idx is None or self._hook_p8_idx is None:
+        if self._hook_p4_idx is None or self._hook_p8_idx is None or self._hook_p3_idx is None:
             self._probe_strides(x)
             self._register_final_hooks()
 
@@ -443,6 +466,8 @@ class FastSAMBackbone(nn.Module):
 
         # 返回提取的特征 | Return extracted features
         result: dict[str, torch.Tensor] = {}
+        if "p3" in self._features:
+            result["p3"] = self._features["p3"]
         if "p4" in self._features:
             result["p4"] = self._features["p4"]
         if "p8" in self._features:

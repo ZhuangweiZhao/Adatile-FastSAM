@@ -210,6 +210,103 @@ class FiLMFewShotDecoder(nn.Module):
         return x
 
 
+class P3P4FiLMFusionDecoder(nn.Module):
+    """
+    Prototype-Guided Adaptive P3+P4 Fusion Decoder.
+    原型引导的自适应 P3+P4 融合解码器.
+
+    Key: proto → gate → α·P3 + (1-α)·P4↑ (channel-wise, learned per class)
+    Replaces naive concat+1×1 with prototype-conditioned gating.
+    """
+
+    _logger = get_logger("P3P4FiLMFusionDecoder")
+
+    def __init__(self, feat_dim_p3: int = 640, feat_dim_p4: int = 1280,
+                 fusion_dim: int = 256, proto_dim: int = 1280):
+        super().__init__()
+        self.fusion_dim = fusion_dim
+        self.proto_dim = proto_dim
+
+        # Align P3 and P4 channels to fusion_dim
+        self.proj_p3 = nn.Sequential(
+            nn.Conv2d(feat_dim_p3, fusion_dim, 1, bias=False),
+            nn.BatchNorm2d(fusion_dim), nn.ReLU(inplace=True),
+        )
+        self.proj_p4 = nn.Sequential(
+            nn.Conv2d(feat_dim_p4, fusion_dim, 1, bias=False),
+            nn.BatchNorm2d(fusion_dim), nn.ReLU(inplace=True),
+        )
+
+        # Proto → Gate: generates per-channel fusion weight α ∈ [0,1]
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(proto_dim, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, fusion_dim),
+            nn.Sigmoid(),  # α ∈ [0,1] per channel
+        )
+
+        # FiLM Generator: proto → γ, β for fused features
+        self.film_mlp = nn.Sequential(
+            nn.Linear(proto_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, fusion_dim * 2),
+        )
+
+        # Upsample path
+        self.up1 = nn.Sequential(
+            nn.Conv2d(fusion_dim, 128, 3, padding=1, bias=False),
+            nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+        )
+        self.up2 = nn.Sequential(
+            nn.Conv2d(128, 64, 3, padding=1, bias=False),
+            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+        )
+        self.up3 = nn.Sequential(
+            nn.Conv2d(64, 32, 3, padding=1, bias=False),
+            nn.BatchNorm2d(32), nn.ReLU(inplace=True),
+        )
+        self.mask_head = nn.Conv2d(32, 1, 1, bias=True)
+
+        n_gate = sum(p.numel() for p in self.gate_mlp.parameters())
+        n_total = sum(p.numel() for p in self.parameters())
+        P3P4FiLMFusionDecoder._logger.log_info(
+            "init", f"P3P4FiLMFusionDecoder (adaptive gate): {n_total:,} params "
+            f"(Gate MLP: {n_gate:,})"
+        )
+
+    def forward(self, query_p3, query_p4, fg_prototype, target_size=None):
+        # Project to same channel space
+        f3 = self.proj_p3(query_p3)  # [B, fusion_dim, H/8, W/8]
+        f4 = self.proj_p4(F.interpolate(query_p4, size=query_p3.shape[2:],
+                          mode="bilinear", align_corners=False))
+
+        # Prototype-guided gated fusion: α·P3 + (1-α)·P4
+        if fg_prototype is not None and fg_prototype.abs().sum() > 1e-8:
+            alpha = self.gate_mlp(fg_prototype)  # [fusion_dim]
+            fused = alpha[None, :, None, None] * f3 + (1 - alpha)[None, :, None, None] * f4
+        else:
+            fused = 0.5 * f3 + 0.5 * f4  # fallback: equal weight
+
+        # FiLM modulation
+        if fg_prototype is not None and fg_prototype.abs().sum() > 1e-8:
+            film_out = self.film_mlp(fg_prototype)
+            gamma, beta = film_out.chunk(2, dim=0)
+            fused = gamma[None, :, None, None] * fused + beta[None, :, None, None]
+
+        # Upsample: H/8 → H/4 → H/2 → H
+        x = self.up1(fused)
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = self.up2(x)
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = self.up3(x)
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = self.mask_head(x)
+
+        if target_size is not None:
+            x = F.interpolate(x, size=target_size, mode="bilinear", align_corners=False)
+        return x
+
+
 class ContrastiveProtoDecoder(nn.Module):
     """
     Contrastive Prototype Decoder | 对比原型解码器.
@@ -279,7 +376,7 @@ def build_decoder(method: str, **kwargs) -> nn.Module:
     Decoder factory | 解码器工厂.
 
     :param method: 'baseline' | 'film' | 'crossattn' | 'contrastive'
-    :param kwargs: passed to decoder constructor (e.g. num_prototypes for crossattn)
+    :param kwargs: passed to decoder constructor (e.g. num_prototypes, feat_dim)
     """
     if method == "baseline":
         return ProtoRefineDecoder(
@@ -295,6 +392,12 @@ def build_decoder(method: str, **kwargs) -> nn.Module:
             feat_dim=kwargs.get("feat_dim", 1280),
             proj_dim=kwargs.get("proj_dim", 256),
             temperature=kwargs.get("temperature", 0.1))
+    elif method == "p3p4film":
+        return P3P4FiLMFusionDecoder(
+            feat_dim_p3=kwargs.get("feat_dim_p3", 640),
+            feat_dim_p4=kwargs.get("feat_dim_p4", 1280),
+            fusion_dim=kwargs.get("fusion_dim", 256),
+            proto_dim=kwargs.get("feat_dim_p4", 1280))
     else:
         raise ValueError(f"Unknown decoder: {method}")
 
@@ -302,6 +405,40 @@ def build_decoder(method: str, **kwargs) -> nn.Module:
 # ═══════════════════════════════════════════════════════════════════
 # Binary IoU | 二值 IoU
 # ═══════════════════════════════════════════════════════════════════
+
+def _decoder_forward(decoder, backbone, query_img, fg_prototype, target_size,
+                     feature_level="p4"):
+    """统一的 decoder 前向调用, 处理单层和 p3p4 融合 | Unified decoder forward."""
+    feats = backbone(query_img)
+    if feature_level == "p3p4":
+        return decoder(feats["p3"], feats["p4"], fg_prototype, target_size=target_size)
+    else:
+        return decoder(feats[feature_level], fg_prototype, target_size=target_size)
+
+
+def _extract_prototype(backbone, support_imgs, support_masks, feature_level, num_proto):
+    """提取 prototype, 处理单层和 p3p4 | Extract prototype for single or fusion."""
+    feats = backbone(support_imgs)
+    if feature_level == "p3p4":
+        support_feats_list = [feats["p4"][i] for i in range(len(support_masks))]
+    else:
+        support_feats_list = [feats[feature_level][i] for i in range(len(support_masks))]
+
+    if num_proto > 1:
+        proto = compute_multi_prototype(support_feats_list, support_masks,
+                                        num_prototypes=num_proto)
+    else:
+        proto = compute_fg_prototype(support_feats_list, support_masks)
+    return proto
+
+
+def _extract_feats_for_proto(backbone, support_imgs, feature_level):
+    """从 backbone 提取用于 prototype 的特征列表 | Extract feature list for proto."""
+    feats = backbone(support_imgs)
+    if feature_level == "p3p4":
+        return [feats["p4"][i] for i in range(len(support_imgs))]
+    return [feats[feature_level][i] for i in range(len(support_imgs))]
+
 
 def binary_iou(pred: torch.Tensor, gt: torch.Tensor) -> float:
     inter = (pred & gt).sum().item()
@@ -332,45 +469,53 @@ def focal_dice_loss(logit: torch.Tensor, target: torch.Tensor,
 
 def train_episode(decoder, backbone, support_idxs, query_idx,
                   train_ds, val_ds, query_class, device, opt,
-                  scaler=None, grad_clip=1.0, use_amp=False):
-    """Single training episode: Support -> proto -> query -> loss -> backward."""
-    # Support
+                  scaler=None, grad_clip=1.0, use_amp=False,
+                  feature_level="p4"):
+    """Single training episode: Support -> proto -> query -> loss -> backward.
+
+    Returns: (loss: float, timing: dict) or (None, None) if empty prototype.
+    """
+    t0 = time.perf_counter()
+
+    # Support — image loading + mask rendering
     support_imgs = torch.stack([train_ds.load_image(si) for si in support_idxs]).to(device)
     support_masks = [train_ds.render_class_mask(si, query_class).to(device)
                      for si in support_idxs]
+    t_load_support = time.perf_counter()
 
-    # Query
+    # Query — image loading + mask rendering
     query_img = val_ds.load_image(query_idx).unsqueeze(0).to(device)
     query_mask = val_ds.render_class_mask(query_idx, query_class)
     query_mask = query_mask.unsqueeze(0).unsqueeze(0).to(device)  # [1,1,H,W]
+    t_load_query = time.perf_counter()
 
     # Forward - support + query backbone (no grad on frozen backbone)
     with torch.no_grad():
-        support_feats = backbone(support_imgs)
-        support_p4s = [support_feats["p4"][i] for i in range(len(support_idxs))]
         num_proto = getattr(decoder, 'num_prototypes', 1)
-        if num_proto > 1:
-            fg_proto = compute_multi_prototype(support_p4s, support_masks,
-                                                num_prototypes=num_proto)
-        else:
-            fg_proto = compute_fg_prototype(support_p4s, support_masks)
+        fg_proto = _extract_prototype(backbone, support_imgs, support_masks,
+                                      feature_level, num_proto)
+        t_proto = time.perf_counter()
 
         # Check empty prototype
         if fg_proto.dim() == 1 and fg_proto.sum() == 0:
-            return None
+            return None, None
         if fg_proto.dim() == 2 and fg_proto.sum() == 0:
-            return None
+            return None, None
 
-        query_p4 = backbone(query_img)["p4"]
+    t_backbone_support = time.perf_counter()
 
     # Forward - query decoder (grad only through decoder)
+    tsize = tuple(query_mask.shape[2:])
     if use_amp:
         with torch.amp.autocast(device.type):
-            logit = decoder(query_p4, fg_proto, target_size=tuple(query_mask.shape[2:]))
+            logit = _decoder_forward(decoder, backbone, query_img, fg_proto,
+                                     tsize, feature_level)
             loss, components = focal_dice_loss(logit, query_mask)
     else:
-        logit = decoder(query_p4, fg_proto, target_size=tuple(query_mask.shape[2:]))
+        logit = _decoder_forward(decoder, backbone, query_img, fg_proto,
+                                 tsize, feature_level)
         loss, components = focal_dice_loss(logit, query_mask)
+    t_decoder = time.perf_counter()
 
     opt.zero_grad()
     if scaler is not None:
@@ -383,14 +528,22 @@ def train_episode(decoder, backbone, support_idxs, query_idx,
         loss.backward()
         torch.nn.utils.clip_grad_norm_(decoder.parameters(), grad_clip)
         opt.step()
+    t_backward = time.perf_counter()
 
-    return loss.item()
+    timing = {
+        "load_support": t_load_support - t0,
+        "load_query": t_load_query - t_load_support,
+        "backbone_proto": t_proto - t_load_query,
+        "decoder_bw": t_backward - t_proto,
+    }
+    return loss.item(), timing
 
 
 @torch.no_grad()
 def validate_all_classes_batched(decoder, backbone, train_ds, val_ds,
                                   target_classes, shot, device, rng,
-                                  n_val_per_class=10, batch_size=32):
+                                  n_val_per_class=10, batch_size=32,
+                                  feature_level="p4"):
     """
     批量验证所有类 | Batched validation for all classes.
 
@@ -400,6 +553,7 @@ def validate_all_classes_batched(decoder, backbone, train_ds, val_ds,
     加速比 | Speedup: ~5-10× for validation phase (90→1 backbone forwards per epoch).
     """
     num_proto = getattr(decoder, 'num_prototypes', 1)
+    t_start = time.perf_counter()
 
     # Phase 1: 预采样所有 episode 的 (support_idxs, query_idx, class)
     # Pre-sample all episodes: (support_idxs, query_idx, class)
@@ -415,7 +569,10 @@ def validate_all_classes_batched(decoder, backbone, train_ds, val_ds,
             episodes.append((s_idxs, q_idx, cls_id))
 
     if not episodes:
-        return {c: 0.0 for c in target_classes}
+        return ({c: 0.0 for c in target_classes},
+                {"sample": 0, "load_backbone": 0, "decoder": 0, "n_images": 0, "n_episodes": 0})
+
+    t_phase1_done = time.perf_counter()
 
     # Phase 2: 收集 train/val unique tile indices + 加载图像 + backbone forward
     # Collect train/val unique tile indices (separate index spaces!) + backbone forward
@@ -427,6 +584,7 @@ def validate_all_classes_batched(decoder, backbone, train_ds, val_ds,
 
     # 分别加载 train/val 图像并过 backbone | Load train/val images separately
     tile_to_p4 = {}  # (ds, tile_idx) -> P4 tensor, ds: 'train' or 'val'
+    n_images_total = 0
 
     for ds_tag, ds, tile_set in [("train", train_ds, train_tiles),
                                   ("val", val_ds, val_tiles)]:
@@ -434,9 +592,14 @@ def validate_all_classes_batched(decoder, backbone, train_ds, val_ds,
         for batch_start in range(0, len(unique_tiles), batch_size):
             batch_tiles = unique_tiles[batch_start:batch_start + batch_size]
             batch_imgs = torch.stack([ds.load_image(ti) for ti in batch_tiles]).to(device)
-            batch_feats = backbone(batch_imgs)["p4"]
+            batch_feats = backbone(batch_imgs)
             for i, ti in enumerate(batch_tiles):
-                tile_to_p4[(ds_tag, ti)] = batch_feats[i]  # [1280, 56, 56]
+                if feature_level == "p3p4":
+                    tile_to_p4[(ds_tag, ti)] = (batch_feats["p3"][i], batch_feats["p4"][i])
+                else:
+                    tile_to_p4[(ds_tag, ti)] = batch_feats[feature_level][i]
+            n_images_total += len(batch_tiles)
+    t_phase2_done = time.perf_counter()
 
     # Phase 3: 计算 prototypes + decoder forward + IoU
     # Compute prototypes + decoder forward + IoU per episode
@@ -451,7 +614,12 @@ def validate_all_classes_batched(decoder, backbone, train_ds, val_ds,
 
         for s_idxs, q_idx, cls_id in batch_eps:
             # Support → prototype (indices from train_ds)
-            s_p4s = [tile_to_p4[("train", si)] for si in s_idxs]
+            # For p3p4: use P4 features for prototype (stronger semantics)
+            raw_s = [tile_to_p4[("train", si)] for si in s_idxs]
+            if feature_level == "p3p4":
+                s_p4s = [r[1] for r in raw_s]  # P4 from (p3, p4) tuple
+            else:
+                s_p4s = raw_s
             s_masks = [train_ds.render_class_mask(si, cls_id).to(device) for si in s_idxs]
 
             if num_proto > 1:
@@ -476,27 +644,37 @@ def validate_all_classes_batched(decoder, backbone, train_ds, val_ds,
         if not query_p4s:
             continue
 
-        # Batch query_p4s: list of [1280,56,56] → [B,1280,56,56]
-        q_p4_batch = torch.stack(query_p4s)
-        q_mask_batch = torch.stack(query_masks).unsqueeze(1)  # [B,1,H,W]
-
         # Decoder — process one at a time since prototypes differ
-        # (each episode has different prototype, can't batch decoder easily)
-        for i, (proto, q_p4, q_mask, cls_id) in enumerate(
-            zip(proto_list, query_p4s, query_masks, query_classes)):
-            logit = decoder(q_p4.unsqueeze(0), proto,
-                          target_size=tuple(q_mask.shape))
+        for proto, q_p4, q_mask, cls_id in zip(proto_list, query_p4s, query_masks, query_classes):
+            tsize = tuple(q_mask.shape)
+            if feature_level == "p3p4":
+                q_p3, q_p4_single = q_p4
+                logit = decoder(q_p3.unsqueeze(0), q_p4_single.unsqueeze(0),
+                              proto, target_size=tsize)
+            else:
+                logit = decoder(q_p4.unsqueeze(0), proto, target_size=tsize)
             pred = (logit.squeeze(0).squeeze(0).cpu() > 0)
             gt = (q_mask.cpu() > 0)
             per_cls_ious[cls_id].append(binary_iou(pred, gt))
 
-    return {c: float(np.mean(per_cls_ious[c])) if per_cls_ious[c] else 0.0
-            for c in target_classes}
+    t_phase3_done = time.perf_counter()
+
+    timing = {
+        "sample": t_phase1_done - t_start,
+        "load_backbone": t_phase2_done - t_phase1_done,
+        "decoder": t_phase3_done - t_phase2_done,
+        "total": t_phase3_done - t_start,
+        "n_images": n_images_total,
+        "n_episodes": len(episodes),
+    }
+
+    return ({c: float(np.mean(per_cls_ious[c])) if per_cls_ious[c] else 0.0
+             for c in target_classes}, timing)
 
 
 @torch.no_grad()
 def validate_episode(decoder, backbone, train_ds, val_ds, query_class,
-                     shot, device, rng, n_val=30):
+                     shot, device, rng, n_val=30, feature_level="p4"):
     """Validation: fixed episodes per class (legacy, use validate_all_classes_batched)."""
     train_candidates = train_ds.class_to_images(query_class)
     val_candidates = val_ds.class_to_images(query_class)
@@ -517,7 +695,7 @@ def validate_episode(decoder, backbone, train_ds, val_ds, query_class,
         query_img = val_ds.load_image(qi).unsqueeze(0).to(device)
         query_mask = val_ds.render_class_mask(qi, query_class).to(device)
 
-        support_p4s = [backbone(support_imgs)["p4"][i] for i in range(len(support_idxs))]
+        support_p4s = _extract_feats_for_proto(backbone, support_imgs, feature_level)
         if num_proto > 1:
             fg_proto = compute_multi_prototype(support_p4s, support_masks,
                                                 num_prototypes=num_proto)
@@ -531,8 +709,9 @@ def validate_episode(decoder, backbone, train_ds, val_ds, query_class,
                 n_skipped += 1
                 continue
 
-        logit = decoder(backbone(query_img)["p4"], fg_proto,
-                       target_size=tuple(query_mask.shape))
+        logit = _decoder_forward(decoder, backbone, query_img, fg_proto,
+                       target_size=tuple(query_mask.shape),
+                       feature_level=feature_level)
         pred = (logit.squeeze(0).squeeze(0).cpu() > 0)
         gt = (query_mask.cpu() > 0)
         ious.append(binary_iou(pred, gt))
@@ -544,7 +723,8 @@ def validate_episode(decoder, backbone, train_ds, val_ds, query_class,
 
 @torch.no_grad()
 def evaluate_full(decoder, backbone, train_ds, val_ds, device,
-                  shot, n_episodes, target_classes, logger, tag):
+                  shot, n_episodes, target_classes, logger, tag,
+                  feature_level="p4"):
     """Full evaluation post-training with per-class + group breakdown."""
     num_proto = getattr(decoder, 'num_prototypes', 1)
     class_to_images = {c: train_ds.class_to_images(c) for c in target_classes}
@@ -573,7 +753,7 @@ def evaluate_full(decoder, backbone, train_ds, val_ds, device,
         query_img = val_ds.load_image(qi).unsqueeze(0).to(device)
         query_mask = val_ds.render_class_mask(qi, query_class).to(device)
 
-        support_p4s = [backbone(support_imgs)["p4"][i] for i in range(len(support_idxs))]
+        support_p4s = _extract_feats_for_proto(backbone, support_imgs, feature_level)
         if num_proto > 1:
             fg_proto = compute_multi_prototype(support_p4s, support_masks,
                                                 num_prototypes=num_proto)
@@ -585,8 +765,9 @@ def evaluate_full(decoder, backbone, train_ds, val_ds, device,
             if fg_proto.sum() == 0:
                 continue
 
-        logit = decoder(backbone(query_img)["p4"], fg_proto,
-                       target_size=tuple(query_mask.shape))
+        logit = _decoder_forward(decoder, backbone, query_img, fg_proto,
+                       target_size=tuple(query_mask.shape),
+                       feature_level=feature_level)
         pred = (logit.squeeze(0).squeeze(0).cpu() > 0)
         gt = (query_mask.cpu() > 0)
         iou = binary_iou(pred, gt)
@@ -639,12 +820,165 @@ def evaluate_full(decoder, backbone, train_ds, val_ds, device,
     return result
 
 # ═══════════════════════════════════════════════════════════════════
+# Timing Helper | 计时工具
+# ═══════════════════════════════════════════════════════════════════
+
+def _log_timing_summary(logger, tag, timing_accum, dt_total, n_epochs):
+    """打印计时总结 | Print timing breakdown summary."""
+    logger.log_info(f"{tag}/timing", f"\n{'='*60}")
+    logger.log_info(f"{tag}/timing", f"  TIMING BREAKDOWN ({n_epochs} epochs, {dt_total:.0f}s total)")
+    logger.log_info(f"{tag}/timing", f"{'='*60}")
+
+    # Train sub-steps (per-epoch average)
+    logger.log_info(f"{tag}/timing", f"  ── Train per epoch (avg) ──")
+    train_keys = [k for k in sorted(timing_accum) if k.startswith("train_")]
+    for k in train_keys:
+        step_name = k.replace("train_", "  ")
+        avg_s = timing_accum[k] / n_epochs
+        pct = timing_accum[k] / dt_total * 100 if dt_total > 0 else 0
+        logger.log_info(f"{tag}/timing", f"  {step_name:<25s}: {avg_s:7.1f}s/epoch ({pct:5.1f}%)")
+
+    # Val sub-steps (per-epoch average)
+    val_keys = [k for k in sorted(timing_accum) if k.startswith("val_")]
+    if val_keys:
+        logger.log_info(f"{tag}/timing", f"  ── Val per epoch (avg) ──")
+        for k in val_keys:
+            step_name = k.replace("val_", "  ")
+            avg_s = timing_accum[k] / n_epochs
+            pct = timing_accum[k] / dt_total * 100 if dt_total > 0 else 0
+            logger.log_info(f"{tag}/timing", f"  {step_name:<25s}: {avg_s:7.1f}s/epoch ({pct:5.1f}%)")
+
+    # Totals
+    total_train = sum(timing_accum[k] for k in train_keys)
+    total_val = sum(timing_accum[k] for k in val_keys)
+    logger.log_info(f"{tag}/timing", f"  ── Totals ──")
+    logger.log_info(f"{tag}/timing", f"  {'train_total':<25s}: {total_train:7.0f}s ({total_train/dt_total*100:5.1f}%)")
+    logger.log_info(f"{tag}/timing", f"  {'val_total':<25s}: {total_val:7.0f}s ({total_val/dt_total*100:5.1f}%)")
+    logger.log_info(f"{tag}/timing", f"  {'TOTAL':<25s}: {dt_total:7.0f}s")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Oracle Analysis & Learning Curves | Oracle分析与学习曲线
+# ═══════════════════════════════════════════════════════════════════
+
+def _log_oracle_gap(logger, tag, oracle_per_cls, final_per_cls, target_classes, best_miou):
+    """报告Oracle差距: 每类最佳epoch vs mIoU最佳epoch | Oracle gap analysis."""
+    logger.log_info(f"{tag}/oracle", f"\n{'='*60}")
+    logger.log_info(f"{tag}/oracle", "  ORACLE ANALYSIS — Per-Class Best vs mIoU-Best")
+    logger.log_info(f"{tag}/oracle", f"{'='*60}")
+    logger.log_info(f"{tag}/oracle",
+                   f"  {'Class':<22} {'Oracle':>8} {'@mIoU-best':>8} {'Gap':>8} {'Best Ep':>8}")
+    logger.log_info(f"{tag}/oracle", f"  {'-'*22} {'-'*8} {'-'*8} {'-'*8} {'-'*8}")
+
+    oracle_miou = 0.0
+    n_cls = 0
+    biases = []
+    for cls_id in sorted(oracle_per_cls.keys()):
+        cls_name = target_classes.get(cls_id, f"class_{cls_id}")
+        oracle_val = oracle_per_cls[cls_id]
+        final_val = final_per_cls.get(cls_id, 0.0)
+        gap = oracle_val - final_val
+        oracle_miou += oracle_val
+        n_cls += 1
+        biases.append((cls_name, gap))
+        logger.log_info(f"{tag}/oracle",
+                       f"  {cls_name:<22} {oracle_val*100:>7.2f}% {final_val*100:>7.2f}% "
+                       f"{gap*100:>+7.2f}% {'':>8}")
+
+    oracle_miou /= max(n_cls, 1)
+    bias_gap = oracle_miou - best_miou
+    logger.log_info(f"{tag}/oracle", f"  {'─'*54}")
+    logger.log_info(f"{tag}/oracle",
+                   f"  {'Oracle mIoU':<22} {oracle_miou*100:>7.2f}%  "
+                   f"(+{bias_gap*100:.2f}% vs best)")
+    logger.log_info(f"{tag}/oracle", f"  {'Best mIoU':<22} {best_miou*100:>7.2f}%")
+    logger.log_info(f"{tag}/oracle",
+                   f"  {'Optimization Bias':<22} {bias_gap*100:>7.2f}%  "
+                   f"← per-class gap due to mIoU selection")
+
+    # Biggest victims
+    biases.sort(key=lambda x: -x[1])
+    logger.log_info(f"{tag}/oracle", f"  Top victims of mIoU selection bias:")
+    for name, gap in biases[:3]:
+        logger.log_info(f"{tag}/oracle", f"    {name}: oracle better by {gap*100:+.1f}%")
+
+    return oracle_miou, bias_gap
+
+
+def _plot_learning_curves(metrics_path, output_dir, decoder_type, shot, target_classes):
+    """绘制每类学习曲线 | Plot per-class learning curves."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+
+    import json as _json
+    with open(metrics_path) as f:
+        lines = f.readlines()
+    if not lines:
+        return
+    epochs_data = [_json.loads(l) for l in lines]
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 5.5))
+
+    # — Left: Per-class IoU curves —
+    ax = axes[0]
+    colors = plt.cm.tab10.colors
+    for i, cls_id in enumerate(sorted(target_classes.keys())):
+        vals = [e["per_cls"].get(str(cls_id), 0) * 100 for e in epochs_data]
+        if max(vals) < 0.1:
+            continue
+        name = target_classes[cls_id].replace("_", " ")
+        color = colors[i % len(colors)]
+        ax.plot(range(1, len(vals) + 1), vals, color=color, linewidth=1.2, alpha=0.8, label=name)
+        # Mark best epoch
+        best_i = max(range(len(vals)), key=lambda j: vals[j])
+        ax.scatter(best_i + 1, vals[best_i], color=color, s=30, zorder=5, edgecolors="white", linewidth=0.5)
+
+    ax.set_xlabel("Epoch", fontsize=10)
+    ax.set_ylabel("Validation IoU (%)", fontsize=10)
+    ax.set_title(f"Per-Class Learning Curves ({decoder_type} {shot}-shot)", fontsize=11, fontweight="bold")
+    ax.legend(fontsize=6, ncol=2, loc="lower right")
+    ax.grid(True, alpha=0.3)
+
+    # — Right: mIoU + Optimization Bias —
+    ax2 = axes[1]
+    mious = [e["val_miou"] * 100 for e in epochs_data]
+    ax2.plot(range(1, len(mious) + 1), mious, color="black", linewidth=2, label="mIoU (best)")
+    ax2.scatter(max(range(len(mious)), key=lambda j: mious[j]) + 1,
+               max(mious), color="black", s=60, zorder=5, marker="*",
+               edgecolors="white", linewidth=1)
+
+    # Highlight the gap: mark the epoch range where small classes peaked vs mIoU peaked
+    best_miou_ep = max(range(len(mious)), key=lambda j: mious[j]) + 1
+    ax2.axvline(x=best_miou_ep, color="gray", linestyle="--", alpha=0.5, linewidth=1,
+               label=f"mIoU best (E{best_miou_ep})")
+
+    ax2.set_xlabel("Epoch", fontsize=10)
+    ax2.set_ylabel("mIoU (%)", fontsize=10)
+    ax2.set_title(f"mIoU vs Optimization Bias ({decoder_type} {shot}-shot)", fontsize=11, fontweight="bold")
+    ax2.legend(fontsize=7)
+    ax2.grid(True, alpha=0.3)
+
+    fig.suptitle(f"Learning Dynamics Analysis — {decoder_type} {shot}-shot",
+                fontsize=13, fontweight="bold", y=1.01)
+    plt.tight_layout()
+
+    plot_path = Path(output_dir) / f"learning_curves_{decoder_type}_{shot}shot.png"
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Main Training Loop | 主训练循环
 # ═══════════════════════════════════════════════════════════════════
 
 def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
                        shot, target_classes, args, logger, output_dir,
-                       decoder_type: str = "unknown"):
+                       decoder_type: str = "unknown",
+                       feature_level: str = "p4"):
     """Full training + evaluation pipeline."""
     tag = f"c04/{decoder_type}/{shot}shot"
     n_classes = len(target_classes)
@@ -713,21 +1047,39 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
         logger.log_info(f"{tag}/classes",
                        f"    {c:2d} {name:<20} {cnt:4d} imgs  p={prob_str}{marker}")
 
+    # ── EMA Model | 指数移动平均 ──
+    # EMA stabilizes few-shot training by smoothing weight updates across episodes
+    ema_decay = getattr(args, 'ema_decay', 0.999)
+    ema_state = {k: v.clone() for k, v in decoder.state_dict().items()} if ema_decay > 0 else None
+
+    # ── SWA config | 随机权重平均 ──
+    swa_start = getattr(args, 'swa_start_epoch', 0)
+    if swa_start <= 0:
+        swa_start = max(1, int(args.epochs * 0.6))  # auto: start at 60% of training
+    swa_state = None
+    swa_n = 0
+    logger.log_info(f"{tag}/train",
+                   f"EMA decay={ema_decay}, SWA start=E{swa_start}")
+
     # Training State
     best_val_miou = 0.0
     best_state = None
+    best_ema_miou = 0.0
+    best_ema_state = None
     best_per_cls_state = {}
     best_per_cls_iou = defaultdict(float)
     metrics_path = output_dir / f"decoder_{decoder_type}_{shot}shot_metrics.jsonl"
     rng = np.random.RandomState(args.seed)
-    rng_val = np.random.RandomState(args.seed + 1)  # 独立 rng: validation 不影响 training 随机序列
+    rng_val = np.random.RandomState(args.seed + 1)
 
     class_list = list(valid_classes.keys())
     class_sample_probs = [class_probs[c] for c in class_list]
 
     t0 = time.perf_counter()
+    timing_accum = defaultdict(float)
 
     for epoch in range(1, args.epochs + 1):
+        t_epoch_start = time.perf_counter()
         decoder.train()
         total_loss, n_eps, n_empty = 0.0, 0, 0
 
@@ -743,17 +1095,20 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
             support_idxs = rng.choice(candidates, shot, replace=False)
             qi = int(rng.choice(val_candidates))
 
-            loss = train_episode(decoder, backbone, support_idxs, qi,
+            loss, ep_timing = train_episode(decoder, backbone, support_idxs, qi,
                                 train_ds, val_ds, query_class, device, opt,
                                 scaler=scaler, grad_clip=args.grad_clip,
-                                use_amp=use_amp)
+                                use_amp=use_amp, feature_level=feature_level)
             if loss is not None:
                 total_loss += loss
                 n_eps += 1
                 pbar.set_postfix({"loss": f"{loss:.4f}"})
+                for k, v in ep_timing.items():
+                    timing_accum[f"train_{k}"] += v
             else:
                 n_empty += 1
 
+        t_train_done = time.perf_counter()
         sch.step()
         avg_loss = total_loss / max(n_eps, 1)
 
@@ -766,21 +1121,46 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
         # Per-class validation — batched: one backbone forward for all episodes
         # 批量验证: 所有 episode 共享一次 backbone forward
         decoder.eval()
-        per_cls_val = validate_all_classes_batched(
+        per_cls_val, val_timing = validate_all_classes_batched(
             decoder, backbone, train_ds, val_ds,
             valid_classes, shot, device, rng_val,
             n_val_per_class=args.val_episodes_per_class,
-            batch_size=args.val_batch_size)
+            batch_size=args.val_batch_size,
+            feature_level=feature_level)
+        for k, v in val_timing.items():
+            timing_accum[f"val_{k}"] += v
         for cls_id in zero_shot_classes:
             per_cls_val[cls_id] = 0.0
 
         mval = float(np.mean(list(per_cls_val.values())))
+        t_epoch_done = time.perf_counter()
+
+        # ── EMA Update | 指数移动平均更新 ──
+        if ema_state is not None:
+            alpha = min(1.0 - 1.0 / (epoch + 1), ema_decay)
+            for k in ema_state:
+                ema_state[k] = alpha * ema_state[k] + (1 - alpha) * decoder.state_dict()[k]
+
+        # ── SWA Update | 随机权重平均 ──
+        if epoch >= swa_start:
+            if swa_state is None:
+                swa_state = {k: v.clone() for k, v in decoder.state_dict().items()}
+                swa_n = 1
+            else:
+                for k in swa_state:
+                    swa_state[k] = (swa_state[k] * swa_n + decoder.state_dict()[k]) / (swa_n + 1)
+                swa_n += 1
 
         # Per-class best saving
         for cls_id, val_iou in per_cls_val.items():
             if val_iou > best_per_cls_iou[cls_id]:
                 best_per_cls_iou[cls_id] = val_iou
                 best_per_cls_state[cls_id] = {k: v.clone() for k, v in decoder.state_dict().items()}
+
+        # Timing for this epoch
+        t_epoch_train = t_train_done - t_epoch_start
+        t_epoch_val = t_epoch_done - t_train_done
+        t_epoch_total = t_epoch_done - t_epoch_start
 
         # Log
         cls_str = ", ".join(f"{target_classes[c][:8]}={per_cls_val[c]:.4f}"
@@ -790,6 +1170,7 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
         logger.log_info(f"{tag}/train",
                        f"E{epoch:3d}/{args.epochs} loss={avg_loss:.4f} "
                        f"val_mIoU={mval:.4f} lr={sch.get_last_lr()[0]:.2e} "
+                       f"train={t_epoch_train:.1f}s val={t_epoch_val:.1f}s "
                        f"({cls_str})")
 
         epoch_metrics = {
@@ -811,10 +1192,57 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
     logger.log_info(f"{tag}/best",
                    f"Best overall val mIoU={best_val_miou:.4f} ({dt_train:.0f}s training)")
 
-    # Save per-class best states
+    # ── 计时总结 | Timing Summary ──
+    _log_timing_summary(logger, tag, timing_accum, dt_train, args.epochs)
+
+    # ── EMA Evaluation | EMA 模型评估 ──
+    ema_result = None
+    if ema_state is not None:
+        ema_backup = {k: v.clone() for k, v in decoder.state_dict().items()}
+        decoder.load_state_dict(ema_state)
+        decoder.eval()
+        logger.log_info(f"{tag}/ema", "Evaluating EMA model...")
+        ema_result = evaluate_full(decoder, backbone, train_ds, val_ds, device,
+                                   shot, args.eval_episodes, target_classes,
+                                   logger, f"{tag}/ema",
+                                   feature_level=feature_level)
+        decoder.load_state_dict(ema_backup)
+        logger.log_info(f"{tag}/ema",
+                       f"EMA mIoU={ema_result['miou_mean']*100:.2f}% "
+                       f"(vs best_val={best_val_miou*100:.2f}%, "
+                       f"delta={ema_result['miou_mean']-best_val_miou:+4f})")
+
+    # ── SWA Evaluation | SWA 模型评估 ──
+    swa_result = None
+    if swa_state is not None and swa_n >= 3:
+        swa_backup = {k: v.clone() for k, v in decoder.state_dict().items()}
+        decoder.load_state_dict(swa_state)
+        decoder.eval()
+        logger.log_info(f"{tag}/swa", f"Evaluating SWA model (n={swa_n} epochs)...")
+        swa_result = evaluate_full(decoder, backbone, train_ds, val_ds, device,
+                                   shot, args.eval_episodes, target_classes,
+                                   logger, f"{tag}/swa",
+                                   feature_level=feature_level)
+        decoder.load_state_dict(swa_backup)
+        logger.log_info(f"{tag}/swa",
+                       f"SWA mIoU={swa_result['miou_mean']*100:.2f}% "
+                       f"(vs best_val={best_val_miou*100:.2f}%, "
+                       f"delta={swa_result['miou_mean']-best_val_miou:+4f})")
+
+    # Save per-class best states + oracle evaluation
+    # 保存每类最佳状态 + Oracle评估
+    oracle_per_cls = {}  # cls_id -> best val IoU ever achieved
     for cls_id, state in best_per_cls_state.items():
         cls_name = target_classes[cls_id]
         torch.save(state, str(output_dir / f"decoder_{decoder_type}_{shot}shot_best_c{cls_id}_{cls_name}.pt"))
+        oracle_per_cls[cls_id] = best_per_cls_iou[cls_id]
+
+    # ── Oracle Analysis: 报告 Optimization Bias | 优化偏差分析 ──
+    oracle_miou, bias_gap = _log_oracle_gap(logger, tag, oracle_per_cls, per_cls_val,
+                                             target_classes, best_val_miou)
+
+    # ── Learning Curves Plot | 学习曲线图 ──
+    _plot_learning_curves(metrics_path, output_dir, decoder_type, shot, target_classes)
 
     # Restore best overall
     if best_state:
@@ -824,12 +1252,19 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
     logger.log_info(f"{tag}/eval", "Evaluating best model...")
     result = evaluate_full(decoder, backbone, train_ds, val_ds, device,
                            shot, args.eval_episodes, target_classes,
-                           logger, f"{tag}/eval")
+                           logger, f"{tag}/eval",
+                           feature_level=feature_level)
 
     result["best_val_miou"] = best_val_miou
     result["per_cls_best"] = dict(best_per_cls_iou)
+    result["oracle_miou"] = oracle_miou
+    result["optimization_bias"] = bias_gap
     result["train_time_s"] = dt_train
     result["class_image_counts"] = class_image_counts
+    if ema_result is not None:
+        result["ema_miou"] = ema_result["miou_mean"]
+    if swa_result is not None:
+        result["swa_miou"] = swa_result["miou_mean"]
 
     return decoder, result, best_val_miou
 
@@ -872,8 +1307,8 @@ def parse_args():
     p.add_argument("--eval-episodes", type=int, default=200)
     p.add_argument("--val-episodes-per-class", type=int, default=10,
                    help="每类每 epoch 验证 episode 数 (默认 10, 30ep 已足够稳定)")
-    p.add_argument("--val-batch-size", type=int, default=32,
-                   help="批量验证时每批处理的图像数 (默认 32, 根据显存调整)")
+    p.add_argument("--val-batch-size", type=int, default=0,
+                   help="批量验证时每批处理的图像数 (0=auto: 6GB→4, 12GB→12, 24GB→32)")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--warmup-epochs", type=int, default=3)
@@ -894,6 +1329,9 @@ def parse_args():
     p.add_argument("--tile-stride", type=int, default=512)
     p.add_argument("--tile-cache-size", type=int, default=0,
                    help="Tile wrapper 原图 LRU 缓存大小 (0=auto: GPU VRAM/2GB, 默认 32)")
+    p.add_argument("--feature-level", type=str, default="p4",
+                   choices=["p3", "p4", "p8", "p3p4"],
+                   help="Backbone 特征层 | p3(stride=8), p4(stride=16), p8(stride=32), p3p4(fusion)")
     return p.parse_args()
 
 
@@ -937,6 +1375,24 @@ def main():
             args.tile_cache_size = 16
             logger.log_info("c04/config", "Auto tile-cache-size=16 (CPU mode)")
 
+    # Auto val batch size from VRAM | 根据显存自动选择验证批大小
+    if args.val_batch_size == 0:
+        if torch.cuda.is_available():
+            vram_gb = torch.cuda.get_device_properties(device).total_memory / (1024**3)
+            # p3p4 stores 2× features per tile → halve batch size
+            mem_factor = 0.5 if args.feature_level == "p3p4" else 1.0
+            if vram_gb <= 6:
+                args.val_batch_size = max(2, int(4 * mem_factor))
+            elif vram_gb <= 12:
+                args.val_batch_size = max(4, int(12 * mem_factor))
+            else:
+                args.val_batch_size = max(8, int(32 * mem_factor))
+            logger.log_info("c04/config",
+                           f"Auto val-batch-size={args.val_batch_size} (VRAM={vram_gb:.1f}GB"
+                           f"{', p3p4 halved' if mem_factor<1 else ''})")
+        else:
+            args.val_batch_size = 2
+
     # Load data
     train_ds = ISAIDInstanceDataset(args.src_root, split="train")
     val_ds = ISAIDInstanceDataset(args.src_root, split="val")
@@ -968,6 +1424,22 @@ def main():
     backbone = FastSAMBackbone(freeze_backbone=True).to(device).eval()
     logger.log_info("c04/model", f"FastSAM backbone (frozen) on {device}")
 
+    # 特征层级 + 自动检测通道数 | Feature level + auto-detect feat_dim
+    feature_level = args.feature_level
+    with torch.no_grad():
+        dummy = torch.randn(1, 3, 896, 896).to(device)
+        probe = backbone(dummy)
+        if feature_level == "p3p4":
+            feat_dim_p3 = probe["p3"].shape[1]
+            feat_dim_p4 = probe["p4"].shape[1]
+            feat_dim = feat_dim_p3  # for logging; actual dims passed to decoder
+            logger.log_info("c04/model",
+                           f"Feature level: p3p4 fusion, p3_dim={feat_dim_p3}, p4_dim={feat_dim_p4}")
+        else:
+            feat_dim = probe[feature_level].shape[1]
+            logger.log_info("c04/model",
+                           f"Feature level: {feature_level}, feat_dim={feat_dim}")
+
     # Non-Parametric Baseline
     if args.non_parametric:
         logger.log_info("c04/mode", "Non-parametric baseline (C-02A style)")
@@ -978,7 +1450,7 @@ def main():
             tag = f"c04/nonparam/{shot}shot"
             result = evaluate_full(model, backbone, train_ds, val_ds, device,
                                    shot, args.eval_episodes, target_classes,
-                                   logger, tag)
+                                   logger, tag, feature_level=feature_level)
             nonparam_results[f"{shot}shot"] = result
             logger.log_metric(f"c04/nonparam_miou_{shot}shot", result["miou_mean"],
                             tags=["c04", "nonparam", f"{shot}shot"])
@@ -1005,10 +1477,17 @@ def main():
         all_results[decoder_type] = {}
 
         for shot in shots:
-            decoder_kwargs = {}
+            # 当 feature_level=p3p4 时, 自动使用 p3p4film 解码器
+            actual_decoder = decoder_type
+            if feature_level == "p3p4" and decoder_type == "film":
+                actual_decoder = "p3p4film"
+            decoder_kwargs = {"feat_dim": feat_dim}
+            if feature_level == "p3p4":
+                decoder_kwargs["feat_dim_p3"] = feat_dim_p3
+                decoder_kwargs["feat_dim_p4"] = feat_dim_p4
             if decoder_type == "crossattn":
                 decoder_kwargs["num_prototypes"] = args.num_prototypes
-            decoder = build_decoder(decoder_type, **decoder_kwargs).to(device)
+            decoder = build_decoder(actual_decoder, **decoder_kwargs).to(device)
             n_params = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
             logger.log_info(f"c04/{decoder_type}/model",
                            f"{decoder_type} decoder: {n_params:,} trainable params")
@@ -1025,7 +1504,8 @@ def main():
                 decoder.eval()
                 result = evaluate_full(decoder, backbone, train_ds, val_ds, device,
                                        shot, args.eval_episodes, target_classes,
-                                       logger, f"c04/{decoder_type}/{shot}shot/eval")
+                                       logger, f"c04/{decoder_type}/{shot}shot/eval",
+                                       feature_level=feature_level)
                 all_results[decoder_type][f"{shot}shot"] = result
             else:
                 # ── 跳过已完成实验 | Skip already-completed experiments ──
@@ -1051,7 +1531,8 @@ def main():
                     decoder.eval()
                     result = evaluate_full(decoder, backbone, train_ds, val_ds, device,
                                            shot, args.eval_episodes, target_classes,
-                                           logger, f"c04/{decoder_type}/{shot}shot/eval")
+                                           logger, f"c04/{decoder_type}/{shot}shot/eval",
+                                           feature_level=feature_level)
                     all_results[decoder_type][f"{shot}shot"] = result
                     # 扫描所有 epoch 取最佳 | Scan all epochs for best val_mIoU
                     best_val = max(json.loads(l)["val_miou"] for l in lines)
@@ -1060,7 +1541,8 @@ def main():
                     decoder, result, best_val = train_and_evaluate(
                         decoder, backbone, train_ds, val_ds, device,
                         shot, target_classes, args, logger, output_dir,
-                        decoder_type=decoder_type)
+                        decoder_type=decoder_type,
+                        feature_level=feature_level)
                     all_results[decoder_type][f"{shot}shot"] = result
                 logger.log_metric(f"c04/{decoder_type}_miou_{shot}shot",
                                 result["miou_mean"],
@@ -1151,6 +1633,8 @@ def main():
                     "per_class_iou": r["per_class_iou"],
                     "group_stats": r.get("group_stats", {}),
                     "best_val_miou": r.get("best_val_miou", 0.0),
+                    "oracle_miou": r.get("oracle_miou", 0.0),
+                    "optimization_bias": r.get("optimization_bias", 0.0),
                     "train_time_s": r.get("train_time_s", 0.0),
                 }
 
