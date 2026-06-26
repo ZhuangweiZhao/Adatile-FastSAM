@@ -427,6 +427,10 @@ def _extract_prototype(backbone, support_imgs, support_masks, feature_level, num
     if num_proto > 1:
         proto = compute_multi_prototype(support_feats_list, support_masks,
                                         num_prototypes=num_proto)
+        # Average K prototypes → single vector for FiLM
+        # K-means centroids capture intra-class modes better than single mean
+        if proto.dim() == 2:
+            proto = proto.mean(dim=0)  # [K, C] → [C]
     else:
         proto = compute_fg_prototype(support_feats_list, support_masks)
     return proto
@@ -444,6 +448,18 @@ def binary_iou(pred: torch.Tensor, gt: torch.Tensor) -> float:
     inter = (pred & gt).sum().item()
     union = (pred | gt).sum().item()
     return inter / union if union > 0 else 0.0
+
+
+def binary_recall_precision(pred: torch.Tensor, gt: torch.Tensor):
+    """Compute pixel-level recall, precision, dice. | 像素级召回率/精确率/Dice."""
+    tp = (pred & gt).sum().item()
+    fp = (pred & ~gt).sum().item()
+    fn = (~pred & gt).sum().item()
+
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    dice = 2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) > 0 else 0.0
+    return recall, precision, dice
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -730,6 +746,7 @@ def evaluate_full(decoder, backbone, train_ds, val_ds, device,
     class_to_images = {c: train_ds.class_to_images(c) for c in target_classes}
     rng = np.random.RandomState(42)
     all_ious, per_cls_ious = [], defaultdict(list)
+    per_cls_recall, per_cls_precision, per_cls_dice = defaultdict(list), defaultdict(list), defaultdict(list)
     t0 = time.perf_counter()
     log_every = max(10, n_episodes // 10)
 
@@ -773,6 +790,11 @@ def evaluate_full(decoder, backbone, train_ds, val_ds, device,
         iou = binary_iou(pred, gt)
         all_ious.append(iou)
         per_cls_ious[query_class].append(iou)
+        # 累积 recall/precision/dice | accumulate for macro averaging
+        rec, prec, dice = binary_recall_precision(pred, gt)
+        per_cls_recall[query_class].append(rec)
+        per_cls_precision[query_class].append(prec)
+        per_cls_dice[query_class].append(dice)
 
         if (ep + 1) % log_every == 0 and all_ious:
             running = float(np.mean(all_ious[-log_every:]))
@@ -795,28 +817,42 @@ def evaluate_full(decoder, backbone, train_ds, val_ds, device,
             "n": len(group_ious),
         }
 
+    # Per-class IoU + Recall + Dice
+    per_cls_avg = {}
+    per_cls_recall_avg = {}
     for c in sorted(per_cls_ious.keys()):
         avg = float(np.mean(per_cls_ious[c]))
+        rec_avg = float(np.mean(per_cls_recall[c])) if per_cls_recall[c] else 0.0
+        prec_avg = float(np.mean(per_cls_precision[c])) if per_cls_precision[c] else 0.0
+        dice_avg = float(np.mean(per_cls_dice[c])) if per_cls_dice[c] else 0.0
         cls_name = target_classes.get(c, f"class_{c}")
         per_cls_avg[str(c)] = avg
+        per_cls_recall_avg[str(c)] = rec_avg
         logger.log_info(f"{tag}/per_cls",
-                       f"  {cls_name:<20} IoU={avg:.4f} ({len(per_cls_ious[c])} eps)")
+                       f"  {cls_name:<20} IoU={avg:.4f}  Rec={rec_avg:.4f}  Dice={dice_avg:.4f} "
+                       f"({len(per_cls_ious[c])} eps)")
 
     for group_name, stats in group_stats.items():
         logger.log_info(f"{tag}/groups",
                        f"  [{group_name}] mIoU={stats['miou']:.4f} ({stats['n']} eps)")
 
+    all_recall = [r for rr in per_cls_recall.values() for r in rr]
+    mrecall = float(np.mean(all_recall)) if all_recall else 0.0
+    logger.log_info(f"{tag}/done",
+                   f"  {shot}-shot: mIoU={float(np.mean(all_ious)):.4f}  "
+                   f"mRecall={mrecall:.4f}  "
+                   f"({len(all_ious)} eps, {dt:.0f}s)")
+
     result = {
         "miou_mean": float(np.mean(all_ious)) if all_ious else 0.0,
         "miou_std": float(np.std(all_ious)) if all_ious else 0.0,
+        "mrecall_mean": mrecall,
         "n_valid": len(all_ious),
         "per_class_iou": per_cls_avg,
+        "per_class_recall": per_cls_recall_avg,
         "group_stats": group_stats,
         "time_s": dt,
     }
-    logger.log_info(f"{tag}/done",
-                   f"  {shot}-shot: mIoU={result['miou_mean']:.4f} "
-                   f"({len(all_ious)} eps, {dt:.0f}s, {dt/max(len(all_ious),1):.2f}s/ep)")
     return result
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1322,7 +1358,7 @@ def parse_args():
                    default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num-prototypes", type=int, default=1,
-                   help="多原型数量 (仅 crossattn decoder, 默认 1=mean pool)")
+                   help="多原型数量 (K-means聚类, 1=mean pool. 适用所有decoder)")
     p.add_argument("--tile", action="store_true",
                    help="Tile 模式: 切分全图为 896x896 tiles (stride=512, overlap=384)")
     p.add_argument("--tile-size", type=int, default=896)
@@ -1485,8 +1521,8 @@ def main():
             if feature_level == "p3p4":
                 decoder_kwargs["feat_dim_p3"] = feat_dim_p3
                 decoder_kwargs["feat_dim_p4"] = feat_dim_p4
-            if decoder_type == "crossattn":
-                decoder_kwargs["num_prototypes"] = args.num_prototypes
+            # Multi-prototype: set on decoder for proto extraction, works for all decoders
+            decoder_kwargs["num_prototypes"] = args.num_prototypes
             decoder = build_decoder(actual_decoder, **decoder_kwargs).to(device)
             n_params = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
             logger.log_info(f"c04/{decoder_type}/model",
@@ -1558,7 +1594,7 @@ def main():
     logger.log_info("c04/summary", "="*90)
 
     short_classes = sorted(target_classes.keys())[:8]
-    header = f"  {'Decoder':<14} {'Shot':<8} {'mIoU':>10} {'+-std':>8}"
+    header = f"  {'Decoder':<14} {'Shot':<8} {'mIoU':>10} {'mRec':>10} {'+-std':>8}"
     for c in short_classes:
         header += f" {target_classes[c][:6]:>8}"
     if len(target_classes) > 8:
@@ -1578,7 +1614,8 @@ def main():
             if key not in all_results.get(decoder_type, {}):
                 continue
             r = all_results[decoder_type][key]
-            line = f"  {decoder_type:<14} {shot:<8} {r['miou_mean']*100:>9.2f}% {r['miou_std']*100:>7.2f}%"
+            mrec = r.get('mrecall_mean', 0) * 100
+            line = f"  {decoder_type:<14} {shot:<8} {r['miou_mean']*100:>9.2f}% {mrec:>9.2f}% {r['miou_std']*100:>7.2f}%"
             for c in short_classes:
                 pc = r["per_class_iou"].get(str(c), 0.0)
                 line += f" {pc*100:>7.2f}%"
@@ -1629,8 +1666,10 @@ def main():
                 summary["results"][decoder_type][key] = {
                     "miou_mean": r["miou_mean"],
                     "miou_std": r["miou_std"],
+                    "mrecall_mean": r.get("mrecall_mean", 0.0),
                     "n_valid": r["n_valid"],
                     "per_class_iou": r["per_class_iou"],
+                    "per_class_recall": r.get("per_class_recall", {}),
                     "group_stats": r.get("group_stats", {}),
                     "best_val_miou": r.get("best_val_miou", 0.0),
                     "oracle_miou": r.get("oracle_miou", 0.0),
