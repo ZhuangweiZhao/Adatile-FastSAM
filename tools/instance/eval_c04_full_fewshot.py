@@ -252,6 +252,14 @@ class P3P4FiLMFusionDecoder(nn.Module):
             nn.Linear(256, fusion_dim * 2),
         )
 
+        # Utilization Module: predict which features are under-utilized
+        self.util_conv = nn.Sequential(
+            nn.Conv2d(fusion_dim, 64, 3, padding=1, bias=False),
+            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+            nn.Conv2d(64, fusion_dim, 1, bias=False),
+            nn.Sigmoid(),  # per-channel utilization weight 0~1
+        )
+
         # Upsample path
         self.up1 = nn.Sequential(
             nn.Conv2d(fusion_dim, 128, 3, padding=1, bias=False),
@@ -286,6 +294,12 @@ class P3P4FiLMFusionDecoder(nn.Module):
             fused = alpha[None, :, None, None] * f3 + (1 - alpha)[None, :, None, None] * f4
         else:
             fused = 0.5 * f3 + 0.5 * f4  # fallback: equal weight
+
+        # ── Utilization Module | 表示利用率模块 ──
+        # Predict per-channel utilization → supervised by ceiling gap
+        util_map = self.util_conv(fused)  # [B, 256, H/8, W/8], 0~1
+        self.util_mean = util_map.mean()  # scalar for supervision
+        fused = fused * util_map
 
         # FiLM modulation
         if fg_prototype is not None and fg_prototype.abs().sum() > 1e-8:
@@ -444,6 +458,34 @@ def _extract_feats_for_proto(backbone, support_imgs, feature_level):
     return [feats[feature_level][i] for i in range(len(support_imgs))]
 
 
+def query_aware_prototype(query_feat, static_proto, blend=0.5):
+    """
+    Query-aware dynamic prototype via cross-attention.
+    Query (e.g. P3, fine spatial) guides Proto (e.g. P4, strong semantics).
+
+    static_proto [C_p] → query_feat [C_q,H,W] → dim align → attention → dynamic [C_p].
+    """
+    if query_feat.dim() == 4:
+        query_feat = query_feat.squeeze(0)
+    C_q, H, W = query_feat.shape
+    C_p = static_proto.shape[0]
+
+    # Align: pad query to proto dim | query 补齐到 proto 维度
+    if C_q != C_p:
+        C = C_p
+        query_feat = F.pad(query_feat, (0, 0, 0, 0, 0, C_p - C_q))  # [C_p, H, W]
+    else:
+        C = C_q
+    static_p = static_proto  # don't modify original
+
+    # Per-location cosine similarity → attention → weighted dynamic proto
+    q_flat = F.normalize(query_feat.reshape(C, -1).T, dim=1)  # [HW, C]
+    p_norm = F.normalize(static_p, dim=0)  # [C]
+    attn = (q_flat @ p_norm).softmax(dim=0)  # [HW]
+    dynamic_p = (query_feat.reshape(C, -1) * attn).sum(dim=1)  # [C]
+    return (1 - blend) * F.normalize(static_p, dim=0, p=2) + blend * F.normalize(dynamic_p, dim=0, p=2)
+
+
 def binary_iou(pred: torch.Tensor, gt: torch.Tensor) -> float:
     inter = (pred & gt).sum().item()
     union = (pred | gt).sum().item()
@@ -468,15 +510,15 @@ def binary_recall_precision(pred: torch.Tensor, gt: torch.Tensor):
 
 def focal_dice_loss(logit: torch.Tensor, target: torch.Tensor,
                     gamma: float = 5.0, ce_weight: float = 0.5,
-                    dice_weight: float = 0.5):
-    """Focal (gamma=5) + Dice loss for binary segmentation."""
+                    dice_weight: float = 0.5, gap_weight: float = 1.0):
+    """Focal (gamma=5) + Dice loss, optionally weighted by RUR gap."""
     ce = F.binary_cross_entropy_with_logits(logit, target, reduction="none")
     focal = ((1 - torch.exp(-ce)) ** gamma * ce).mean()
     prob = torch.sigmoid(logit)
     inter = (prob * target).sum()
     union = prob.sum() + target.sum() + 1e-8
     dice = 1.0 - (2 * inter / union)
-    loss = ce_weight * focal + dice_weight * dice
+    loss = gap_weight * (ce_weight * focal + dice_weight * dice)
     return loss, {"focal": focal.item(), "dice": dice.item()}
 
 # ═══════════════════════════════════════════════════════════════════
@@ -486,7 +528,8 @@ def focal_dice_loss(logit: torch.Tensor, target: torch.Tensor,
 def train_episode(decoder, backbone, support_idxs, query_idx,
                   train_ds, val_ds, query_class, device, opt,
                   scaler=None, grad_clip=1.0, use_amp=False,
-                  feature_level="p4"):
+                  feature_level="p4", use_dynamic_proto=False,
+                  gap_weight=1.0):
     """Single training episode: Support -> proto -> query -> loss -> backward.
 
     Returns: (loss: float, timing: dict) or (None, None) if empty prototype.
@@ -518,6 +561,20 @@ def train_episode(decoder, backbone, support_idxs, query_idx,
         if fg_proto.dim() == 2 and fg_proto.sum() == 0:
             return None, None
 
+        # ── Query-aware Dynamic Prototype | 查询感知动态原型 ──
+        if use_dynamic_proto:
+            query_feat_proto = backbone(query_img)
+            if feature_level == "p3p4":
+                # P3 (spatial) + P4 (semantic) → concat → model learns which scale
+                p3_f = query_feat_proto["p3"].squeeze(0)  # [960, H/8, W/8]
+                p4_f = query_feat_proto["p4"]  # [1, 1280, H/16, W/16]
+                p4_f = F.interpolate(p4_f, size=p3_f.shape[1:],
+                                    mode="bilinear", align_corners=False).squeeze(0)
+                qf = torch.cat([p3_f, p4_f], dim=0)  # [2240, H/8, W/8]
+            else:
+                qf = query_feat_proto[feature_level]
+            fg_proto = query_aware_prototype(qf, fg_proto)
+
     t_backbone_support = time.perf_counter()
 
     # Forward - query decoder (grad only through decoder)
@@ -526,14 +583,22 @@ def train_episode(decoder, backbone, support_idxs, query_idx,
         with torch.amp.autocast(device.type):
             logit = _decoder_forward(decoder, backbone, query_img, fg_proto,
                                      tsize, feature_level)
-            loss, components = focal_dice_loss(logit, query_mask)
+            loss, components = focal_dice_loss(logit, query_mask, gap_weight=gap_weight)
     else:
         logit = _decoder_forward(decoder, backbone, query_img, fg_proto,
                                  tsize, feature_level)
-        loss, components = focal_dice_loss(logit, query_mask)
+        loss, components = focal_dice_loss(logit, query_mask, gap_weight=gap_weight)
     t_decoder = time.perf_counter()
 
     opt.zero_grad()
+
+    # ── Utilization Supervision | 利用率监督信号 ──
+    # util_mean (predicted) → target_util (from ceiling gap) → MSE
+    if hasattr(decoder, 'util_mean') and gap_weight > 1.0:
+        target_util = min(1.0, max(0.05, 1.0 - (gap_weight - 1.0) / 2.0))
+        util_loss = 0.1 * ((decoder.util_mean - target_util) ** 2)
+        loss = loss + util_loss
+
     if scaler is not None:
         scaler.scale(loss).backward()
         scaler.unscale_(opt)
@@ -1046,6 +1111,13 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
                            f"skipping warmup to avoid ZeroDivisionError")
         sch = CosineAnnealingLR(opt, T_max=args.epochs, eta_min=args.lr * 0.01)
 
+    # ── RUR-aware: dynamic gap weights + ceiling data ──
+    rur_ceiling_data = None
+    moving_iou = {c: 0.0 for c in target_classes}  # EMA of per-class val IoU
+    if getattr(args, 'rur_ceiling', None):
+        with open(args.rur_ceiling) as f:
+            rur_ceiling_data = json.load(f)
+        logger.log_info(f"{tag}/loss", "RUR-aware: dynamic gap weights + utilization supervision")
     use_amp = args.amp and device.type == "cuda"
     scaler = torch.amp.GradScaler(device.type) if use_amp else None
 
@@ -1114,6 +1186,10 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
     t0 = time.perf_counter()
     timing_accum = defaultdict(float)
 
+    # 动态 gap 权重: 初始全 1.0，每 epoch 根据 moving IoU 更新
+    gap_weights = {c: 1.0 for c in valid_classes}
+    beta_ema = 0.9  # moving average decay
+
     for epoch in range(1, args.epochs + 1):
         t_epoch_start = time.perf_counter()
         decoder.train()
@@ -1134,7 +1210,9 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
             loss, ep_timing = train_episode(decoder, backbone, support_idxs, qi,
                                 train_ds, val_ds, query_class, device, opt,
                                 scaler=scaler, grad_clip=args.grad_clip,
-                                use_amp=use_amp, feature_level=feature_level)
+                                use_amp=use_amp, feature_level=feature_level,
+                                use_dynamic_proto=args.use_dynamic_proto,
+                                gap_weight=gap_weights.get(query_class, 1.0))
             if loss is not None:
                 total_loss += loss
                 n_eps += 1
@@ -1171,6 +1249,19 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
         mval = float(np.mean(list(per_cls_val.values())))
         t_epoch_done = time.perf_counter()
 
+        # ── Dynamic Gap Weights | 动态差距权重 ──
+        if rur_ceiling_data is not None:
+            for cid in valid_classes:
+                name = target_classes[cid]
+                ceil_pct = rur_ceiling_data['per_class'].get(name, {}).get('tile_p3_pct', 100)
+                current_iou = per_cls_val.get(cid, 0)
+                # EMA of per-class IoU
+                moving_iou[cid] = beta_ema * moving_iou[cid] + (1 - beta_ema) * current_iou
+                # gap = ceiling - moving_IoU, clamp to [0, ceiling]
+                gap = max(0.0, ceil_pct / 100.0 - moving_iou[cid])
+                # weight = 1 + λ × gap → harder classes get more focus
+                gap_weights[cid] = 1.0 + 2.0 * gap
+
         # ── EMA Update | 指数移动平均更新 ──
         if ema_state is not None:
             alpha = min(1.0 - 1.0 / (epoch + 1), ema_decay)
@@ -1199,10 +1290,8 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
         t_epoch_total = t_epoch_done - t_epoch_start
 
         # Log
-        cls_str = ", ".join(f"{target_classes[c][:8]}={per_cls_val[c]:.4f}"
-                          for c in sorted(target_classes)[:8])
-        if n_classes > 8:
-            cls_str += f" ... ({n_classes-8} more)"
+        cls_str = ", ".join(f"{target_classes[c][:7]}={per_cls_val[c]:.3f}"
+                          for c in sorted(target_classes))
         logger.log_info(f"{tag}/train",
                        f"E{epoch:3d}/{args.epochs} loss={avg_loss:.4f} "
                        f"val_mIoU={mval:.4f} lr={sch.get_last_lr()[0]:.2e} "
@@ -1368,6 +1457,10 @@ def parse_args():
     p.add_argument("--feature-level", type=str, default="p4",
                    choices=["p3", "p4", "p8", "p3p4"],
                    help="Backbone 特征层 | p3(stride=8), p4(stride=16), p8(stride=32), p3p4(fusion)")
+    p.add_argument("--use-dynamic-proto", action="store_true",
+                   help="Query-aware dynamic prototype (cross-attn query×proto)")
+    p.add_argument("--rur-ceiling", type=str, default=None,
+                   help="RUR ceiling JSON path for gap-aware loss weighting")
     return p.parse_args()
 
 
