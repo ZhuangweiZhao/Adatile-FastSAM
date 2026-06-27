@@ -591,14 +591,6 @@ def train_episode(decoder, backbone, support_idxs, query_idx,
     t_decoder = time.perf_counter()
 
     opt.zero_grad()
-
-    # ── Utilization Supervision | 利用率监督信号 ──
-    # util_mean (predicted) → target_util (from ceiling gap) → MSE
-    if hasattr(decoder, 'util_mean') and gap_weight > 1.0:
-        target_util = min(1.0, max(0.05, 1.0 - (gap_weight - 1.0) / 2.0))
-        util_loss = 0.1 * ((decoder.util_mean - target_util) ** 2)
-        loss = loss + util_loss
-
     if scaler is not None:
         scaler.scale(loss).backward()
         scaler.unscale_(opt)
@@ -1111,13 +1103,26 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
                            f"skipping warmup to avoid ZeroDivisionError")
         sch = CosineAnnealingLR(opt, T_max=args.epochs, eta_min=args.lr * 0.01)
 
-    # ── RUR-aware: dynamic gap weights + ceiling data ──
-    rur_ceiling_data = None
-    moving_iou = {c: 0.0 for c in target_classes}  # EMA of per-class val IoU
+    # ── Static RUR gap weights | 固定表示差距权重 ──
+    # Fixed per-class weights from pre-computed ceiling (not per-epoch dynamic)
+    gap_weights_fixed = {c: 1.0 for c in target_classes}
     if getattr(args, 'rur_ceiling', None):
-        with open(args.rur_ceiling) as f:
-            rur_ceiling_data = json.load(f)
-        logger.log_info(f"{tag}/loss", "RUR-aware: dynamic gap weights + utilization supervision")
+        try:
+            with open(args.rur_ceiling) as f:
+                rur_ceiling_data = json.load(f)
+            for cid in target_classes:
+                name = target_classes[cid]
+                ceil_pct = rur_ceiling_data['per_class'].get(name, {}).get('tile_p3_pct', 100)
+                # gap = ceiling/100 → larger gap = higher weight (capped at 2.0)
+                gap = max(0, 100 - ceil_pct) / 100
+                gap_weights_fixed[cid] = min(2.0, 1.0 + gap * 1.5)
+            logger.log_info(f"{tag}/loss",
+                           f"Static RUR weights: " + ", ".join(
+                               f"{target_classes[c][:7]}={gap_weights_fixed[c]:.2f}"
+                               for c in sorted(target_classes) if gap_weights_fixed[c] > 1.01))
+        except (FileNotFoundError, KeyError, json.JSONDecodeError):
+            logger.log_info(f"{tag}/loss",
+                           f"RUR ceiling file not found or invalid, using uniform weights")
     use_amp = args.amp and device.type == "cuda"
     scaler = torch.amp.GradScaler(device.type) if use_amp else None
 
@@ -1186,10 +1191,6 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
     t0 = time.perf_counter()
     timing_accum = defaultdict(float)
 
-    # 动态 gap 权重: 初始全 1.0，每 epoch 根据 moving IoU 更新
-    gap_weights = {c: 1.0 for c in valid_classes}
-    beta_ema = 0.9  # moving average decay
-
     for epoch in range(1, args.epochs + 1):
         t_epoch_start = time.perf_counter()
         decoder.train()
@@ -1212,7 +1213,7 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
                                 scaler=scaler, grad_clip=args.grad_clip,
                                 use_amp=use_amp, feature_level=feature_level,
                                 use_dynamic_proto=args.use_dynamic_proto,
-                                gap_weight=gap_weights.get(query_class, 1.0))
+                                gap_weight=gap_weights_fixed.get(query_class, 1.0))
             if loss is not None:
                 total_loss += loss
                 n_eps += 1
@@ -1248,19 +1249,6 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
 
         mval = float(np.mean(list(per_cls_val.values())))
         t_epoch_done = time.perf_counter()
-
-        # ── Dynamic Gap Weights | 动态差距权重 ──
-        if rur_ceiling_data is not None:
-            for cid in valid_classes:
-                name = target_classes[cid]
-                ceil_pct = rur_ceiling_data['per_class'].get(name, {}).get('tile_p3_pct', 100)
-                current_iou = per_cls_val.get(cid, 0)
-                # EMA of per-class IoU
-                moving_iou[cid] = beta_ema * moving_iou[cid] + (1 - beta_ema) * current_iou
-                # gap = ceiling - moving_IoU, clamp to [0, ceiling]
-                gap = max(0.0, ceil_pct / 100.0 - moving_iou[cid])
-                # weight = 1 + λ × gap → harder classes get more focus
-                gap_weights[cid] = 1.0 + 2.0 * gap
 
         # ── EMA Update | 指数移动平均更新 ──
         if ema_state is not None:
