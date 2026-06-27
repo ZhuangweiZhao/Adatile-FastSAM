@@ -1176,6 +1176,7 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
 
     # Training State
     best_val_miou = 0.0
+    best_epoch = 1
     best_state = None
     best_ema_miou = 0.0
     best_ema_state = None
@@ -1300,6 +1301,17 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
             best_val_miou = mval
             best_state = {k: v.clone() for k, v in decoder.state_dict().items()}
             torch.save(best_state, str(output_dir / f"decoder_{decoder_type}_{shot}shot_best.pt"))
+            best_epoch = epoch
+
+        # ── Early Stopping | 早停 ──
+        patience = getattr(args, 'early_stop_patience', 0)
+        if patience > 0:
+            epochs_since_best = epoch - best_epoch
+            if epochs_since_best >= patience:
+                logger.log_info(f"{tag}/train",
+                               f"Early stop at E{epoch}: no improvement for {patience} epochs "
+                               f"(best_val={best_val_miou:.4f} @E{best_epoch})")
+                break
 
     dt_train = time.perf_counter() - t0
     logger.log_info(f"{tag}/best",

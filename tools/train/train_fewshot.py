@@ -67,20 +67,28 @@ def parse_args():
     p.add_argument("--lora-rank", type=int, default=0,
                    help="LoRA rank (0=disabled). Placeholder for future.")
     # ── Training ──
-    p.add_argument("--epochs", type=int, default=40)
-    p.add_argument("--episodes-per-epoch", type=int, default=150)
+    p.add_argument("--epochs", type=int, default=60,
+                   help="训练轮数 (少量推荐60，充分推荐100)")
+    p.add_argument("--episodes-per-epoch", type=int, default=200)
     p.add_argument("--eval-episodes", type=int, default=200)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--weight-decay", type=float, default=1e-4)
-    p.add_argument("--warmup-epochs", type=int, default=3)
+    p.add_argument("--weight-decay", type=float, default=5e-4,
+                   help="权重衰减 (few-shot 推荐 5e-4，减少过拟合)")
+    p.add_argument("--warmup-epochs", type=int, default=10,
+                   help="学习率预热轮数 (长预热稳定早期训练)")
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--amp", action="store_true")
-    p.add_argument("--val-episodes-per-class", type=int, default=10)
-    p.add_argument("--val-batch-size", type=int, default=8,
+    p.add_argument("--val-episodes-per-class", type=int, default=30,
+                   help="每类验证episode数 (30→更可靠的checkpoint选择)")
+    p.add_argument("--val-batch-size", type=int, default=16,
                    help="验证批大小 (6GB=4, 12GB=12, 24GB=32)")
     p.add_argument("--tile-cache-size", type=int, default=16)
-    p.add_argument("--ema-decay", type=float, default=0.999)
-    p.add_argument("--swa-start-epoch", type=int, default=0)
+    p.add_argument("--ema-decay", type=float, default=0.997,
+                   help="EMA衰减率 (0.997→更快适应，适合noisy few-shot)")
+    p.add_argument("--swa-start-epoch", type=int, default=0,
+                   help="SWA起始轮 (0=auto=60%epochs)")
+    p.add_argument("--early-stop-patience", type=int, default=15,
+                   help="早停耐心 (0=禁用)")
     p.add_argument("--use-dynamic-proto", action="store_true")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--rur-ceiling", type=str, default="runs/tile_recall_ceiling.json")
