@@ -742,10 +742,12 @@ def validate_all_classes_batched(decoder, backbone, train_ds, val_ds,
         """从缓存获取指定类的二值掩码 | Get class-specific binary mask from cache."""
         key = (ds_tag, tile_idx)
         if key not in mask_cache:
-            # 一次读盘，缓存完整 dense label | One disk read, cache full dense label
-            tile_info = ds._tiles[tile_idx]
+            # 从 wrapped dataset 加载 dense label | Load dense label from wrapped dataset
+            # FewShotEpisodeDataset wraps underlying adapter at .ds
+            inner = getattr(ds, 'ds', ds)
+            tile_info = inner._tiles[tile_idx]
             fname = f"{tile_info['tile_name']}_label.png"
-            raw = ds._cv2.imread(str(ds._mask_dir / fname), ds._cv2.IMREAD_UNCHANGED)
+            raw = inner._cv2.imread(str(inner._mask_dir / fname), inner._cv2.IMREAD_UNCHANGED)
             mask_cache[key] = torch.from_numpy(raw).long()
         return (mask_cache[key] == cls_id).float().to(device)
 
