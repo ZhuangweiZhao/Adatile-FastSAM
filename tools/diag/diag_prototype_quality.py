@@ -318,13 +318,13 @@ def run_diagnosis_episode(
         if dataset.crop_support and mask.sum() > 64:
             img, mask = dataset._roi_crop(img, mask)
         support_imgs.append(img)
-        support_masks.append(mask)
+        support_masks.append(mask.to(device))
 
     support_batch = torch.stack(support_imgs).to(device)  # [K, 3, H, W]
 
     # ── Load query ──
     query_img = dataset.load_image(int(query_idx)).unsqueeze(0).to(device)
-    query_mask = dataset.render_class_mask(int(query_idx), class_id)
+    query_mask = dataset.render_class_mask(int(query_idx), class_id).to(device)
     H_orig, W_orig = query_mask.shape
 
     # ── Backbone: support → prototype ──
