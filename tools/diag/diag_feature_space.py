@@ -373,7 +373,7 @@ def plot_tsne(features_dict: dict, class_names: dict, title: str,
     # Use sklearn TSNE if available, else PCA fallback
     try:
         from sklearn.manifold import TSNE
-        tsne = TSNE(n_components=2, perplexity=30, random_state=42, n_iter=1000, verbose=0)
+        tsne = TSNE(n_components=2, perplexity=30, random_state=42, max_iter=1000)
         X_2d = tsne.fit_transform(X)
         method = "t-SNE"
     except ImportError:
