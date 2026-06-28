@@ -342,6 +342,135 @@ class P3P4FiLMFusionDecoder(nn.Module):
         return x
 
 
+class P3P4CrossAttnDecoder(nn.Module):
+    """
+    P3+P4 Fusion + Cross-Attention Decoder | P3+P4 融合 + 交叉注意力解码器.
+
+    组合 P3P4FiLMFusionDecoder 的自适应融合 + CATFewShotDecoder 的 cross-attention。
+    Combines adaptive P3/P4 fusion with cross-attention conditioning.
+
+    Architecture | 架构:
+        P3 [640, H/8] ──→ proj_p3 ──→ [256, H/8] ──┐
+                                                      ├─gate(proto)→ fused [256, H/8]
+        P4 [1280, H/16] → upsample → proj_p4 ──→ [256, H/8] ──┘
+                                                      │
+        proto [1280] ──→ proto_mlp ──→ tokens [K, 256] ──→ CrossAttn(Q=fused, K=tokens, V=tokens)
+                                                      │
+                                           residual + → Upsample (×8) → mask
+
+    ~1.3M params. Supports multi-prototype (K>1 → standard softmax attention).
+    """
+
+    def __init__(self, feat_dim_p3: int = 640, feat_dim_p4: int = 1280,
+                 hidden_dim: int = 256, num_prototypes: int = 1):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_prototypes = num_prototypes
+
+        # P3 projection: 640 → 256
+        self.proj_p3 = nn.Sequential(
+            nn.Conv2d(feat_dim_p3, hidden_dim, 1, bias=False),
+            nn.BatchNorm2d(hidden_dim), nn.ReLU(inplace=True),
+        )
+        # P4 projection: 1280 → 256
+        self.proj_p4 = nn.Sequential(
+            nn.Conv2d(feat_dim_p4, hidden_dim, 1, bias=False),
+            nn.BatchNorm2d(hidden_dim), nn.ReLU(inplace=True),
+        )
+
+        # Proto-guided gate: proto → α per channel
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(feat_dim_p4, 128), nn.ReLU(inplace=True),
+            nn.Linear(128, hidden_dim), nn.Sigmoid(),
+        )
+
+        # Proto → token projection
+        self.proto_mlp = nn.Sequential(
+            nn.Linear(feat_dim_p4, hidden_dim), nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        # Upsample path (from H/8)
+        self.up1 = nn.Sequential(
+            nn.Conv2d(hidden_dim, 128, 3, padding=1, bias=False),
+            nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+        )
+        self.up2 = nn.Sequential(
+            nn.Conv2d(128, 64, 3, padding=1, bias=False),
+            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+        )
+        self.up3 = nn.Sequential(
+            nn.Conv2d(64, 32, 3, padding=1, bias=False),
+            nn.BatchNorm2d(32), nn.ReLU(inplace=True),
+        )
+        self.mask_head = nn.Conv2d(32, 1, 1, bias=True)
+
+    def _cross_attention(self, q: torch.Tensor, proto_tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Cross-attention: Q from query features, K/V from prototype tokens.
+        Q: [B, C, H, W]   proto_tokens: [K, C]
+
+        K=1 → sigmoid gating.  K>1 → softmax attention.
+        """
+        B, C, H, W = q.shape
+        K = proto_tokens.shape[0]
+        q_flat = q.reshape(B, C, -1).permute(0, 2, 1)  # [B, N, C]
+        kv = proto_tokens.unsqueeze(0).expand(B, -1, -1)  # [B, K, C]
+
+        scale = C ** -0.5
+        attn_logits = torch.bmm(q_flat, kv.transpose(1, 2)) * scale  # [B, N, K]
+
+        if K == 1:
+            gate = torch.sigmoid(attn_logits)  # [B, N, 1]
+            attended = gate * kv  # per-position gating
+        else:
+            attn = attn_logits.softmax(dim=-1)  # [B, N, K]
+            attended = torch.bmm(attn, kv)  # [B, N, C]
+
+        attended = attended.permute(0, 2, 1).reshape(B, C, H, W)
+        return q + attended  # residual
+
+    def forward(self, query_p3, query_p4, fg_prototype, target_size=None):
+        # Project P3 and P4 to same channel space
+        f3 = self.proj_p3(query_p3)  # [B, 256, H/8, W/8]
+        f4 = self.proj_p4(F.interpolate(query_p4, size=query_p3.shape[2:],
+                          mode="bilinear", align_corners=False))
+
+        # Proto-guided gate fusion
+        if fg_prototype.dim() == 2:
+            proto_cond = fg_prototype.mean(dim=0)
+        else:
+            proto_cond = fg_prototype
+
+        if proto_cond.abs().sum() > 1e-8:
+            alpha = self.gate_mlp(proto_cond)  # [256]
+            fused = alpha[None, :, None, None] * f3 + (1 - alpha)[None, :, None, None] * f4
+        else:
+            fused = 0.5 * f3 + 0.5 * f4
+
+        # Proto → tokens
+        if fg_prototype.dim() == 2:
+            proto_tokens = self.proto_mlp(fg_prototype)  # [K, 256]
+        else:
+            proto_tokens = self.proto_mlp(fg_prototype.unsqueeze(0))  # [1, 256]
+
+        # Cross-attention
+        x = self._cross_attention(fused, proto_tokens)
+
+        # Upsample: H/8 → H/4 → H/2 → H
+        x = self.up1(x)
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = self.up2(x)
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = self.up3(x)
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = self.mask_head(x)
+
+        if target_size is not None:
+            x = F.interpolate(x, size=target_size, mode="bilinear", align_corners=False)
+        return x
+
+
 class ContrastiveProtoDecoder(nn.Module):
     """
     Contrastive Prototype Decoder | 对比原型解码器.
@@ -433,6 +562,12 @@ def build_decoder(method: str, **kwargs) -> nn.Module:
             feat_dim_p4=kwargs.get("feat_dim_p4", 1280),
             fusion_dim=kwargs.get("fusion_dim", 256),
             proto_dim=kwargs.get("feat_dim_p4", 1280))
+    elif method == "p3p4crossattn":
+        return P3P4CrossAttnDecoder(
+            feat_dim_p3=kwargs.get("feat_dim_p3", 640),
+            feat_dim_p4=kwargs.get("feat_dim_p4", 1280),
+            hidden_dim=kwargs.get("fusion_dim", 256),
+            num_prototypes=kwargs.get("num_prototypes", 1))
     else:
         raise ValueError(f"Unknown decoder: {method}")
 

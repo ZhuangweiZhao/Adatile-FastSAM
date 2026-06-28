@@ -63,7 +63,8 @@ def parse_args():
                    help="ROI crop support images around GT mask (1=on, 0=off)")
     # ── Model ──
     p.add_argument("--decoder", type=str, default="film",
-                   choices=["baseline", "film", "crossattn", "contrastive"])
+                   choices=["baseline", "film", "crossattn", "contrastive",
+                            "p3p4film", "p3p4crossattn"])
     p.add_argument("--feature-level", type=str, default="p3p4",
                    choices=["p3", "p4", "p8", "p3p4"])
     p.add_argument("--num-prototypes", type=int, default=4)
@@ -120,13 +121,24 @@ class PreCutTileAdapter:
 
     提供 class_to_images / load_image / render_class_mask 三个必需方法。
     Auto-detects metadata format (dict vs list).
+
+    Tile Cache: 内置 LRU tile 缓存，避免验证时重复磁盘 I/O。
+    Built-in LRU tile cache to avoid repeated disk I/O during validation.
     """
+
+    # 类级别缓存容量 | Class-level cache capacity
+    _CACHE_MAX = 600  # tiles (~600 × 10MB = 6GB CPU RAM)
 
     def __init__(self, tile_root: str, split: str):
         import cv2
         self._cv2 = cv2
         self.split = split
         self._root = Path(tile_root)
+
+        # LRU image cache: tile_idx → (image_tensor, mask_tensor)
+        self._img_cache: dict[int, torch.Tensor] = {}
+        self._mask_cache: dict[int, torch.Tensor] = {}
+        self._cache_order: list[int] = []  # 最近使用顺序 | access order (last=most recent)
 
         # 检测格式: dict (precut) vs list (legacy) | Detect format
         meta_path = self._root / "metadata" / f"{split}.json"
@@ -183,7 +195,12 @@ class PreCutTileAdapter:
         return self._cls_to_tiles.get(class_id, [])
 
     def load_image(self, tile_idx: int) -> torch.Tensor:
-        """加载 tile 图像 → [3, H, W] float32 (兼容 ISAIDTileWrapper API)."""
+        """加载 tile 图像 → [3, H, W] float32 (兼容 ISAIDTileWrapper API).
+        带 LRU 缓存 | With LRU cache."""
+        if tile_idx in self._img_cache:
+            self._touch_cache(tile_idx)
+            return self._img_cache[tile_idx]
+
         tile_info = self._tiles[tile_idx]
         if self._fmt == "precut":
             fname = f"{tile_info['tile_name']}.png"
@@ -193,20 +210,48 @@ class PreCutTileAdapter:
         if img is None:
             raise ValueError(f"Corrupted image: {fname}")
         img = self._cv2.cvtColor(img, self._cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        return torch.from_numpy(img).permute(2, 0, 1).float()
+        tensor = torch.from_numpy(img).permute(2, 0, 1).float()
+
+        self._img_cache[tile_idx] = tensor
+        self._cache_order.append(tile_idx)
+        self._evict_if_needed()
+        return tensor
 
     def render_class_mask(self, tile_idx: int, class_id: int) -> torch.Tensor:
-        """渲染指定类别的二值掩码 → [H, W] float32 (兼容 ISAIDTileWrapper API)."""
-        tile_info = self._tiles[tile_idx]
-        if self._fmt == "precut":
-            fname = f"{tile_info['tile_name']}_label.png"
+        """渲染指定类别的二值掩码 → [H, W] float32 (兼容 ISAIDTileWrapper API).
+        带 LRU 缓存 | With LRU cache (caches raw label, extracts class_id each time)."""
+        # 缓存原始 label map | Cache raw label map
+        if tile_idx not in self._mask_cache:
+            tile_info = self._tiles[tile_idx]
+            if self._fmt == "precut":
+                fname = f"{tile_info['tile_name']}_label.png"
+            else:
+                fname = tile_info["tile_name"]
+            mask = self._cv2.imread(str(self._mask_dir / fname), self._cv2.IMREAD_UNCHANGED)
+            if mask is None:
+                raise ValueError(f"Corrupted mask: {fname}")
+            self._mask_cache[tile_idx] = torch.from_numpy(mask.astype(np.int64))
+            self._cache_order.append(tile_idx)
+            self._evict_if_needed()
         else:
-            fname = tile_info["tile_name"]
-        mask = self._cv2.imread(str(self._mask_dir / fname), self._cv2.IMREAD_UNCHANGED)
-        if mask is None:
-            raise ValueError(f"Corrupted mask: {fname}")
-        # 预切 tile mask 是 dense label (0-15), 提取指定类别即可
-        return torch.from_numpy((mask == class_id).astype(np.float32))
+            self._touch_cache(tile_idx)
+
+        return (self._mask_cache[tile_idx] == class_id).float()
+
+    def _touch_cache(self, tile_idx: int):
+        """将 tile_idx 移到访问顺序末尾 | Move tile_idx to end of access order."""
+        if tile_idx in self._cache_order:
+            self._cache_order.remove(tile_idx)
+        self._cache_order.append(tile_idx)
+
+    def _evict_if_needed(self):
+        """LRU 淘汰 | LRU eviction."""
+        while len(self._img_cache) + len(self._mask_cache) > self._CACHE_MAX * 2:
+            if not self._cache_order:
+                break
+            oldest = self._cache_order.pop(0)
+            self._img_cache.pop(oldest, None)
+            self._mask_cache.pop(oldest, None)
 
     def __len__(self):
         return len(self._tiles)
@@ -375,6 +420,8 @@ def main():
     decoder_type = args.decoder
     if args.feature_level == "p3p4" and args.decoder == "film":
         decoder_type = "p3p4film"
+    elif args.feature_level == "p3p4" and args.decoder == "crossattn":
+        decoder_type = "p3p4crossattn"
     decoder_kwargs = {"feat_dim": feat_dim, "num_prototypes": args.num_prototypes}
     if args.feature_level == "p3p4":
         decoder_kwargs["feat_dim_p3"] = feat_dim_p3
