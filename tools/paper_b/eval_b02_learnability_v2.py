@@ -233,12 +233,16 @@ def evaluate_model(fdr, backbone, loader, device):
         if fg_t.sum() == 0:
             offset += n_tokens
             continue
-        o_ord = np.argsort(gt_t.numpy())[::-1]
+        # 转 numpy 避免 PyTorch tensor + numpy index 的负步长问题
+        # Convert to numpy to avoid negative stride issue with PyTorch tensor + numpy index
+        fg_np = fg_t.numpy()
+        gt_np = gt_t.numpy()
+        o_ord = np.argsort(gt_np)[::-1]
         l_ord = np.argsort(pred_t.numpy())[::-1]
         for k in ks:
             nk = max(1, int(n_tokens * k / 100))
-            per_tile_oracle[k].append(float(fg_t[o_ord[:nk]].sum() / fg_t.sum()))
-            per_tile_learned[k].append(float(fg_t[l_ord[:nk]].sum() / fg_t.sum()))
+            per_tile_oracle[k].append(float(fg_np[o_ord[:nk]].sum() / fg_np.sum()))
+            per_tile_learned[k].append(float(fg_np[l_ord[:nk]].sum() / fg_np.sum()))
 
     per_tile_mean_oracle = {k: float(np.mean(v)) if v else 0.0 for k, v in per_tile_oracle.items()}
     per_tile_mean_learned = {k: float(np.mean(v)) if v else 0.0 for k, v in per_tile_learned.items()}
