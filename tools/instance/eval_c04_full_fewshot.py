@@ -720,15 +720,34 @@ def validate_all_classes_batched(decoder, backbone, train_ds, val_ds,
             batch_feats = backbone(batch_imgs)
             for i, ti in enumerate(batch_tiles):
                 if feature_level == "p3p4":
-                    tile_to_p4[(ds_tag, ti)] = (batch_feats["p3"][i], batch_feats["p4"][i])
+                    # 移到 CPU — 200+ tile 的 P3+P4 GPU 特征会撑爆 6GB 显存
+                    # Move to CPU — 200+ tiles × P3+P4 = 10GB+ GPU memory
+                    tile_to_p4[(ds_tag, ti)] = (
+                        batch_feats["p3"][i].cpu(),
+                        batch_feats["p4"][i].cpu(),
+                    )
                 else:
-                    tile_to_p4[(ds_tag, ti)] = batch_feats[feature_level][i]
+                    tile_to_p4[(ds_tag, ti)] = batch_feats[feature_level][i].cpu()
             n_images_total += len(batch_tiles)
     t_phase2_done = time.perf_counter()
 
     # Phase 3: 计算 prototypes + decoder forward + IoU
     # Compute prototypes + decoder forward + IoU per episode
     per_cls_ious = {c: [] for c in target_classes}
+
+    # ── Mask cache: 避免同一 tile 被不同 class 重复读盘 | Avoid repeated disk reads ──
+    mask_cache: dict[tuple, torch.Tensor] = {}  # (ds_tag, tile_idx) → dense_label
+
+    def get_mask_cached(ds, ds_tag, tile_idx, cls_id):
+        """从缓存获取指定类的二值掩码 | Get class-specific binary mask from cache."""
+        key = (ds_tag, tile_idx)
+        if key not in mask_cache:
+            # 一次读盘，缓存完整 dense label | One disk read, cache full dense label
+            tile_info = ds._tiles[tile_idx]
+            fname = f"{tile_info['tile_name']}_label.png"
+            raw = ds._cv2.imread(str(ds._mask_dir / fname), ds._cv2.IMREAD_UNCHANGED)
+            mask_cache[key] = torch.from_numpy(raw).long()
+        return (mask_cache[key] == cls_id).float().to(device)
 
     for batch_start in range(0, len(episodes), batch_size):
         batch_eps = episodes[batch_start:batch_start + batch_size]
@@ -742,10 +761,10 @@ def validate_all_classes_batched(decoder, backbone, train_ds, val_ds,
             # For p3p4: use P4 features for prototype (stronger semantics)
             raw_s = [tile_to_p4[("train", si)] for si in s_idxs]
             if feature_level == "p3p4":
-                s_p4s = [r[1] for r in raw_s]  # P4 from (p3, p4) tuple
+                s_p4s = [r[1].to(device) for r in raw_s]  # P4 from (p3, p4) tuple, CPU→GPU
             else:
-                s_p4s = raw_s
-            s_masks = [train_ds.render_class_mask(si, cls_id).to(device) for si in s_idxs]
+                s_p4s = [r.to(device) for r in raw_s]  # CPU→GPU
+            s_masks = [get_mask_cached(train_ds, "train", si, cls_id) for si in s_idxs]
 
             if num_proto > 1:
                 proto = compute_multi_prototype(s_p4s, s_masks, num_prototypes=num_proto)
@@ -757,9 +776,13 @@ def validate_all_classes_batched(decoder, backbone, train_ds, val_ds,
                 if proto.sum() == 0:
                     continue
 
-            # Query (indices from val_ds)
+            # Query (indices from val_ds) — features cached on CPU, move to GPU
             q_p4 = tile_to_p4[("val", q_idx)]
-            q_mask = val_ds.render_class_mask(q_idx, cls_id).to(device)
+            if feature_level == "p3p4":
+                q_p4 = (q_p4[0].to(device), q_p4[1].to(device))
+            else:
+                q_p4 = q_p4.to(device)
+            q_mask = get_mask_cached(val_ds, "val", q_idx, cls_id)
 
             proto_list.append(proto)
             query_p4s.append(q_p4)

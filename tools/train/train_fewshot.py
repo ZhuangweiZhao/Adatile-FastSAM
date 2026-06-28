@@ -87,8 +87,8 @@ def parse_args():
     p.add_argument("--amp", action="store_true")
     p.add_argument("--val-episodes-per-class", type=int, default=30,
                    help="每类验证episode数 (30→更可靠的checkpoint选择)")
-    p.add_argument("--val-batch-size", type=int, default=4,
-                   help="验证批大小 (6GB=2, 12GB=8, 24GB=16, 896px建议≤4)")
+    p.add_argument("--val-batch-size", type=int, default=2,
+                   help="验证批大小 (6GB=1-2, 12GB=6, 24GB=12, 896px建议≤2)")
     p.add_argument("--tile-cache-size", type=int, default=16)
     p.add_argument("--ema-decay", type=float, default=0.997,
                    help="EMA衰减率 (0.997→更快适应，适合noisy few-shot)")

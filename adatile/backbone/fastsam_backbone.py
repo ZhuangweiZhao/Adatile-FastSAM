@@ -212,8 +212,8 @@ class FastSAMBackbone(nn.Module):
         # 执行前向（通过 YOLO Sequential，绕过 predict 的预处理）
         # Forward through YOLO Sequential (bypasses predict's preprocessing)
         with torch.no_grad():
-            # 使用 _predict_once 处理多输入层路由 | Use _predict_once for multi-input routing
-            self.model.model._predict_once(x)
+            # 跳过 Detect head，只跑 Backbone+Neck | Skip Detect head, only Backbone+Neck
+            self._forward_features(x)
 
         # 分析各层输出的步长 | Analyze strides of each layer's output
         candidates_8  = []  # stride-8 candidates
@@ -474,6 +474,36 @@ class FastSAMBackbone(nn.Module):
 
     # ── 前向传播 | Forward Pass ───────────────────────────────
 
+    def _forward_features(self, x: torch.Tensor) -> None:
+        """
+        仅运行 Backbone+Neck，跳过 Detect/Segment head.
+        Run only Backbone+Neck, skip Detect/Segment head.
+
+        复刻 _predict_once 的多输入层路由 (m.f 索引)，
+        但在遇到 Detect/Segment 层时提前终止。
+        Replicates _predict_once's multi-input routing (m.f indices),
+        but breaks early when Detect/Segment layers are reached.
+
+        跳过 head 可节省 ~30-40% 前向时间 + 显存，
+        因为我们只需要中间特征 (P3/P4/P8)，不需要 box/mask 输出。
+        Skipping head saves ~30-40% forward time + memory,
+        since we only need intermediate features, not box/mask outputs.
+        """
+        detection_model = self.model.model
+        y = []
+        for m in detection_model.model:
+            # ── 多输入路由 | Multi-input routing ──
+            if m.f != -1:
+                x = y[m.f] if isinstance(m.f, int) else [
+                    x if j == -1 else y[j] for j in m.f
+                ]
+            # ── 跳过 Detect/Segment head | Skip Detect/Segment head ──
+            cls_name = m.__class__.__name__
+            if cls_name in ("Detect", "Segment", "DetectSegment"):
+                break
+            x = m(x)
+            y.append(x if m.i in getattr(detection_model, 'save', []) else None)
+
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         """前向传播，返回多尺度特征图 | Forward pass, returns multi-scale feature maps."""
         if self._hook_p4_idx is None or self._hook_p8_idx is None or self._hook_p3_idx is None:
@@ -486,13 +516,7 @@ class FastSAMBackbone(nn.Module):
         self._features.clear()
 
         with torch.set_grad_enabled(not self._freeze_backbone):
-            # 使用 _predict_once 而非 Sequential 直调：
-            # YOLOv8 neck 中的 C2f 层需要多尺度特征路由 (m.f 索引)，
-            # nn.Sequential 直调会绕过这个路由，导致通道不匹配崩溃。
-            # Use _predict_once (NOT Sequential direct call):
-            # C2f layers in YOLOv8 neck need multi-scale feature routing (m.f indices).
-            # Direct Sequential call bypasses this → channel mismatch crash.
-            self.model.model._predict_once(x)
+            self._forward_features(x)
 
         result: dict[str, torch.Tensor] = {}
         if "p3" in self._features:
