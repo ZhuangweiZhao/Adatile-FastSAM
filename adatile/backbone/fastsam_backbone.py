@@ -531,7 +531,28 @@ class FastSAMBackbone(nn.Module):
             result["p4"] = f
         if "p8" in self._features:
             result["p8"] = self._features["p8"]
+
+        # ── 应用 Adapter (CAT-SAM 迁移) | Apply Adapters (CAT-SAM port) ──
+        if getattr(self, '_adapters', None) is not None:
+            adapted = self._adapters(
+                p3=result.get("p3"),
+                p4=result.get("p4"),
+                p8=result.get("p8"),
+            )
+            result.update(adapted)
+
         return result
+
+    def set_adapters(self, adapters):
+        """
+        附加多尺度 ConvAdapter | Attach multi-scale ConvAdapters.
+
+        设置后，每次 forward 会自动对 P3/P4/P8 应用 adapter。
+        Once set, adapters are automatically applied to P3/P4/P8 on each forward.
+
+        :param adapters: MultiScaleAdapter 实例 | MultiScaleAdapter instance.
+        """
+        self._adapters = adapters
 
 
 class ConvLoRA(nn.Module):
