@@ -5,6 +5,26 @@ iSAID Few-Shot Instance Segmentation 3-Fold Split | 三折 Base/Novel 划分.
 按照 PASCAL-5i 风格，将 15 类分为 3 个 Fold，每个 Fold 5 个 Novel 类，其余为 Base。
 PASCAL-5i style: 15 classes → 3 folds, 5 Novel + rest Base per fold.
 
+.. warning::
+    **类别 ID 体系: 本模块使用 ``ISAID_CATEGORIES`` (标准 iSAID COCO ID)**
+
+    与 ``adatile.utils.label_mapping.ISAID5I_FOLDS`` 使用不同的 ID 体系:
+
+    ====================  ============================  ============================
+    模块                    ID 体系                       small_vehicle 的 ID
+    ====================  ============================  ============================
+    ``fewshot_split.py``   ``ISAID_CATEGORIES``          1
+    ``label_mapping.py``   ``ISAID5I_CATEGORIES``        9
+    ====================  ============================  ============================
+
+    **规则:**
+    - ``--dataset fastsam`` (非标准 debug 路径) → ``ISAID_FEWSHOT_FOLDS`` + ``ISAID_CATEGORIES``
+    - ``--dataset isaid5i`` (标准 FSS benchmark) → ``ISAID5I_FOLDS`` + ``ISAID5I_CATEGORIES``
+    - **禁止混用**: 两套 ID 体系不可互换！相同类别名对应不同数字 ID。
+
+    论文正式实验只用 ``ISAID5I_FOLDS`` (标准 iSAID-5i benchmark)。
+    ``ISAID_FEWSHOT_FOLDS`` 仅用于早期快速验证 (``--dataset fastsam``)。
+
 用法 | Usage::
     from adatile.datasets.fewshot_split import ISAID_FEWSHOT_FOLDS
 """
@@ -24,6 +44,11 @@ PASCAL-5i style: 15 classes → 3 folds, 5 Novel + rest Base per fold.
 #   PASCAL-5i 同样存在类别不平衡, 社区接受此做法
 #
 # 共 15 类, Fold0=5, Fold1=5, Fold2=5 (含 road)
+#
+# .. warning::
+#    以下 ID 使用 ``ISAID_CATEGORIES`` 体系 (1=small_vehicle, 2=large_vehicle, ...)。
+#    如需标准 iSAID-5i benchmark, 请使用 ``adatile.utils.label_mapping.ISAID5I_FOLDS``
+#    (9=small_vehicle, 8=large_vehicle, ...)。
 
 ISAID_FEWSHOT_FOLDS = {
     0: {  # Fold 0 — small_vehicle + 4 diverse classes

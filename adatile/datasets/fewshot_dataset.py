@@ -122,10 +122,24 @@ class FewShotEpisodeDataset:
 
     def sample_episode(self):
         """
+        .. deprecated::
+            训练循环 (train_and_evaluate) 直接采样 indices 并通过 train_episode()
+            构建 episode，不使用此方法。此方法保留仅用于兼容性和独立测试。
+            The training loop directly samples indices and constructs episodes
+            via train_episode(). This method is retained only for compatibility
+            and standalone testing.
+
         采样一个 episode | Sample one episode.
 
         :return: dict with support_imgs, support_masks, query_img, query_mask, class_id
         """
+        import warnings
+        warnings.warn(
+            "FewShotEpisodeDataset.sample_episode() is deprecated. "
+            "The training loop samples episodes directly via train_episode(). "
+            "This method is not used in standard training flow.",
+            DeprecationWarning, stacklevel=2,
+        )
         # 随机选一个 Novel 类 | Random Novel class
         cls_id = int(self.rng.choice(self.valid_novel))
         candidates = self.ds.class_to_images(cls_id)

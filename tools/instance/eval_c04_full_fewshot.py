@@ -875,39 +875,87 @@ def validate_episode(decoder, backbone, train_ds, val_ds, query_class,
 def evaluate_full(decoder, backbone, train_ds, val_ds, device,
                   shot, n_episodes, target_classes, logger, tag,
                   feature_level="p4"):
-    """Full evaluation post-training with per-class + group breakdown."""
+    """
+    标准 FSS Episodic Evaluation | Standard FSS Episodic Evaluation.
+    ================================================================
+
+    与 PANet/PFENet/HSNet/Matcher 协议完全一致 | Consistent with standard FSS protocol:
+        - 每类等量 episode (n_episodes 自动均分)
+          Equal episodes per class (n_episodes auto-distributed)
+        - mIoU = mean(per_class_mean_IoU), 而非 mean(all_episode_IoUs)
+          mIoU = mean(per-class means), NOT mean of all episode IoUs
+        - Support 从 train_ds, Query 从 val_ds
+          Support from train_ds, Query from val_ds
+
+    :return: dict with miou_mean (standard), miou_std, per_class_iou, ...
+    """
     num_proto = getattr(decoder, 'num_prototypes', 1)
     class_to_images = {c: train_ds.class_to_images(c) for c in target_classes}
     rng = np.random.RandomState(42)
-    all_ious, per_cls_ious = [], defaultdict(list)
-    per_cls_recall, per_cls_precision, per_cls_dice = defaultdict(list), defaultdict(list), defaultdict(list)
+    per_cls_ious = defaultdict(list)
+    per_cls_recall = defaultdict(list)
+    per_cls_precision = defaultdict(list)
+    per_cls_dice = defaultdict(list)
     t0 = time.perf_counter()
-    log_every = max(10, n_episodes // 10)
 
-    for ep in tqdm(range(n_episodes), desc=f"  {shot}-shot eval"):
-        valid_classes = [c for c in target_classes if len(class_to_images[c]) >= shot]
-        if not valid_classes:
-            continue
-        query_class = int(rng.choice(valid_classes))
+    # ── 确定有效类 + 每类 episode 数 | Determine valid classes + episodes per class ──
+    valid_classes = [c for c in target_classes if len(class_to_images.get(c, [])) >= shot
+                     and len(val_ds.class_to_images(c)) >= 1]
+    if not valid_classes:
+        logger.log_warn(f"{tag}/eval", "No valid classes for evaluation!")
+        return {
+            "miou_mean": 0.0, "miou_std": 0.0, "mrecall_mean": 0.0,
+            "n_valid": 0, "per_class_iou": {}, "per_class_recall": {},
+            "group_stats": {}, "time_s": 0.0,
+        }
 
-        candidates = class_to_images[query_class]
-        val_candidates = val_ds.class_to_images(query_class)
-        if not val_candidates:
-            continue
+    n_per_class = max(1, n_episodes // len(valid_classes))
+    total_episodes = n_per_class * len(valid_classes)
+    logger.log_info(f"{tag}/eval",
+                    f"Evaluating {len(valid_classes)} classes × {n_per_class} eps "
+                    f"= {total_episodes} episodes (shot={shot})")
 
-        support_idxs = rng.choice(candidates, shot, replace=False)
-        qi = int(rng.choice(val_candidates))
+    # ── 为每类每个 episode 预采样 (support_idxs, query_idx) | Pre-sample per class ──
+    # 预采样确保可复现: 固定 seed rng | Pre-sample for reproducibility: fixed seed rng
+    all_episodes: list[tuple[int, list[int], int]] = []  # (cls_id, [s_idxs], q_idx)
+    skipped_empty = 0
+    for cls_id in valid_classes:
+        candidates = class_to_images[cls_id]
+        val_candidates = val_ds.class_to_images(cls_id)
+        for _ in range(n_per_class):
+            if len(candidates) < shot or not val_candidates:
+                skipped_empty += 1
+                continue
+            s_idxs = rng.choice(candidates, shot, replace=False).tolist()
+            q_idx = int(rng.choice(val_candidates))
+            all_episodes.append((cls_id, s_idxs, q_idx))
 
-        support_imgs = torch.stack([train_ds.load_image(si) for si in support_idxs]).to(device)
-        support_masks = [train_ds.render_class_mask(si, query_class).to(device)
-                         for si in support_idxs]
+    if skipped_empty > 0:
+        logger.log_warn(f"{tag}/eval",
+                        f"Skipped {skipped_empty} episodes due to insufficient "
+                        f"support/query tiles")
+
+    # ── Episode-by-episode evaluation | 逐 episode 评估 ──
+    log_every = max(10, len(all_episodes) // 10)
+    for ep_idx, (query_class, support_idxs, qi) in enumerate(
+        tqdm(all_episodes, desc=f"  {shot}-shot eval")
+    ):
+        # ── Support: image + mask → backbone → prototype ──
+        support_imgs = torch.stack(
+            [train_ds.load_image(si) for si in support_idxs]
+        ).to(device)
+        support_masks = [
+            train_ds.render_class_mask(si, query_class).to(device)
+            for si in support_idxs
+        ]
         query_img = val_ds.load_image(qi).unsqueeze(0).to(device)
         query_mask = val_ds.render_class_mask(qi, query_class).to(device)
 
         support_p4s = _extract_feats_for_proto(backbone, support_imgs, feature_level)
         if num_proto > 1:
-            fg_proto = compute_multi_prototype(support_p4s, support_masks,
-                                                num_prototypes=num_proto)
+            fg_proto = compute_multi_prototype(
+                support_p4s, support_masks, num_prototypes=num_proto
+            )
             if (fg_proto.dim() == 1 and fg_proto.sum() == 0) or \
                (fg_proto.dim() == 2 and fg_proto.sum() == 0):
                 continue
@@ -916,42 +964,36 @@ def evaluate_full(decoder, backbone, train_ds, val_ds, device,
             if fg_proto.sum() == 0:
                 continue
 
-        logit = _decoder_forward(decoder, backbone, query_img, fg_proto,
-                       target_size=tuple(query_mask.shape),
-                       feature_level=feature_level)
+        # ── Query: backbone → decoder(proto) → mask ──
+        logit = _decoder_forward(
+            decoder, backbone, query_img, fg_proto,
+            target_size=tuple(query_mask.shape),
+            feature_level=feature_level,
+        )
         pred = (logit.squeeze(0).squeeze(0).cpu() > 0)
         gt = (query_mask.cpu() > 0)
         iou = binary_iou(pred, gt)
-        all_ious.append(iou)
         per_cls_ious[query_class].append(iou)
+
         # 累积 recall/precision/dice | accumulate for macro averaging
         rec, prec, dice = binary_recall_precision(pred, gt)
         per_cls_recall[query_class].append(rec)
         per_cls_precision[query_class].append(prec)
         per_cls_dice[query_class].append(dice)
 
-        if (ep + 1) % log_every == 0 and all_ious:
-            running = float(np.mean(all_ious[-log_every:]))
-            total = float(np.mean(all_ious))
+        if (ep_idx + 1) % log_every == 0:
+            running_cls = {c: float(np.mean(per_cls_ious[c]))
+                          for c in per_cls_ious if per_cls_ious[c]}
+            running_miou = float(np.mean(list(running_cls.values()))) if running_cls else 0.0
             logger.log_info(f"{tag}/progress",
-                           f"  Ep {ep+1}/{n_episodes}: running={running:.4f} total={total:.4f}")
+                          f"  Ep {ep_idx+1}/{len(all_episodes)}: running mIoU={running_miou:.4f}")
 
     dt = time.perf_counter() - t0
 
-    # Per-class + Group stats
-    per_cls_avg = {}
-    group_stats = {}
-    for group_name, group_classes in CLASS_GROUPS.items():
-        group_ious = []
-        for c in group_classes:
-            if c in per_cls_ious:
-                group_ious.extend(per_cls_ious[c])
-        group_stats[group_name] = {
-            "miou": float(np.mean(group_ious)) if group_ious else 0.0,
-            "n": len(group_ious),
-        }
-
-    # Per-class IoU + Recall + Dice
+    # ═══════════════════════════════════════════════════════════════════
+    # 标准 FSS mIoU: mean(per_class_mean_IoU) — 每类等权
+    # Standard FSS mIoU: mean of per-class means — equal weight per class
+    # ═══════════════════════════════════════════════════════════════════
     per_cls_avg = {}
     per_cls_recall_avg = {}
     for c in sorted(per_cls_ious.keys()):
@@ -963,25 +1005,50 @@ def evaluate_full(decoder, backbone, train_ds, val_ds, device,
         per_cls_avg[str(c)] = avg
         per_cls_recall_avg[str(c)] = rec_avg
         logger.log_info(f"{tag}/per_cls",
-                       f"  {cls_name:<20} IoU={avg:.4f}  Rec={rec_avg:.4f}  Dice={dice_avg:.4f} "
-                       f"({len(per_cls_ious[c])} eps)")
+                       f"  {cls_name:<20} IoU={avg:.4f}  Rec={rec_avg:.4f}  "
+                       f"Dice={dice_avg:.4f}  ({len(per_cls_ious[c])} eps)")
+
+    # 标准 mIoU = mean(per_class_means) | Standard mIoU = mean(per-class means)
+    per_class_means = [per_cls_avg[str(c)] for c in valid_classes if str(c) in per_cls_avg]
+    miou_mean = float(np.mean(per_class_means)) if per_class_means else 0.0
+    miou_std = float(np.std(per_class_means)) if per_class_means else 0.0  # std across classes
+
+    # 全局统计 (保留兼容) | Global stats (kept for compatibility)
+    all_ious_flat = [iou for ious in per_cls_ious.values() for iou in ious]
+
+    # Group stats | 分组统计
+    group_stats = {}
+    for group_name, group_classes in CLASS_GROUPS.items():
+        group_means = []
+        for c in group_classes:
+            if c in per_cls_ious and per_cls_ious[c]:
+                group_means.append(float(np.mean(per_cls_ious[c])))
+        group_stats[group_name] = {
+            "miou": float(np.mean(group_means)) if group_means else 0.0,
+            "n_classes": len(group_means),
+        }
+
+    # Recall — mean of per-class means
+    per_class_recalls = [per_cls_recall_avg[str(c)] for c in valid_classes
+                         if str(c) in per_cls_recall_avg]
+    mrecall = float(np.mean(per_class_recalls)) if per_class_recalls else 0.0
 
     for group_name, stats in group_stats.items():
         logger.log_info(f"{tag}/groups",
-                       f"  [{group_name}] mIoU={stats['miou']:.4f} ({stats['n']} eps)")
+                       f"  [{group_name}] mIoU={stats['miou']:.4f} ({stats['n_classes']} classes)")
 
-    all_recall = [r for rr in per_cls_recall.values() for r in rr]
-    mrecall = float(np.mean(all_recall)) if all_recall else 0.0
     logger.log_info(f"{tag}/done",
-                   f"  {shot}-shot: mIoU={float(np.mean(all_ious)):.4f}  "
+                   f"  {shot}-shot: mIoU={miou_mean:.4f} (std={miou_std:.4f})  "
                    f"mRecall={mrecall:.4f}  "
-                   f"({len(all_ious)} eps, {dt:.0f}s)")
+                   f"({len(all_ious_flat)} eps × {len(valid_classes)} classes, {dt:.0f}s)")
 
     result = {
-        "miou_mean": float(np.mean(all_ious)) if all_ious else 0.0,
-        "miou_std": float(np.std(all_ious)) if all_ious else 0.0,
+        "miou_mean": miou_mean,          # ← 标准 FSS: mean(per_class_means)
+        "miou_std": miou_std,            # ← std across per-class means
         "mrecall_mean": mrecall,
-        "n_valid": len(all_ious),
+        "n_valid": len(all_ious_flat),
+        "n_classes_evaluated": len(valid_classes),
+        "n_episodes_per_class": n_per_class,
         "per_class_iou": per_cls_avg,
         "per_class_recall": per_cls_recall_avg,
         "group_stats": group_stats,

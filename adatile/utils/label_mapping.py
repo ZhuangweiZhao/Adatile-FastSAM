@@ -125,6 +125,21 @@ ISAID5I_CATEGORIES: OrderedDict[str, str] = OrderedDict([
 
 # 标准 iSAID-5i 的 Base/Novel 划分（官方 3-Fold）
 # Standard iSAID-5i Base/Novel split (official 3-Fold)
+#
+# .. note::
+#     **类别 ID 体系: 本模块使用 ``ISAID5I_CATEGORIES`` (iSAID-5i benchmark ID)**
+#
+#     ====================  ============================  ============================
+#     模块                    ID 体系                       small_vehicle 的 ID
+#     ====================  ============================  ============================
+#     ``label_mapping.py``   ``ISAID5I_CATEGORIES``        9
+#     ``fewshot_split.py``   ``ISAID_CATEGORIES``          1
+#     ====================  ============================  ============================
+#
+#     **规则:**
+#     - 标准 iSAID-5i benchmark → ``ISAID5I_FOLDS`` (本模块) ← 论文使用此
+#     - 内部快速验证 (``--dataset fastsam``) → ``ISAID_FEWSHOT_FOLDS`` (fewshot_split.py)
+#     - **禁止混用**: 相同类别名对应不同数字 ID！
 ISAID5I_FOLDS = {
     0: {
         "novel": [9, 15, 11, 5, 12],

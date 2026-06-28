@@ -265,8 +265,15 @@ def main():
 
     else:
         # ═══ AdaTile-FastSAM 协议 (896px tiles) | AdaTile-FastSAM Protocol ═══
+        # .. warning::
+        #    此路径使用 ISAID_CATEGORIES ID 体系 + ISAID_FEWSHOT_FOLDS,
+        #    Train on Novel + Test on Novel — 非标准 FSS!
+        #    仅用于内部快速验证 (debug), 论文正式实验请用 --dataset isaid5i.
         CATEGORIES = ISAID_CATEGORIES
         novel_ids = get_novel_classes(args.fold)
+        logger.log_warn("fewshot/config",
+                       "⚠ 非标准 FSS 协议: Train-on-Novel + Test-on-Novel. "
+                       "论文正式实验请使用 --dataset isaid5i.")
         logger.log_info("fewshot/config",
                        f"Protocol: AdaTile-FastSAM | Fold {args.fold}, Shot={args.shot}")
 
