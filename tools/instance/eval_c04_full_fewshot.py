@@ -670,19 +670,22 @@ def validate_all_classes_batched(decoder, backbone, train_ds, val_ds,
                                   n_val_per_class=10, batch_size=32,
                                   feature_level="p4"):
     """
-    批量验证所有类 | Batched validation for all classes.
+    流式批量验证 | Streaming Batched Validation.
+    =============================================
 
-    一次 backbone forward 处理所有验证 episode, 替代逐类逐 episode 的 N×2 次 backbone forward。
-    One backbone forward for all validation episodes, replacing N×2 sequential forwards.
+    不再全局缓存所有 tile 特征 (p3p4 下 9类×30eps = 1620 tiles × 46MB = 73GB CPU RAM),
+    改为按 chunk 流式处理: 加载→backbone→prototype→decoder→释放。
 
-    加速比 | Speedup: ~5-10× for validation phase (90→1 backbone forwards per epoch).
+    Streaming instead of global caching: load → backbone → prototype → decoder → free.
+    Avoids 73GB CPU RAM explosion that triggers OOM Killer with p3p4 features.
+
+    内存 | Memory: O(chunk_size × shot × feature_size) instead of O(all_tiles × feature_size)
     """
     num_proto = getattr(decoder, 'num_prototypes', 1)
     t_start = time.perf_counter()
 
-    # Phase 1: 预采样所有 episode 的 (support_idxs, query_idx, class)
-    # Pre-sample all episodes: (support_idxs, query_idx, class)
-    episodes = []  # list of (support_idxs: list[int], query_idx: int, cls: int)
+    # Phase 1: 预采样所有 episode | Pre-sample all episodes
+    episodes: list[tuple[list[int], int, int]] = []  # (support_idxs, query_idx, cls)
     for cls_id in sorted(target_classes):
         train_candidates = train_ds.class_to_images(cls_id)
         val_candidates = val_ds.class_to_images(cls_id)
@@ -695,81 +698,82 @@ def validate_all_classes_batched(decoder, backbone, train_ds, val_ds,
 
     if not episodes:
         return ({c: 0.0 for c in target_classes},
-                {"sample": 0, "load_backbone": 0, "decoder": 0, "n_images": 0, "n_episodes": 0})
+                {"sample": 0, "load_backbone": 0, "decoder": 0,
+                 "n_images": 0, "n_episodes": 0})
 
     t_phase1_done = time.perf_counter()
 
-    # Phase 2: 收集 train/val unique tile indices + 加载图像 + backbone forward
-    # Collect train/val unique tile indices (separate index spaces!) + backbone forward
-    train_tiles = set()
-    val_tiles = set()
-    for s_idxs, q_idx, _ in episodes:
-        train_tiles.update(s_idxs)
-        val_tiles.add(q_idx)
-
-    # 分别加载 train/val 图像并过 backbone | Load train/val images separately
-    tile_to_p4 = {}  # (ds, tile_idx) -> P4 tensor, ds: 'train' or 'val'
+    # Phase 2+3: 流式处理 — 按 chunk 批量 backbone → proto → decoder → 释放
+    # Streaming: per-chunk batch backbone → proto → decoder → free
+    per_cls_ious: dict[int, list[float]] = {c: [] for c in target_classes}
     n_images_total = 0
 
-    for ds_tag, ds, tile_set in [("train", train_ds, train_tiles),
-                                  ("val", val_ds, val_tiles)]:
-        unique_tiles = sorted(tile_set)
-        for batch_start in range(0, len(unique_tiles), batch_size):
-            batch_tiles = unique_tiles[batch_start:batch_start + batch_size]
-            batch_imgs = torch.stack([ds.load_image(ti) for ti in batch_tiles]).to(device)
-            batch_feats = backbone(batch_imgs)
-            for i, ti in enumerate(batch_tiles):
-                if feature_level == "p3p4":
-                    # 移到 CPU — 200+ tile 的 P3+P4 GPU 特征会撑爆 6GB 显存
-                    # Move to CPU — 200+ tiles × P3+P4 = 10GB+ GPU memory
-                    tile_to_p4[(ds_tag, ti)] = (
-                        batch_feats["p3"][i].cpu(),
-                        batch_feats["p4"][i].cpu(),
-                    )
-                else:
-                    tile_to_p4[(ds_tag, ti)] = batch_feats[feature_level][i].cpu()
-            n_images_total += len(batch_tiles)
-    t_phase2_done = time.perf_counter()
+    # Chunk size for streaming. Large enough to batch backbone efficiently,
+    # small enough to keep feature cache manageable.
+    # 64 episodes → ~64×6=384 tiles max → ~17.6GB GPU (p3p4). OK for 24GB+ GPUs.
+    # For 12GB GPUs, reduce to 32 or use p4-only.
+    stream_chunk_size = max(8, batch_size * 4)
 
-    # Phase 3: 计算 prototypes + decoder forward + IoU
-    # Compute prototypes + decoder forward + IoU per episode
-    per_cls_ious = {c: [] for c in target_classes}
+    for chunk_start in range(0, len(episodes), stream_chunk_size):
+        chunk_eps = episodes[chunk_start:chunk_start + stream_chunk_size]
 
-    # ── Mask cache: 避免同一 tile 被不同 class 重复读盘 | Avoid repeated disk reads ──
-    mask_cache: dict[tuple, torch.Tensor] = {}  # (ds_tag, tile_idx) → dense_label
+        # ── 收集本 chunk 的 unique tiles (train + val 分别索引) ──
+        chunk_train_tiles: set[int] = set()
+        chunk_val_tiles: set[int] = set()
+        for s_idxs, q_idx, _ in chunk_eps:
+            chunk_train_tiles.update(s_idxs)
+            chunk_val_tiles.add(q_idx)
 
-    def get_mask_cached(ds, ds_tag, tile_idx, cls_id):
-        """从缓存获取指定类的二值掩码 | Get class-specific binary mask from cache."""
-        key = (ds_tag, tile_idx)
-        if key not in mask_cache:
-            # 从 wrapped dataset 加载 dense label | Load dense label from wrapped dataset
-            # FewShotEpisodeDataset wraps underlying adapter at .ds
-            inner = getattr(ds, 'ds', ds)
-            tile_info = inner._tiles[tile_idx]
-            fname = f"{tile_info['tile_name']}_label.png"
-            raw = inner._cv2.imread(str(inner._mask_dir / fname), inner._cv2.IMREAD_UNCHANGED)
-            mask_cache[key] = torch.from_numpy(raw).long()
-        return (mask_cache[key] == cls_id).float().to(device)
+        # ── Backbone forward on chunk's unique tiles (batched) | chunk 内 tile → 特征 ──
+        tile_to_feat: dict[tuple[str, int], torch.Tensor | tuple] = {}
 
-    for batch_start in range(0, len(episodes), batch_size):
-        batch_eps = episodes[batch_start:batch_start + batch_size]
+        for ds_tag, ds, tile_set in [("train", train_ds, chunk_train_tiles),
+                                      ("val", val_ds, chunk_val_tiles)]:
+            unique_tiles = sorted(tile_set)
+            for bb_start in range(0, len(unique_tiles), batch_size):
+                bb_tiles = unique_tiles[bb_start:bb_start + batch_size]
+                bb_imgs = torch.stack(
+                    [ds.load_image(ti) for ti in bb_tiles]
+                ).to(device)
+                bb_feats = backbone(bb_imgs)
+                for i, ti in enumerate(bb_tiles):
+                    if feature_level == "p3p4":
+                        tile_to_feat[(ds_tag, ti)] = (
+                            bb_feats["p3"][i],
+                            bb_feats["p4"][i],
+                        )
+                    else:
+                        tile_to_feat[(ds_tag, ti)] = bb_feats[feature_level][i]
+                n_images_total += len(bb_tiles)
 
-        # 收集 batch 内所有 query P4 | Collect query P4s within batch
-        query_p4s, query_masks, query_classes = [], [], []
-        proto_list = []
+        # ── 本 chunk 内的 mask cache | Per-chunk mask cache ──
+        chunk_mask_cache: dict[tuple[str, int], torch.Tensor] = {}
 
-        for s_idxs, q_idx, cls_id in batch_eps:
-            # Support → prototype (indices from train_ds)
-            # For p3p4: use P4 features for prototype (stronger semantics)
-            raw_s = [tile_to_p4[("train", si)] for si in s_idxs]
+        def _get_mask(ds, ds_tag: str, tile_idx: int, cls_id: int) -> torch.Tensor:
+            key = (ds_tag, tile_idx)
+            if key not in chunk_mask_cache:
+                inner = getattr(ds, 'ds', ds)
+                tile_info = inner._tiles[tile_idx]
+                fname = f"{tile_info['tile_name']}_label.png"
+                raw = inner._cv2.imread(
+                    str(inner._mask_dir / fname), inner._cv2.IMREAD_UNCHANGED
+                )
+                chunk_mask_cache[key] = torch.from_numpy(raw).long()
+            return (chunk_mask_cache[key] == cls_id).float().to(device)
+
+        # ── Compute prototypes + decoder forward per episode | 逐 episode 计算 ──
+        for s_idxs, q_idx, cls_id in chunk_eps:
+            # Support → prototype (features kept on GPU within chunk)
             if feature_level == "p3p4":
-                s_p4s = [r[1].to(device) for r in raw_s]  # P4 from (p3, p4) tuple, CPU→GPU
+                s_p4s = [tile_to_feat[("train", si)][1] for si in s_idxs]
             else:
-                s_p4s = [r.to(device) for r in raw_s]  # CPU→GPU
-            s_masks = [get_mask_cached(train_ds, "train", si, cls_id) for si in s_idxs]
+                s_p4s = [tile_to_feat[("train", si)] for si in s_idxs]
+            s_masks = [_get_mask(train_ds, "train", si, cls_id) for si in s_idxs]
 
             if num_proto > 1:
-                proto = compute_multi_prototype(s_p4s, s_masks, num_prototypes=num_proto)
+                proto = compute_multi_prototype(
+                    s_p4s, s_masks, num_prototypes=num_proto
+                )
                 if (proto.dim() == 1 and proto.sum() == 0) or \
                    (proto.dim() == 2 and proto.sum() == 0):
                     continue
@@ -778,42 +782,35 @@ def validate_all_classes_batched(decoder, backbone, train_ds, val_ds,
                 if proto.sum() == 0:
                     continue
 
-            # Query (indices from val_ds) — features cached on CPU, move to GPU
-            q_p4 = tile_to_p4[("val", q_idx)]
-            if feature_level == "p3p4":
-                q_p4 = (q_p4[0].to(device), q_p4[1].to(device))
-            else:
-                q_p4 = q_p4.to(device)
-            q_mask = get_mask_cached(val_ds, "val", q_idx, cls_id)
-
-            proto_list.append(proto)
-            query_p4s.append(q_p4)
-            query_masks.append(q_mask)
-            query_classes.append(cls_id)
-
-        if not query_p4s:
-            continue
-
-        # Decoder — process one at a time since prototypes differ
-        for proto, q_p4, q_mask, cls_id in zip(proto_list, query_p4s, query_masks, query_classes):
+            # Query → decoder
+            q_feat = tile_to_feat[("val", q_idx)]
+            q_mask = _get_mask(val_ds, "val", q_idx, cls_id)
             tsize = tuple(q_mask.shape)
+
             if feature_level == "p3p4":
-                q_p3, q_p4_single = q_p4
-                logit = decoder(q_p3.unsqueeze(0), q_p4_single.unsqueeze(0),
-                              proto, target_size=tsize)
+                q_p3, q_p4_single = q_feat
+                logit = decoder(
+                    q_p3.unsqueeze(0), q_p4_single.unsqueeze(0),
+                    proto, target_size=tsize,
+                )
             else:
-                logit = decoder(q_p4.unsqueeze(0), proto, target_size=tsize)
+                logit = decoder(
+                    q_feat.unsqueeze(0), proto, target_size=tsize,
+                )
             pred = (logit.squeeze(0).squeeze(0).cpu() > 0)
             gt = (q_mask.cpu() > 0)
             per_cls_ious[cls_id].append(binary_iou(pred, gt))
 
-    t_phase3_done = time.perf_counter()
+        # ── 释放本 chunk 的特征缓存 | Free chunk feature cache ──
+        del tile_to_feat, chunk_mask_cache
+
+    t_all_done = time.perf_counter()
 
     timing = {
         "sample": t_phase1_done - t_start,
-        "load_backbone": t_phase2_done - t_phase1_done,
-        "decoder": t_phase3_done - t_phase2_done,
-        "total": t_phase3_done - t_start,
+        "load_backbone": t_all_done - t_phase1_done,  # includes decoder (interleaved)
+        "decoder": 0,  # interleaved with backbone, not separately timed
+        "total": t_all_done - t_start,
         "n_images": n_images_total,
         "n_episodes": len(episodes),
     }
