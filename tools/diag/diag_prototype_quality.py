@@ -42,6 +42,7 @@ from collections import defaultdict
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib
 matplotlib.use("Agg")
@@ -282,6 +283,7 @@ def run_diagnosis_episode(
     dataset, backbone, decoder, class_id: int, shot: int,
     feature_level: str, device: torch.device, num_proto: int = 1,
     rng: np.random.RandomState = None,
+    p3_adapter: nn.Module = None, p4_adapter: nn.Module = None,
 ) -> dict:
     """
     执行单个诊断 episode | Run a single diagnosis episode.
@@ -357,10 +359,18 @@ def run_diagnosis_episode(
     sim_metrics = compute_similarity_metrics(sim_map_resized, query_mask)
 
     # ── Decoder prediction ──
+    # 应用 adapter 处理维度不匹配 | Apply adapter for dimension mismatch
+    q_p3 = q_feats["p3"]
+    q_p4_dec = q_feats["p4"]
+    if p3_adapter is not None:
+        q_p3 = p3_adapter(q_p3)
+    if p4_adapter is not None:
+        q_p4_dec = p4_adapter(q_p4_dec)
+
     if feature_level == "p3p4":
-        logit = decoder(q_feats["p3"], q_feats["p4"], proto, target_size=(H_orig, W_orig))
+        logit = decoder(q_p3, q_p4_dec, proto, target_size=(H_orig, W_orig))
     else:
-        logit = decoder(q_feats[feature_level], proto, target_size=(H_orig, W_orig))
+        logit = decoder(q_p4_dec, proto, target_size=(H_orig, W_orig))
 
     pred_mask = (torch.sigmoid(logit.squeeze()) > 0.5).float().cpu()  # [H_orig, W_orig]
 
@@ -455,15 +465,63 @@ def main():
     # ── 加载模型 | Load models ──
     print("[1/5] Loading models...")
     backbone = FastSAMBackbone(freeze_backbone=True).to(device).eval()
-    feat_dim = 640 if args.feature_level == "p3" else 1280
-    decoder = build_decoder_for_diag(args.decoder, feat_dim=feat_dim,
-                                      num_prototypes=args.num_proto).to(device)
+
+    # 探测 backbone 实际输出维度 | Probe backbone actual output dims
+    with torch.no_grad():
+        probe_feats = backbone(torch.randn(1, 3, 896, 896).to(device))
+        actual_p3_dim = probe_feats["p3"].shape[1]
+        actual_p4_dim = probe_feats["p4"].shape[1]
+        print(f"       Backbone P3 dim: {actual_p3_dim}, P4 dim: {actual_p4_dim}")
+
+    # 从 checkpoint 自动检测维度 | Auto-detect dimensions from checkpoint
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=True)
+
+    if "proj_p3.0.weight" in ckpt:
+        ckpt_p3_dim = ckpt["proj_p3.0.weight"].shape[1]  # [out, in, 1, 1]
+        print(f"       Checkpoint P3 dim: {ckpt_p3_dim}")
+    else:
+        ckpt_p3_dim = actual_p3_dim
+
+    if "proj_p4.0.weight" in ckpt:
+        ckpt_p4_dim = ckpt["proj_p4.0.weight"].shape[1]
+        print(f"       Checkpoint P4 dim: {ckpt_p4_dim}")
+    else:
+        ckpt_p4_dim = actual_p4_dim
+
+    # 构建 decoder 并加载权重 | Build decoder and load weights
+    if args.decoder == "p3p4film":
+        from tools.instance.eval_c04_full_fewshot import P3P4FiLMFusionDecoder
+        decoder = P3P4FiLMFusionDecoder(
+            feat_dim_p3=ckpt_p3_dim, feat_dim_p4=ckpt_p4_dim
+        ).to(device)
+    else:
+        feat_dim = 640 if args.feature_level == "p3" else 1280
+        decoder = build_decoder_for_diag(args.decoder, feat_dim=feat_dim,
+                                          num_prototypes=args.num_proto).to(device)
+
     decoder.load_state_dict(ckpt)
     decoder.eval()
-    decoder_type_str = args.decoder
+
+    # 如果 backbone P3 ≠ checkpoint P3，添加投影适配器
+    # If backbone P3 ≠ checkpoint P3, add projection adapter
+    p3_adapter = None
+    if actual_p3_dim != ckpt_p3_dim:
+        print(f"       ⚠ P3 dim mismatch: backbone={actual_p3_dim} vs ckpt={ckpt_p3_dim}")
+        print(f"       Adding projection adapter {actual_p3_dim}→{ckpt_p3_dim}")
+        p3_adapter = nn.Conv2d(actual_p3_dim, ckpt_p3_dim, 1, bias=False).to(device)
+        # 如果 ckpt 维度是 backbone+其他，尝试用 identity 初始化部分
+        # If ckpt dim is backbone+something else, try partial identity init
+        nn.init.kaiming_normal_(p3_adapter.weight)
+
+    p4_adapter = None
+    if actual_p4_dim != ckpt_p4_dim:
+        print(f"       ⚠ P4 dim mismatch: backbone={actual_p4_dim} vs ckpt={ckpt_p4_dim}")
+        print(f"       Adding projection adapter {actual_p4_dim}→{ckpt_p4_dim}")
+        p4_adapter = nn.Conv2d(actual_p4_dim, ckpt_p4_dim, 1, bias=False).to(device)
+        nn.init.kaiming_normal_(p4_adapter.weight)
+
     print(f"       Backbone: FastSAM-x (frozen)")
-    print(f"       Decoder:  {decoder_type_str} ({sum(p.numel() for p in decoder.parameters()):,} params)")
+    print(f"       Decoder:  {args.decoder} ({sum(p.numel() for p in decoder.parameters()):,} params)")
     print(f"       Checkpoint loaded: {len(ckpt)} keys")
 
     # ── 数据集 | Dataset ──
@@ -545,6 +603,7 @@ def main():
                 ds, backbone, decoder, cls_id, args.shot,
                 feature_level=args.feature_level, device=device,
                 num_proto=args.num_proto, rng=rng,
+                p3_adapter=p3_adapter, p4_adapter=p4_adapter,
             )
             if result is None:
                 continue
