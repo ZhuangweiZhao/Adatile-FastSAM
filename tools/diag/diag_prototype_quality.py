@@ -372,12 +372,15 @@ def run_diagnosis_episode(
     else:
         logit = decoder(q_p4_dec, proto, target_size=(H_orig, W_orig))
 
-    pred_mask = (torch.sigmoid(logit.squeeze()) > 0.5).float().cpu()  # [H_orig, W_orig]
+    pred_mask = (torch.sigmoid(logit.squeeze()) > 0.5).float()  # [H_orig, W_orig], on GPU
 
-    # Pred IoU
+    # Pred IoU (compute on GPU, then move)
     intersection = (pred_mask * query_mask).sum().item()
     union = ((pred_mask + query_mask) > 0).sum().item()
     pred_iou = intersection / union if union > 0 else 0.0
+
+    # Move to CPU for visualization
+    pred_mask = pred_mask.cpu()
 
     # ── 准备可视化数据 | Prepare visualization data ──
     def to_display(img_tensor):
