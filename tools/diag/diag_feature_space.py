@@ -149,15 +149,16 @@ def davies_bouldin_index(features: np.ndarray, labels: np.ndarray) -> float:
     for label in unique_labels:
         mask = labels == label
         cluster_feats = features[mask]
-        centroid = cluster_feats.mean(axis=0)
+        # L2-normalize each vector
+        cluster_norm = cluster_feats / np.linalg.norm(cluster_feats, axis=1, keepdims=True).clip(min=1e-10)
+        centroid = cluster_norm.mean(axis=0)
+        centroid = centroid / max(np.linalg.norm(centroid), 1e-10)
         # Dispersion: mean cosine distance to centroid
-        centroid_norm = centroid / max(np.linalg.norm(centroid), 1e-10)
-        sims = cluster_feats @ centroid_norm
-        dists = 1.0 - sims
-        dispersions.append(float(np.mean(dists)))
+        sims = np.clip(cluster_norm @ centroid, -1.0, 1.0)
+        dispersions.append(float(np.mean(1.0 - sims)))
         centroids.append(centroid)
 
-    centroids = np.array(centroids)
+    centroids = np.array(centroids)  # already L2-normalized
     dispersions = np.array(dispersions)
 
     db_sum = 0.0
@@ -166,10 +167,8 @@ def davies_bouldin_index(features: np.ndarray, labels: np.ndarray) -> float:
         for j in range(K):
             if j == k:
                 continue
-            # Cosine distance between centroids
-            c_k_norm = centroids[k] / max(np.linalg.norm(centroids[k]), 1e-10)
-            c_j_norm = centroids[j] / max(np.linalg.norm(centroids[j]), 1e-10)
-            d_centroids = 1.0 - float(np.dot(c_k_norm, c_j_norm))
+            # Cosine distance between centroids (already normalized)
+            d_centroids = 1.0 - float(np.clip(np.dot(centroids[k], centroids[j]), -1.0, 1.0))
             ratio = (dispersions[k] + dispersions[j]) / max(d_centroids, 1e-10)
             max_ratio = max(max_ratio, ratio)
         db_sum += max_ratio
@@ -273,22 +272,25 @@ def compute_class_statistics(class_features: dict) -> dict:
     """
     计算每个类的统计量：类内距离、类中心、分散度。
     Compute per-class statistics: intra-class distance, centroid, dispersion.
+
+    所有计算在 L2-normalized 空间中进行 | All computations in L2-normalized space.
     """
     stats = {}
     for cls_id, data in class_features.items():
-        feats = data["features"]  # [N, C]
-        centroid = feats.mean(axis=0)
-        centroid_norm = centroid / max(np.linalg.norm(centroid), 1e-10)
+        feats = data["features"]  # [N, C], raw P4 features
+        # L2-normalize each vector
+        feats_norm = feats / np.linalg.norm(feats, axis=1, keepdims=True).clip(min=1e-10)
+        centroid = feats_norm.mean(axis=0)
+        centroid = centroid / max(np.linalg.norm(centroid), 1e-10)
 
-        # Intra-class distance (mean pairwise cosine distance)
-        # 近似: mean distance to centroid
-        sims = feats @ centroid_norm
+        # Intra-class distance (mean cosine dist to centroid)
+        sims = np.clip(feats_norm @ centroid, -1.0, 1.0)
         intra_dist = float(np.mean(1.0 - sims))
 
         stats[cls_id] = {
             "n_vectors": len(feats),
             "intra_dist": round(intra_dist, 4),
-            "centroid": centroid_norm,  # numpy array, L2-normalized
+            "centroid": centroid,  # numpy array, L2-normalized
         }
 
     return stats
@@ -649,7 +651,7 @@ def main():
 
     diag_path = out_dir / "feature_diagnosis.json"
     with open(diag_path, "w") as f:
-        json.dump(diagnosis, f, indent=2, ensure_ascii=False)
+        json.dump(diagnosis, f, indent=2, ensure_ascii=False, default=str)
 
     # ── [7] 可视化 ──
     print(f"\n[7] Generating visualizations...")
