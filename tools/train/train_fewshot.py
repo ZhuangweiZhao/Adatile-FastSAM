@@ -29,10 +29,11 @@ from adatile.logging.backends import ConsoleBackend, FileBackend
 from adatile.utils.seed import set_seed
 from adatile.utils.env import get_env_info
 from adatile.backbone import FastSAMBackbone
-from adatile.utils.label_mapping import ISAID_CATEGORIES
+from adatile.utils.label_mapping import ISAID_CATEGORIES, ISAID5I_CATEGORIES, ISAID5I_FOLDS
 from adatile.datasets.isaid_tile_wrapper import ISAIDTileWrapper
 from adatile.datasets.fewshot_dataset import FewShotEpisodeDataset
 from adatile.datasets.fewshot_split import get_novel_classes
+from adatile.datasets.isaid5i import ISAID5iDataset
 
 # ── 复用 C-04 核心训练循环 | Reuse C-04 core training loop ──
 from tools.instance.eval_c04_full_fewshot import (
@@ -44,11 +45,16 @@ from tools.instance.eval_c02a_fastsam_fewshot import ISAIDInstanceDataset
 def parse_args():
     p = argparse.ArgumentParser(description="Few-Shot Training Entry Point")
     # ── Data ──
+    p.add_argument("--dataset", type=str, default="fastsam",
+                   choices=["fastsam", "isaid5i"],
+                   help="Dataset protocol: 'fastsam' (896px tiles, custom splits) "
+                   "or 'isaid5i' (official iSAID-5i benchmark, 256px tiles, standard folds)")
     p.add_argument("--src-root", type=str, required=True,
-                   help="iSAID COCO JSON root (e.g. data/iSAID_processed)")
+                   help="fastsam: iSAID COCO JSON root | isaid5i: iSAID-5i dataset root "
+                   "(or any path when using --tile-root with custom tiles)")
     p.add_argument("--tile-root", type=str, default=None,
-                   help="Pre-cut tiles root (e.g. data/iSAID_tiles). "
-                   "If set, skips slow dynamic tiling and uses pre-cut tiles directly.")
+                   help="Custom pre-cut tiles root. Works with BOTH protocols: "
+                   "fastsam: loads via PreCutTileAdapter | isaid5i: uses official folds + custom tiles")
     p.add_argument("--fold", type=int, required=True, choices=[0, 1, 2])
     p.add_argument("--shot", type=int, default=1, help="K-shot (1/3/5)")
     p.add_argument("--tile-size", type=int, default=896)
@@ -65,7 +71,8 @@ def parse_args():
                    help="Freeze FastSAM backbone (default: True)")
     p.add_argument("--no-freeze-encoder", action="store_false", dest="freeze_encoder")
     p.add_argument("--lora-rank", type=int, default=0,
-                   help="LoRA rank (0=disabled). Placeholder for future.")
+                   help="LoRA rank for FastSAM backbone (0=disabled, 4=light, 8=medium). "
+                   "Adds ~50K params per rank to neck layers.")
     # ── Training ──
     p.add_argument("--epochs", type=int, default=60,
                    help="训练轮数 (少量推荐60，充分推荐100)")
@@ -80,8 +87,8 @@ def parse_args():
     p.add_argument("--amp", action="store_true")
     p.add_argument("--val-episodes-per-class", type=int, default=30,
                    help="每类验证episode数 (30→更可靠的checkpoint选择)")
-    p.add_argument("--val-batch-size", type=int, default=16,
-                   help="验证批大小 (6GB=4, 12GB=12, 24GB=32)")
+    p.add_argument("--val-batch-size", type=int, default=4,
+                   help="验证批大小 (6GB=2, 12GB=8, 24GB=16, 896px建议≤4)")
     p.add_argument("--tile-cache-size", type=int, default=16)
     p.add_argument("--ema-decay", type=float, default=0.997,
                    help="EMA衰减率 (0.997→更快适应，适合noisy few-shot)")
@@ -221,56 +228,131 @@ def main():
     logger.add_backend(ConsoleBackend())
     logger.add_backend(FileBackend(str(out_dir / "train.jsonl")))
 
-    # ── Novel classes for this fold ──
-    novel_ids = get_novel_classes(args.fold)
-    novel_classes = {cid: ISAID_CATEGORIES[cid] for cid in novel_ids
-                     if cid in ISAID_CATEGORIES}
-    logger.log_info("fewshot/config",
-                   f"Fold {args.fold}, Shot={args.shot}, "
-                   f"Novel={list(novel_classes.values())}")
+    # ── Dataset protocol selection | 数据集协议选择 ──
+    if args.dataset == "isaid5i":
+        # ═══ 标准 iSAID-5i 协议 | Standard iSAID-5i Protocol ═══
+        # 使用官方 Fold 划分 + 标准类别 ID
+        # --tile-root 可选: 指定自定义尺寸的预切 tiles (如 tile_896)
+        # 不指定时: 使用官方 256×256 ISAID5iDataset
+        from adatile.utils.label_mapping import ISAID5I_CATEGORIES, ISAID5I_FOLDS
+        CATEGORIES = ISAID5I_CATEGORIES
+        novel_ids = ISAID5I_FOLDS[args.fold]["novel"]
+        base_ids = ISAID5I_FOLDS[args.fold]["base"]
 
-    # ── Load datasets ──
-    if args.tile_root:
-        # 快速路径: 预切 tiles → 秒级初始化 | Fast path: pre-cut tiles → seconds
-        logger.log_info("fewshot/data",
-                       f"Using pre-cut tiles: {args.tile_root}")
-        train_tiles = PreCutTileAdapter(args.tile_root, "train")
-        val_tiles = PreCutTileAdapter(args.tile_root, "val")
-        # 使用适配器检测到的 tile 尺寸 | Use adapter-detected tile size
-        args.tile_size = getattr(train_tiles, '_tile_size', 896)
+        if args.tile_root:
+            # 自定义 tile 尺寸 + 官方 Fold | Custom tile size + official folds
+            logger.log_info("fewshot/config",
+                           f"Protocol: iSAID-5i (official folds) + custom tiles | "
+                           f"Fold {args.fold}, Shot={args.shot}")
+            logger.log_info("fewshot/config",
+                           f"Tile root: {args.tile_root}")
+            train_tiles = PreCutTileAdapter(args.tile_root, "train")
+            val_tiles = PreCutTileAdapter(args.tile_root, "val")
+            args.tile_size = getattr(train_tiles, '_tile_size', 896)
+        else:
+            # 官方 256×256 tiles | Official 256×256 tiles
+            args.tile_size = 256
+            logger.log_info("fewshot/config",
+                           f"Protocol: iSAID-5i (official) | Fold {args.fold}, Shot={args.shot}, "
+                           f"Tile={args.tile_size}px")
+            train_tiles = ISAID5iDataset(args.src_root, split="train", fold=args.fold)
+            val_tiles = ISAID5iDataset(args.src_root, split="val", fold=args.fold)
+
+        logger.log_info("fewshot/config",
+                       f"Base classes: {[CATEGORIES[c] for c in base_ids if c in CATEGORIES]}")
+        logger.log_info("fewshot/config",
+                       f"Novel classes: {[CATEGORIES[c] for c in novel_ids if c in CATEGORIES]}")
+
     else:
-        # 原始路径: 全图 → 动态 tile grid (慢) | Original: full-image → dynamic tile grid (slow)
-        logger.log_info("fewshot/data",
-                       f"Using dynamic tile wrapper (tile={args.tile_size}, stride={args.tile_stride})")
-        train_ds = ISAIDInstanceDataset(args.src_root, split="train")
-        val_ds = ISAIDInstanceDataset(args.src_root, split="val")
-        train_tiles = ISAIDTileWrapper(train_ds, tile_size=args.tile_size,
-                                        stride=args.tile_stride)
-        val_tiles = ISAIDTileWrapper(val_ds, tile_size=args.tile_size,
-                                      stride=args.tile_stride)
+        # ═══ AdaTile-FastSAM 协议 (896px tiles) | AdaTile-FastSAM Protocol ═══
+        CATEGORIES = ISAID_CATEGORIES
+        novel_ids = get_novel_classes(args.fold)
+        logger.log_info("fewshot/config",
+                       f"Protocol: AdaTile-FastSAM | Fold {args.fold}, Shot={args.shot}")
+
+        if args.tile_root:
+            # 快速路径: 预切 tiles → 秒级初始化 | Fast path: pre-cut tiles
+            logger.log_info("fewshot/data",
+                           f"Using pre-cut tiles: {args.tile_root}")
+            train_tiles = PreCutTileAdapter(args.tile_root, "train")
+            val_tiles = PreCutTileAdapter(args.tile_root, "val")
+            args.tile_size = getattr(train_tiles, '_tile_size', 896)
+        else:
+            # 原始路径: 全图 → 动态 tile grid (慢) | Original: full-image → dynamic
+            logger.log_info("fewshot/data",
+                           f"Using dynamic tile wrapper (tile={args.tile_size}, "
+                           f"stride={args.tile_stride})")
+            train_ds = ISAIDInstanceDataset(args.src_root, split="train")
+            val_ds = ISAIDInstanceDataset(args.src_root, split="val")
+            train_tiles = ISAIDTileWrapper(train_ds, tile_size=args.tile_size,
+                                            stride=args.tile_stride)
+            val_tiles = ISAIDTileWrapper(val_ds, tile_size=args.tile_size,
+                                          stride=args.tile_stride)
+
+    novel_classes = {cid: CATEGORIES[cid] for cid in novel_ids if cid in CATEGORIES}
+    logger.log_info("fewshot/config",
+                   f"Novel classes: {list(novel_classes.values())}")
 
     # ── Episode Datasets ──
-    train_ep = FewShotEpisodeDataset(
-        train_tiles, fold=args.fold, shot=args.shot, split="train",
-        episodes_per_epoch=args.episodes_per_epoch, seed=args.seed,
-        crop_support=bool(args.crop_support),
-    )
-    # For validation: use the SAME fold, but val split tiles
-    # validate_all_classes_batched needs class_to_images on val tiles
-    # We wrap val_tiles with the same episode interface for compat
-    val_ep = FewShotEpisodeDataset(
-        val_tiles, fold=args.fold, shot=args.shot, split="val",
-        episodes_per_epoch=args.eval_episodes, seed=args.seed + 1,
-        crop_support=False,
-    )
+    if args.dataset == "isaid5i":
+        # iSAID-5i 协议: train_ds 仅含 Base 类 tiles
+        # Meta-training: Base 类 episodes (学会 "如何从 Support 学习")
+        # Meta-testing:  Novel 类 episodes (评估泛化)
+        base_classes = {cid: CATEGORIES[cid] for cid in base_ids if cid in CATEGORIES}
+        logger.log_info("fewshot/config",
+                       f"Meta-training on Base classes: {list(base_classes.values())}")
+
+        train_ep = FewShotEpisodeDataset(
+            train_tiles, fold=args.fold, shot=args.shot, split="train",
+            episodes_per_epoch=args.episodes_per_epoch, seed=args.seed,
+            crop_support=bool(args.crop_support),
+            novel_classes=base_ids,  # ← 训练时采样 Base 类
+            category_names=CATEGORIES,
+        )
+        val_ep = FewShotEpisodeDataset(
+            val_tiles, fold=args.fold, shot=args.shot, split="val",
+            episodes_per_epoch=args.eval_episodes, seed=args.seed + 1,
+            crop_support=False,
+            novel_classes=novel_ids,  # ← 验证时采样 Novel 类
+            category_names=CATEGORIES,
+        )
+        # 训练目标: Base 类 | Training target: Base classes
+        train_target = base_classes
+        eval_target = novel_classes
+    else:
+        # AdaTile-FastSAM 协议: episodic training on Novel classes
+        train_ep = FewShotEpisodeDataset(
+            train_tiles, fold=args.fold, shot=args.shot, split="train",
+            episodes_per_epoch=args.episodes_per_epoch, seed=args.seed,
+            crop_support=bool(args.crop_support),
+            novel_classes=novel_ids,
+            category_names=CATEGORIES,
+        )
+        val_ep = FewShotEpisodeDataset(
+            val_tiles, fold=args.fold, shot=args.shot, split="val",
+            episodes_per_epoch=args.eval_episodes, seed=args.seed + 1,
+            crop_support=False,
+            novel_classes=novel_ids,
+            category_names=CATEGORIES,
+        )
+        train_target = novel_classes
+        eval_target = novel_classes
 
     logger.log_info("fewshot/data",
                    f"Train tiles: {len(train_tiles)}, Val tiles: {len(val_tiles)}")
 
     # ── Backbone ──
     backbone = FastSAMBackbone(freeze_backbone=args.freeze_encoder).to(device).eval()
-    logger.log_info("fewshot/model",
-                   f"FastSAM backbone (frozen={args.freeze_encoder}) on {device}")
+
+    # ── LoRA | 低秩适配 ──
+    if args.lora_rank > 0:
+        n_lora = backbone.apply_lora(rank=args.lora_rank)
+        logger.log_info("fewshot/model",
+                       f"FastSAM backbone (frozen={args.freeze_encoder}, "
+                       f"LoRA rank={args.lora_rank}, +{n_lora:,} params) on {device}")
+    else:
+        logger.log_info("fewshot/model",
+                       f"FastSAM backbone (frozen={args.freeze_encoder}) on {device}")
 
     # ── Feature dims ──
     with torch.no_grad():
@@ -295,21 +377,29 @@ def main():
     logger.log_info("fewshot/model", f"Decoder: {n_params:,} trainable params")
 
     # ── Train (reuse C-04 core loop) ──
-    # train_and_evaluate uses: decoder, backbone, train_ds, val_ds, device,
-    #   shot, target_classes, args, logger, output_dir, decoder_type, feature_level
     decoder, result, best_val = train_and_evaluate(
         decoder, backbone, train_ep, val_ep, device,
-        args.shot, novel_classes, args, logger, out_dir,
+        args.shot, train_target, args, logger, out_dir,
         decoder_type=decoder_type, feature_level=args.feature_level,
     )
 
-    # ── Final eval on Novel classes only ──
-    logger.log_info("fewshot/eval", "Final evaluation on Novel classes...")
-    final_result = evaluate_full(
-        decoder, backbone, train_ep, val_ep, device,
-        args.shot, args.eval_episodes, novel_classes,
-        logger, "fewshot/final", feature_level=args.feature_level,
-    )
+    # ── Final eval on Novel classes ──
+    if args.dataset == "isaid5i":
+        logger.log_info("fewshot/eval", "Final evaluation on Novel classes (iSAID-5i protocol)...")
+        # iSAID-5i: train_ds 不含 Novel 类，评估时 support 和 query 都从 val_ds
+        # evaluate_full 内部会从 val_ds 采样 support+query (train_ds 用于获取 class_to_images)
+        final_result = evaluate_full(
+            decoder, backbone, val_ep, val_ep, device,
+            args.shot, args.eval_episodes, eval_target,
+            logger, "fewshot/final", feature_level=args.feature_level,
+        )
+    else:
+        logger.log_info("fewshot/eval", "Final evaluation on Novel classes...")
+        final_result = evaluate_full(
+            decoder, backbone, train_ep, val_ep, device,
+            args.shot, args.eval_episodes, eval_target,
+            logger, "fewshot/final", feature_level=args.feature_level,
+        )
 
     # ── Save results ──
     summary = {

@@ -129,9 +129,18 @@ class ProtoRefineDecoder(nn.Module):
         ProtoRefineDecoder._logger.log_info("init", f"ProtoRefineDecoder: {n:,} trainable params")
 
     def forward(self, query_p4, fg_prototype, target_size=None):
-        q_norm = F.normalize(query_p4, dim=1, p=2)
-        p_norm = F.normalize(fg_prototype, dim=0, p=2)  # true cosine similarity
-        sim = (q_norm * p_norm.view(1, -1, 1, 1)).sum(dim=1, keepdim=True)
+        q_norm = F.normalize(query_p4, dim=1, p=2)  # [B, C, H, W]
+
+        if fg_prototype.dim() == 2:
+            # Multi-proto [K, C]: max-similarity across K prototypes
+            p_norm = F.normalize(fg_prototype, dim=1, p=2)  # [K, C]
+            sim = torch.einsum('bchw,kc->bkhw', q_norm, p_norm)  # [B, K, H, W]
+            sim = sim.max(dim=1, keepdim=True)[0]  # [B, 1, H, W] — max across K
+        else:
+            # Single proto [C]: standard cosine similarity
+            p_norm = F.normalize(fg_prototype, dim=0, p=2)
+            sim = (q_norm * p_norm.view(1, -1, 1, 1)).sum(dim=1, keepdim=True)
+
         sim = sim / self.temperature
         x = self.refine(sim)
         if target_size is not None:
@@ -187,9 +196,16 @@ class FiLMFewShotDecoder(nn.Module):
     def forward(self, query_p4, fg_prototype, target_size=None):
         x = self.proj(query_p4)
 
+        # Multi-proto [K, C]: 取平均用于 FiLM conditioning
+        # Multi-proto [K, C]: average for FiLM conditioning
+        if fg_prototype.dim() == 2:
+            proto_for_film = fg_prototype.mean(dim=0)  # [K, C] → [C]
+        else:
+            proto_for_film = fg_prototype
+
         # FiLM condition injection
-        if fg_prototype is not None and fg_prototype.abs().sum() > 1e-8:
-            film_out = self.film_mlp(fg_prototype)
+        if proto_for_film is not None and proto_for_film.abs().sum() > 1e-8:
+            film_out = self.film_mlp(proto_for_film)
             gamma, beta = film_out.chunk(2, dim=0)
             x = gamma[None, :, None, None] * x + beta[None, :, None, None]
         else:
@@ -288,22 +304,27 @@ class P3P4FiLMFusionDecoder(nn.Module):
         f4 = self.proj_p4(F.interpolate(query_p4, size=query_p3.shape[2:],
                           mode="bilinear", align_corners=False))
 
+        # Multi-proto [K, C]: 取平均用于 gate/FiLM
+        if fg_prototype.dim() == 2:
+            proto_for_cond = fg_prototype.mean(dim=0)
+        else:
+            proto_for_cond = fg_prototype
+
         # Prototype-guided gated fusion: α·P3 + (1-α)·P4
-        if fg_prototype is not None and fg_prototype.abs().sum() > 1e-8:
-            alpha = self.gate_mlp(fg_prototype)  # [fusion_dim]
+        if proto_for_cond is not None and proto_for_cond.abs().sum() > 1e-8:
+            alpha = self.gate_mlp(proto_for_cond)  # [fusion_dim]
             fused = alpha[None, :, None, None] * f3 + (1 - alpha)[None, :, None, None] * f4
         else:
             fused = 0.5 * f3 + 0.5 * f4  # fallback: equal weight
 
         # ── Utilization Module | 表示利用率模块 ──
-        # Predict per-channel utilization → supervised by ceiling gap
         util_map = self.util_conv(fused)  # [B, 256, H/8, W/8], 0~1
         self.util_mean = util_map.mean()  # scalar for supervision
         fused = fused * util_map
 
         # FiLM modulation
-        if fg_prototype is not None and fg_prototype.abs().sum() > 1e-8:
-            film_out = self.film_mlp(fg_prototype)
+        if proto_for_cond is not None and proto_for_cond.abs().sum() > 1e-8:
+            film_out = self.film_mlp(proto_for_cond)
             gamma, beta = film_out.chunk(2, dim=0)
             fused = gamma[None, :, None, None] * fused + beta[None, :, None, None]
 
@@ -431,7 +452,13 @@ def _decoder_forward(decoder, backbone, query_img, fg_prototype, target_size,
 
 
 def _extract_prototype(backbone, support_imgs, support_masks, feature_level, num_proto):
-    """提取 prototype, 处理单层和 p3p4 | Extract prototype for single or fusion."""
+    """提取 prototype, 处理单层和 p3p4 | Extract prototype for single or fusion.
+
+    当 num_proto > 1 时，返回 [K, C] 矩阵（K 个独立 prototype）。
+    Decoder 端用 max-similarity 跨 prototype 聚合。
+    When num_proto > 1, returns [K, C] matrix (K independent prototypes).
+    Decoder uses max-similarity across prototypes for aggregation.
+    """
     feats = backbone(support_imgs)
     if feature_level == "p3p4":
         support_feats_list = [feats["p4"][i] for i in range(len(support_masks))]
@@ -441,10 +468,8 @@ def _extract_prototype(backbone, support_imgs, support_masks, feature_level, num
     if num_proto > 1:
         proto = compute_multi_prototype(support_feats_list, support_masks,
                                         num_prototypes=num_proto)
-        # Average K prototypes → single vector for FiLM
-        # K-means centroids capture intra-class modes better than single mean
-        if proto.dim() == 2:
-            proto = proto.mean(dim=0)  # [K, C] → [C]
+        # 保留 [K, C] 矩阵 — 不再取平均！
+        # Keep [K, C] matrix — do NOT average!
     else:
         proto = compute_fg_prototype(support_feats_list, support_masks)
     return proto
@@ -511,40 +536,67 @@ def binary_recall_precision(pred: torch.Tensor, gt: torch.Tensor):
 def focal_dice_loss(logit: torch.Tensor, target: torch.Tensor,
                     gamma: float = 5.0, ce_weight: float = 0.5,
                     dice_weight: float = 0.5, gap_weight: float = 1.0):
-    """Focal (gamma=5) + Dice loss, optionally weighted by RUR gap."""
-    ce = F.binary_cross_entropy_with_logits(logit, target, reduction="none")
+    """Focal (gamma=5) + Dice + FG-presence loss.
+
+    修复 "全背景崩溃":
+    - pos_weight: 按 BG/FG 比例平衡 BCE, 防止背景主导梯度
+    - fg_presence: 惩罚预测全背景 (sigmoid max < 0.5), 仅在前景存在时生效
+
+    Fixes "all-background collapse":
+    - pos_weight: balances BCE by BG/FG ratio
+    - fg_presence: penalizes all-background predictions when GT has foreground
+    """
+    # pos_weight: FG/BG ratio for BCE balance
+    n_fg = target.sum().clamp(min=1)
+    n_bg = target.numel() - n_fg
+    pos_weight = (n_bg / n_fg).clamp(max=100.0)  # cap at 100:1
+
+    ce = F.binary_cross_entropy_with_logits(
+        logit, target, reduction="none",
+        pos_weight=pos_weight.expand_as(target))
     focal = ((1 - torch.exp(-ce)) ** gamma * ce).mean()
+
     prob = torch.sigmoid(logit)
     inter = (prob * target).sum()
     union = prob.sum() + target.sum() + 1e-8
     dice = 1.0 - (2 * inter / union)
-    loss = gap_weight * (ce_weight * focal + dice_weight * dice)
-    return loss, {"focal": focal.item(), "dice": dice.item()}
+
+    # FG presence: 如果 GT 有前景但 pred 全 <0.5, 额外惩罚
+    # Penalize "all-background" when GT has foreground pixels
+    fg_presence = 0.0
+    if n_fg > 10:
+        pred_max = prob.max()
+        if pred_max < 0.5:
+            fg_presence = (0.5 - pred_max) ** 2
+
+    loss = gap_weight * (ce_weight * focal + dice_weight * dice + 0.1 * fg_presence)
+    return loss, {"focal": focal.item(), "dice": dice.item(), "fg_presence": fg_presence}
 
 # ═══════════════════════════════════════════════════════════════════
 # Episodic Training | 回合式训练
 # ═══════════════════════════════════════════════════════════════════
 
 def train_episode(decoder, backbone, support_idxs, query_idx,
-                  train_ds, val_ds, query_class, device, opt,
+                  train_ds, query_class, device, opt,
                   scaler=None, grad_clip=1.0, use_amp=False,
                   feature_level="p4", use_dynamic_proto=False,
                   gap_weight=1.0):
     """Single training episode: Support -> proto -> query -> loss -> backward.
 
+    Support and Query BOTH come from train_ds (standard Few-shot protocol).
     Returns: (loss: float, timing: dict) or (None, None) if empty prototype.
     """
     t0 = time.perf_counter()
 
-    # Support — image loading + mask rendering
+    # Support — image loading + mask rendering (from train_ds)
     support_imgs = torch.stack([train_ds.load_image(si) for si in support_idxs]).to(device)
     support_masks = [train_ds.render_class_mask(si, query_class).to(device)
                      for si in support_idxs]
     t_load_support = time.perf_counter()
 
-    # Query — image loading + mask rendering
-    query_img = val_ds.load_image(query_idx).unsqueeze(0).to(device)
-    query_mask = val_ds.render_class_mask(query_idx, query_class)
+    # Query — image loading + mask rendering (also from train_ds)
+    query_img = train_ds.load_image(query_idx).unsqueeze(0).to(device)
+    query_mask = train_ds.render_class_mask(query_idx, query_class)
     query_mask = query_mask.unsqueeze(0).unsqueeze(0).to(device)  # [1,1,H,W]
     t_load_query = time.perf_counter()
 
@@ -1083,7 +1135,17 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
     # Optimizer & Scheduler
     # beta2=0.95 适合少样本: 有效记忆 ~20 步 (vs 默认 0.999 的 ~1000 步)
     # beta2=0.95 for few-shot: effective memory ~20 steps (vs default 0.999 ~1000 steps)
-    opt = torch.optim.AdamW(decoder.parameters(), lr=args.lr,
+    # 优化器参数: decoder + 可选的 backbone LoRA
+    # Optimizer params: decoder + optional backbone LoRA
+    opt_params = list(decoder.parameters())
+    lora_params = [p for p in backbone.parameters() if p.requires_grad and p is not decoder]
+    lora_params = [p for p in lora_params if p not in set(opt_params)]
+    if lora_params:
+        opt_params += lora_params
+        logger.log_info(f"{tag}/opt",
+                       f"Optimizing {sum(p.numel() for p in opt_params):,} params "
+                       f"(+{sum(p.numel() for p in lora_params):,} LoRA)")
+    opt = torch.optim.AdamW(opt_params, lr=args.lr,
                             betas=(0.9, 0.95), weight_decay=args.weight_decay)
 
     from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
@@ -1202,15 +1264,15 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
         for _ in pbar:
             query_class = int(rng.choice(class_list, p=class_sample_probs))
             candidates = train_ds.class_to_images(query_class)
-            val_candidates = val_ds.class_to_images(query_class)
-            if len(candidates) < shot or not val_candidates:
+            if len(candidates) < shot + 1:
                 continue
 
-            support_idxs = rng.choice(candidates, shot, replace=False)
-            qi = int(rng.choice(val_candidates))
+            indices = rng.choice(candidates, shot + 1, replace=False)
+            support_idxs = indices[:shot].tolist()
+            qi = int(indices[shot])  # Query also from train
 
             loss, ep_timing = train_episode(decoder, backbone, support_idxs, qi,
-                                train_ds, val_ds, query_class, device, opt,
+                                train_ds, query_class, device, opt,
                                 scaler=scaler, grad_clip=args.grad_clip,
                                 use_amp=use_amp, feature_level=feature_level,
                                 use_dynamic_proto=args.use_dynamic_proto,

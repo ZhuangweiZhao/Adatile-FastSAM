@@ -54,6 +54,8 @@ class FewShotEpisodeDataset:
         seed: int = 42,
         crop_support: bool = True,
         crop_margin: float = 0.2,
+        novel_classes: Optional[list[int]] = None,
+        category_names: Optional[dict] = None,
     ):
         self.ds = tile_dataset
         self.fold = fold
@@ -63,7 +65,13 @@ class FewShotEpisodeDataset:
         self.crop_support = crop_support
         self.crop_margin = crop_margin  # bbox扩张比例 | bbox expansion ratio
 
-        self.novel_classes = get_novel_classes(fold)
+        # 如果外部传入了 novel_classes，直接使用；否则从 fewshot_split 获取
+        # If novel_classes provided externally, use them; otherwise get from fewshot_split
+        if novel_classes is not None:
+            self.novel_classes = list(novel_classes)
+        else:
+            self.novel_classes = get_novel_classes(fold)
+
         self.valid_novel = []
         for cid in self.novel_classes:
             n_images = len(tile_dataset.class_to_images(cid))
@@ -71,7 +79,7 @@ class FewShotEpisodeDataset:
                 self.valid_novel.append(cid)
 
         self.rng = np.random.RandomState(seed)
-        self.class_names = ISAID_CATEGORIES
+        self.class_names = category_names if category_names is not None else ISAID_CATEGORIES
 
         if not self.valid_novel:
             raise ValueError(f"Fold {fold}: no Novel classes with >= {shot} images!")

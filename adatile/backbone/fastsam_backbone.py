@@ -212,14 +212,8 @@ class FastSAMBackbone(nn.Module):
         # 执行前向（通过 YOLO Sequential，绕过 predict 的预处理）
         # Forward through YOLO Sequential (bypasses predict's preprocessing)
         with torch.no_grad():
-            try:
-                # 直接调用底层 sequential model 的 forward
-                # Directly call underlying sequential model's forward
-                self.model.model.model(x)
-            except (TypeError, AttributeError, RuntimeError) as e:
-                # Fallback: YOLO model API may require different call signature | API fallback
-                self.model.model(x)
-                self.model.model(x)
+            # 使用 _predict_once 处理多输入层路由 | Use _predict_once for multi-input routing
+            self.model.model._predict_once(x)
 
         # 分析各层输出的步长 | Analyze strides of each layer's output
         candidates_8  = []  # stride-8 candidates
@@ -429,55 +423,133 @@ class FastSAMBackbone(nn.Module):
         """安全冻结：设置 requires_grad=False | Safe freeze: requires_grad=False."""
         self._apply_freeze()
 
+    def __del__(self) -> None:
+        """清理钩子 | Clean up hooks."""
+        self._remove_all_hooks()
+
+    # ── LoRA | 低秩适配 ───────────────────────────────────────
+
+    def apply_lora(self, rank: int = 4) -> int:
+        """
+        在冻结 backbone 的 P3/P4 输出特征后添加 Feature LoRA 适配器。
+        Add Feature LoRA adapters after frozen P3/P4 outputs.
+
+        安全：不修改 YOLOv8 内部结构，只在特征提取后添加可训练的轻量适配器。
+        Safe: does NOT modify YOLOv8 internals, only adds trainable adapters
+        after feature extraction points.
+
+        :param rank: LoRA 秩 | LoRA rank (default 4).
+        :return: 添加的参数数量 | Number of parameters added.
+        """
+        import torch.nn as nn
+
+        # P3: stride=8, 960 channels → add LoRA
+        # P4: stride=16, 1280 channels → add LoRA
+        self._lora_p3 = nn.Sequential(
+            nn.Conv2d(960, rank, 1, bias=False),
+            nn.Conv2d(rank, 960, 1, bias=False),
+        )
+        self._lora_p4 = nn.Sequential(
+            nn.Conv2d(1280, rank, 1, bias=False),
+            nn.Conv2d(rank, 1280, 1, bias=False),
+        )
+        # 初始化: 第二层权重为 0 → LoRA 初始不改变特征
+        nn.init.kaiming_uniform_(self._lora_p3[0].weight)
+        nn.init.zeros_(self._lora_p3[1].weight)
+        nn.init.kaiming_uniform_(self._lora_p4[0].weight)
+        nn.init.zeros_(self._lora_p4[1].weight)
+
+        self._lora_p3.to(torch.device(self._device))
+        self._lora_p4.to(torch.device(self._device))
+        self._has_lora = True
+
+        n_params = sum(p.numel() for p in list(self._lora_p3.parameters()) +
+                       list(self._lora_p4.parameters()))
+        self.logger.log_info(
+            "backbone/lora",
+            f"Feature LoRA applied: rank={rank}, +{n_params:,} params "
+            f"(P3: 960→{rank}→960, P4: 1280→{rank}→1280)",
+        )
+        return n_params
+
     # ── 前向传播 | Forward Pass ───────────────────────────────
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        """
-        前向传播，返回多尺度特征图 | Forward pass, returns multi-scale feature maps.
-
-        首次调用时自动探测钩子位置。后续调用直接使用已探测的位置。
-        Auto-probes hook locations on first call. Subsequent calls use cached positions.
-
-        :param x: 输入图像张量 [B, 3, H, W] 值域 [0, 1] 或 [0, 255] Input image tensor [B, 3, H, W] in [0, 1] or [0, 255].
-        :type x: torch.Tensor
-
-        :return: dict with: "p4": [B, C4, H/16, W/16]  stride-16 特征 | stride-16 features "p8": [B, C8, H/32, W/32]  stride-32 特征 | stride-32 features
-        :rtype: dict[str, torch.Tensor]
-        """
-        # 首次调用：探测钩子位置 | First call: probe hook locations
+        """前向传播，返回多尺度特征图 | Forward pass, returns multi-scale feature maps."""
         if self._hook_p4_idx is None or self._hook_p8_idx is None or self._hook_p3_idx is None:
             self._probe_strides(x)
             self._register_final_hooks()
 
-        # 确保在正确的设备上 | Ensure on correct device
         if x.device != torch.device(self._device):
             x = x.to(self._device)
 
         self._features.clear()
 
-        # 执行前向传播通过 YOLO Sequential
-        # Forward through YOLO Sequential
         with torch.set_grad_enabled(not self._freeze_backbone):
-            try:
-                self.model.model.model(x)
-            except Exception:
-                # 回退：通过 model.predict | Fallback: through model.predict
-                self.model.model(x)
+            # 使用 _predict_once 而非 Sequential 直调：
+            # YOLOv8 neck 中的 C2f 层需要多尺度特征路由 (m.f 索引)，
+            # nn.Sequential 直调会绕过这个路由，导致通道不匹配崩溃。
+            # Use _predict_once (NOT Sequential direct call):
+            # C2f layers in YOLOv8 neck need multi-scale feature routing (m.f indices).
+            # Direct Sequential call bypasses this → channel mismatch crash.
+            self.model.model._predict_once(x)
 
-        # 返回提取的特征 | Return extracted features
         result: dict[str, torch.Tensor] = {}
         if "p3" in self._features:
-            result["p3"] = self._features["p3"]
+            f = self._features["p3"]
+            if getattr(self, '_has_lora', False):
+                f = f + self._lora_p3(f)
+            result["p3"] = f
         if "p4" in self._features:
-            result["p4"] = self._features["p4"]
+            f = self._features["p4"]
+            if getattr(self, '_has_lora', False):
+                f = f + self._lora_p4(f)
+            result["p4"] = f
         if "p8" in self._features:
             result["p8"] = self._features["p8"]
-
         return result
 
-    def __del__(self) -> None:
-        """清理钩子 | Clean up hooks."""
-        self._remove_all_hooks()
+
+class ConvLoRA(nn.Module):
+    """
+    Conv2d LoRA 适配器 | Conv2d LoRA Adapter.
+
+    y = W*x + (alpha/r) * B(A(x))
+    原始权重 W 冻结，仅训练 A 和 B。
+    """
+
+    def __init__(self, conv: nn.Conv2d, rank: int = 4, alpha: float = 1.0):
+        super().__init__()
+        self.conv = conv  # 原始冻结 Conv | Frozen original Conv
+        self.rank = rank
+        self.alpha = alpha
+        self.scale = alpha / rank
+
+        # 冻结原始权重 | Freeze original weights
+        for p in conv.parameters():
+            p.requires_grad = False
+
+        # LoRA: 1×1 down → 1×1 up
+        in_ch = conv.in_channels
+        out_ch = conv.out_channels
+        self.lora_down = nn.Conv2d(in_ch, rank, 1, bias=False)
+        self.lora_up = nn.Conv2d(rank, out_ch, 1, bias=False)
+        nn.init.kaiming_uniform_(self.lora_down.weight, a=5**0.5)
+        nn.init.zeros_(self.lora_up.weight)
+
+        self.lora_params = sum(p.numel() for p in [self.lora_down.weight, self.lora_up.weight])
+
+    def forward(self, x):
+        """前向传播: y = W*x + (alpha/r) * B(A(x))"""
+        y = self.conv(x)
+        lora_y = self.lora_up(self.lora_down(x))
+        return y + self.scale * lora_y
+
+
+
+# ═══════════════════════════════════════════════════════════════
+# ConvLoRA: 独立模块类 | Standalone module class
+# ═══════════════════════════════════════════════════════════════
 
 
 # ── 工厂函数 | Factory Function ───────────────────────────────

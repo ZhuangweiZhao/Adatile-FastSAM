@@ -98,6 +98,63 @@ _ORIGINAL_NAME_ALIASES: Dict[str, str] = {
 
 
 # ═══════════════════════════════════════════════════════════════════
+# 标准 iSAID-5i 类别映射 | Standard iSAID-5i Category Mapping
+# ═══════════════════════════════════════════════════════════════════
+# 官方 iSAID-5i Few-shot Benchmark 使用标准类别 ID (与原始 iSAID 一致)。
+# 此映射用于 --dataset isaid5i 协议，与已发表论文 (PANet/PFENet/HSNet等) 直接可比。
+# Official iSAID-5i Few-shot Benchmark uses standard category IDs (same as original iSAID).
+# This mapping is for --dataset isaid5i protocol, directly comparable with published works.
+
+ISAID5I_CATEGORIES: OrderedDict[str, str] = OrderedDict([
+    (1, "ship"),
+    (2, "storage_tank"),
+    (3, "baseball_diamond"),
+    (4, "tennis_court"),
+    (5, "basketball_court"),
+    (6, "ground_track_field"),
+    (7, "bridge"),
+    (8, "large_vehicle"),
+    (9, "small_vehicle"),
+    (10, "helicopter"),
+    (11, "swimming_pool"),
+    (12, "roundabout"),
+    (13, "soccer_ball_field"),
+    (14, "plane"),
+    (15, "harbor"),
+])
+
+# 标准 iSAID-5i 的 Base/Novel 划分（官方 3-Fold）
+# Standard iSAID-5i Base/Novel split (official 3-Fold)
+ISAID5I_FOLDS = {
+    0: {
+        "novel": [9, 15, 11, 5, 12],
+        # small_vehicle, harbor, swimming_pool, basketball_court, roundabout
+        "base":  [1, 2, 3, 4, 6, 7, 8, 10, 13, 14],
+    },
+    1: {
+        "novel": [14, 8, 7, 6, 4],
+        # plane, large_vehicle, bridge, ground_track_field, tennis_court
+        "base":  [1, 2, 3, 5, 9, 10, 11, 12, 13, 15],
+    },
+    2: {
+        "novel": [1, 2, 10, 13, 3],
+        # ship, storage_tank, helicopter, soccer_ball_field, baseball_diamond
+        "base":  [4, 5, 6, 7, 8, 9, 11, 12, 14, 15],
+    },
+}
+
+
+def get_isaid5i_novel_classes(fold: int) -> list[int]:
+    """获取指定 Fold 的 iSAID-5i Novel 类别 ID | Get iSAID-5i novel class IDs for a fold."""
+    return ISAID5I_FOLDS[fold]["novel"]
+
+
+def get_isaid5i_base_classes(fold: int) -> list[int]:
+    """获取指定 Fold 的 iSAID-5i Base 类别 ID | Get iSAID-5i base class IDs for a fold."""
+    return ISAID5I_FOLDS[fold]["base"]
+
+
+# ═══════════════════════════════════════════════════════════════════
 # 已废弃：旧的硬编码映射（仅对 train 有效，不要使用）
 # Deprecated: old hardcoded mapping (train-only, DO NOT USE)
 # ═══════════════════════════════════════════════════════════════════
