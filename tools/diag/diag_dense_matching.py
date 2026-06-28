@@ -69,9 +69,11 @@ def dense_matching(
     Dense feature matching: support FG pixels → query pixels.
     密集特征匹配: 对每个 query 位置，与所有 support FG 像素计算 cosine 相似度。
 
-    Strategy A (max):  每个 query 位置 = max_{support FG} cos(q_i, s_j)
-    Strategy B (mean): 每个 query 位置 = mean_{support FG} cos(q_i, s_j)
-    Strategy C (topk): 每个 query 位置 = mean of top-K support FG cosines
+    Strategy A (max):     每个 query 位置 = max_{support FG} cos(q_i, s_j)
+    Strategy B (mean):    每个 query 位置 = mean_{support FG} cos(q_i, s_j)
+    Strategy C (topk):    每个 query 位置 = mean of top-K support FG cosines
+    Strategy D (softmax): 每个 query 位置 = cos(q_i, Σ_j softmax(cos(q_i,s_j)/τ)·s_j)
+                          ↑ 最接近 Cross-Attention 的实际行为
 
     :return: [1, 1, H_q, W_q] 相似度图 (未归一化)
     """
@@ -122,6 +124,16 @@ def dense_matching(
             k_eff = min(topk, N_total)
             topk_vals, _ = sim_chunk.topk(k_eff, dim=0)
             sim_flat[0, q_start:q_end] = topk_vals.mean(dim=0)
+        elif strategy == "softmax":
+            # 最接近 Cross-Attention: softmax-weighted sum of support → cos with query
+            # Most similar to Cross-Attention: softmax-weighted support → cos with query
+            tau = 0.1  # temperature (same as ProtoRefineDecoder)
+            attn = (sim_chunk / tau).softmax(dim=0)  # [N_total, chunk]
+            # Weighted sum of support features: [C, N_total] @ [N_total, chunk] = [C, chunk]
+            s_weighted = s_fg @ attn  # [C, chunk]
+            s_weighted = F.normalize(s_weighted, p=2, dim=0)  # L2-normalize
+            # Cosine similarity between query and attention-weighted support
+            sim_flat[0, q_start:q_end] = (q_chunk * s_weighted).sum(dim=0)  # [chunk]
         else:  # mean
             sim_flat[0, q_start:q_end] = sim_chunk.mean(dim=0)
 
@@ -357,6 +369,9 @@ def run_dense_episode(
     # ── Strategy C: Dense-Mean ──
     dense_mean_p4 = dense_matching(s_p4, s_mask_batch, q_p4, strategy="mean")
 
+    # ── Strategy D: Dense-Softmax ── (closest to Cross-Attention)
+    dense_softmax_p4 = dense_matching(s_p4, s_mask_batch, q_p4, strategy="softmax")
+
     # Resize to original spatial size
     proto_sim = F.interpolate(proto_sim_p4, size=(H_orig, W_orig),
                               mode="bilinear", align_corners=False).squeeze()
@@ -364,11 +379,14 @@ def run_dense_episode(
                                   mode="bilinear", align_corners=False).squeeze()
     dense_mean_sim = F.interpolate(dense_mean_p4, size=(H_orig, W_orig),
                                    mode="bilinear", align_corners=False).squeeze()
+    dense_softmax_sim = F.interpolate(dense_softmax_p4, size=(H_orig, W_orig),
+                                       mode="bilinear", align_corners=False).squeeze()
 
     # Metrics
     proto_metrics = compute_best_iou(proto_sim, query_mask_orig)
     dense_max_metrics = compute_best_iou(dense_max_sim, query_mask_orig)
     dense_mean_metrics = compute_best_iou(dense_mean_sim, query_mask_orig)
+    dense_softmax_metrics = compute_best_iou(dense_softmax_sim, query_mask_orig)
 
     # Visualization data
     def to_display(t):
@@ -379,12 +397,14 @@ def run_dense_episode(
         "proto": proto_metrics,
         "dense_max": dense_max_metrics,
         "dense_mean": dense_mean_metrics,
+        "dense_softmax": dense_softmax_metrics,
         "fg_pixels": int(query_mask_orig.sum().item()),
         "query_img": to_display(query_img.squeeze(0)),
         "gt_mask": query_mask_orig.cpu().numpy(),
         "proto_sim": proto_sim.cpu().numpy(),
         "dense_max_sim": dense_max_sim.cpu().numpy(),
         "dense_mean_sim": dense_mean_sim.cpu().numpy(),
+        "dense_softmax_sim": dense_softmax_sim.cpu().numpy(),
     }
 
 
@@ -503,12 +523,14 @@ def main():
         if cls_results:
             proto_ious = [r["proto"]["best_iou"] for r in cls_results]
             dense_ious = [r["dense_max"]["best_iou"] for r in cls_results]
+            softmax_ious = [r["dense_softmax"]["best_iou"] for r in cls_results]
             per_class[cls_id] = {
                 "name": cls_name,
                 "n_episodes": len(cls_results),
                 "proto_iou_mean": round(np.mean(proto_ious), 4),
                 "dense_max_iou_mean": round(np.mean(dense_ious), 4),
                 "dense_mean_iou_mean": round(np.mean([r["dense_mean"]["best_iou"] for r in cls_results]), 4),
+                "dense_softmax_iou_mean": round(np.mean(softmax_ious), 4),
                 "proto_peak_gt": round(np.mean([r["proto"]["peak_in_gt"] for r in cls_results]), 4),
                 "dense_peak_gt": round(np.mean([r["dense_max"]["peak_in_gt"] for r in cls_results]), 4),
             }
@@ -531,33 +553,38 @@ def main():
         p = avg([r["proto"]["best_iou"] for r in results])
         d = avg([r["dense_max"]["best_iou"] for r in results])
         dm = avg([r["dense_mean"]["best_iou"] for r in results])
+        ds = avg([r["dense_softmax"]["best_iou"] for r in results])
         pp = avg([r["proto"]["peak_in_gt"] for r in results])
         dp = avg([r["dense_max"]["peak_in_gt"] for r in results])
         gain = d - p
+        gain_softmax = ds - p
         print(f"\n  ── {label} ({len(results)} eps) ──")
-        print(f"  Proto bestIoU:     {p:.4f}  (peak_in_GT={pp:.1%})")
-        print(f"  Dense-Max bestIoU: {d:.4f}  (peak_in_GT={dp:.1%})  ← KEY RESULT")
-        print(f"  Dense-Mean bestIoU:{dm:.4f}")
-        print(f"  Δ (Dense − Proto): {gain:+.4f}")
-        if gain > 0.05:
-            print(f"  ✅ Dense matching SIGNIFICANTLY better than prototype")
-        elif gain > 0.01:
-            print(f"  🟡 Dense matching slightly better")
+        print(f"  Proto bestIoU:         {p:.4f}  (peak={pp:.1%})")
+        print(f"  Dense-Max bestIoU:     {d:.4f}  (peak={dp:.1%})  ← upper bound")
+        print(f"  Dense-Softmax bestIoU: {ds:.4f}                    ← ≈Cross-Attn")
+        print(f"  Dense-Mean bestIoU:    {dm:.4f}")
+        print(f"  Δ Max−Proto:    {gain:+.4f}")
+        print(f"  Δ Softmax−Proto:{gain_softmax:+.4f}")
+        if gain_softmax > 0.03:
+            print(f"  ✅ Dense-Softmax SIGNIFICANTLY better — Cross-Attn almost certain to help")
+        elif gain_softmax > 0.01:
+            print(f"  🟡 Dense-Softmax moderately better — Cross-Attn worth trying")
         else:
-            print(f"  🔴 Dense matching NOT better — feature maps also lack matching signal")
+            print(f"  🔴 Dense-Softmax NOT better — even spatial correspondence is weak")
 
     # Per-class
-    print(f"\n  {'Class':<22s} {'Type':<6s} {'Proto':>8s} {'DenseMax':>8s} {'Δ':>8s} {'ProtoPeak':>9s} {'DensePeak':>10s}")
-    print(f"  {'─'*75}")
+    print(f"\n  {'Class':<22s} {'Type':<6s} {'Proto':>7s} {'DenseM':>7s} {'SoftMx':>7s} {'ΔMax':>7s} {'ΔSoft':>7s}")
+    print(f"  {'─'*70}")
     for cls_id in sorted(target_classes):
         if cls_id not in per_class:
             continue
         c = per_class[cls_id]
         ct = "NOVEL" if cls_id in novel_set else "BASE"
-        delta = c["dense_max_iou_mean"] - c["proto_iou_mean"]
+        delta_max = c["dense_max_iou_mean"] - c["proto_iou_mean"]
+        delta_soft = c["dense_softmax_iou_mean"] - c["proto_iou_mean"]
         print(f"  {c['name']:<22s} {ct:<6s} "
-              f"{c['proto_iou_mean']:>8.4f} {c['dense_max_iou_mean']:>8.4f} "
-              f"{delta:>+8.4f} {c['proto_peak_gt']:>8.1%} {c['dense_peak_gt']:>9.1%}")
+              f"{c['proto_iou_mean']:>7.4f} {c['dense_max_iou_mean']:>7.4f} "
+              f"{c['dense_softmax_iou_mean']:>7.4f} {delta_max:>+7.4f} {delta_soft:>+7.4f}")
 
     # ── Verdict ──
     print(f"\n{'█'*70}")
@@ -566,21 +593,21 @@ def main():
 
     novel_gain = avg([r["dense_max"]["best_iou"] - r["proto"]["best_iou"]
                        for r in novel_results]) if novel_results else 0.0
-    base_gain = avg([r["dense_max"]["best_iou"] - r["proto"]["best_iou"]
-                      for r in base_results]) if base_results else 0.0
+    novel_gain_soft = avg([r["dense_softmax"]["best_iou"] - r["proto"]["best_iou"]
+                            for r in novel_results]) if novel_results else 0.0
 
-    if novel_gain > 0.05:
-        print(f"  ✅ Dense matching provides SIGNIFICANT gain over prototype")
-        print(f"     (Novel Δ={novel_gain:+.3f}, Base Δ={base_gain:+.3f})")
-        print(f"     → Cross-Attention is strongly recommended.")
-    elif novel_gain > 0.02:
-        print(f"  🟡 Dense matching provides MODERATE gain")
+    if novel_gain_soft > 0.05:
+        print(f"  ✅ Dense-Softmax provides SIGNIFICANT gain over prototype")
+        print(f"     (Novel ΔSoft={novel_gain_soft:+.3f})")
+        print(f"     → Cross-Attention is strongly validated by this diagnostic.")
+    elif novel_gain_soft > 0.02:
+        print(f"  🟡 Dense-Softmax provides MODERATE gain (Novel ΔSoft={novel_gain_soft:+.3f})")
         print(f"     → Cross-Attention worth trying but not guaranteed.")
     else:
-        print(f"  🔴 Dense matching does NOT improve over prototype")
-        print(f"     (Novel Δ={novel_gain:+.3f}, Base Δ={base_gain:+.3f})")
-        print(f"     → FastSAM feature maps lack cross-image matching signal.")
-        print(f"     → Consider: (1) LoRA fine-tune backbone, (2) Different foundation model")
+        print(f"  🔴 Dense-Softmax does NOT improve over prototype")
+        print(f"     (Novel ΔSoft={novel_gain_soft:+.3f})")
+        print(f"     → Even dense spatial correspondence is weak in FastSAM P4.")
+        print(f"     → Consider: LoRA fine-tune backbone to improve feature matching quality.")
 
     print(f"{'█'*70}\n")
 
@@ -589,11 +616,14 @@ def main():
         "config": {"fold": args.fold, "shot": args.shot},
         "summary": {
             "base": {"proto_iou": avg([r["proto"]["best_iou"] for r in base_results]),
-                      "dense_max_iou": avg([r["dense_max"]["best_iou"] for r in base_results])},
+                      "dense_max_iou": avg([r["dense_max"]["best_iou"] for r in base_results]),
+                      "dense_softmax_iou": avg([r["dense_softmax"]["best_iou"] for r in base_results])},
             "novel": {"proto_iou": avg([r["proto"]["best_iou"] for r in novel_results]),
-                       "dense_max_iou": avg([r["dense_max"]["best_iou"] for r in novel_results])},
-            "novel_dense_gain": novel_gain,
-            "base_dense_gain": base_gain,
+                       "dense_max_iou": avg([r["dense_max"]["best_iou"] for r in novel_results]),
+                       "dense_softmax_iou": avg([r["dense_softmax"]["best_iou"] for r in novel_results])},
+            "novel_softmax_gain": novel_gain_soft,
+            "base_softmax_gain": avg([r["dense_softmax"]["best_iou"] - r["proto"]["best_iou"]
+                                       for r in base_results]) if base_results else 0.0,
         },
         "per_class": {str(k): v for k, v in per_class.items()},
     }
