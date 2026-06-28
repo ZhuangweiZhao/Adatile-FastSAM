@@ -51,7 +51,7 @@ ISAID_CATEGORIES: list[dict] = [
     {"id": 8, "name": "soccer_ball_field"},
     {"id": 9, "name": "tennis_court"},
     {"id": 10, "name": "swimming_pool"},
-    {"id": 11, "name": "road"},
+    {"id": 11, "name": "baseball_diamond"},
     {"id": 12, "name": "basketball_court"},
     {"id": 13, "name": "bridge"},
     {"id": 14, "name": "helicopter"},

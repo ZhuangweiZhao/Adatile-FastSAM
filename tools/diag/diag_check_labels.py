@@ -26,7 +26,7 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 ISAID_NAMES = {
     0: "bg", 1: "small_vehicle", 2: "large_vehicle", 3: "plane",
     4: "storage_tank", 5: "ship", 6: "harbor", 7: "ground_track",
-    8: "soccer", 9: "tennis", 10: "pool", 11: "road",
+    8: "soccer", 9: "tennis", 10: "pool", 11: "baseball",
     12: "basketball", 13: "bridge", 14: "helicopter", 15: "roundabout",
 }
 

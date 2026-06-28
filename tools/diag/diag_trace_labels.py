@@ -26,7 +26,7 @@ ISAID_NAMES = {
     1: "small_vehicle", 2: "large_vehicle", 3: "plane",
     4: "storage_tank", 5: "ship", 6: "harbor",
     7: "ground_track_field", 8: "soccer_ball_field", 9: "tennis_court",
-    10: "swimming_pool", 11: "road", 12: "basketball_court",
+    10: "swimming_pool", 11: "baseball_diamond", 12: "basketball_court",
     13: "bridge", 14: "helicopter", 15: "roundabout",
 }
 
