@@ -668,10 +668,11 @@ def main():
 
     # Save
     result_path = out_dir / "routing_results.json"
-    json.dump({
-        "args": {k: str(v) for k, v in vars(args).items()},
-        "summary": {s: {str(k): v for k, v in ss.items()} for s, ss in summary.items()},
-    }, result_path, indent=2)
+    with open(result_path, "w") as f:
+        json.dump({
+            "args": {k: str(v) for k, v in vars(args).items()},
+            "summary": {s: {str(k): v for k, v in ss.items()} for s, ss in summary.items()},
+        }, f, indent=2)
     logger.log_info("report", f"\nResults saved → {result_path}")
     logger.log_info("done", "Token Routing Verification Complete.")
 
