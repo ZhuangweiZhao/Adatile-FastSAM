@@ -46,7 +46,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from adatile.logging import get_logger, ConsoleBackend, FileBackend
+from adatile.logging import get_logger
+from adatile.logging.backends import ConsoleBackend, FileBackend
 from adatile.utils.seed import set_seed
 from adatile.utils.label_mapping import ISAID5I_CATEGORIES, ISAID5I_FOLDS
 from adatile.utils.prototype import compute_fg_prototype
