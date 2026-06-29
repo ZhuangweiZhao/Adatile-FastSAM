@@ -819,6 +819,12 @@ def validate_all_classes_batched(decoder, backbone, train_ds, val_ds,
     num_proto = getattr(decoder, 'num_prototypes', 1)
     t_start = time.perf_counter()
 
+    # 每轮验证前清空 tile 缓存 | Clear tile cache before each validation
+    for ds in [train_ds, val_ds]:
+        adapter = getattr(ds, 'ds', None)
+        if adapter is not None and hasattr(adapter, 'clear_cache'):
+            adapter.clear_cache()
+
     # Phase 1: 预采样所有 episode | Pre-sample all episodes
     episodes: list[tuple[list[int], int, int]] = []  # (support_idxs, query_idx, cls)
     for cls_id in sorted(target_classes):

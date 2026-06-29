@@ -245,8 +245,14 @@ class PreCutTileAdapter:
         self._cache_order.append(tile_idx)
 
     def _evict_if_needed(self):
-        """No-op: cache bounded by validation episode count, well within server RAM."""
+        """No-op: cache cleaned manually each validation."""
         pass
+
+    def clear_cache(self):
+        """清空 tile 缓存（每次验证前调用）| Clear tile cache (called before each validation)."""
+        self._img_cache.clear()
+        self._mask_cache.clear()
+        self._cache_order.clear()
 
     def __len__(self):
         return len(self._tiles)
