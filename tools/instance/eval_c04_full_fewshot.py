@@ -476,30 +476,28 @@ class SparseSupportCrossAttnDecoder(nn.Module):
     Sparse Support Memory Cross-Attention Decoder.
     稀疏支持记忆交叉注意力解码器.
 
-    核心创新 | Core Innovation:
-        不再用 KMeans 聚类原型，而是直接从 support FG 像素中 learnably select
-        Top-K 个代表性 token → 保留空间多样性 → Cross-Attention。
+    不做 learned token selection (会 shortcut), 直接从 support FG 像素
+    random sample → Cross-Attn K/V。与 Dense Matching 诊断一致。
 
-    Instead of KMeans proto clustering, directly select Top-K representative
-    tokens from all support FG pixels via learnable importance scoring.
-    This preserves spatial diversity for cross-attention.
+    No learned token selection (would shortcut). Directly random-sample
+    from support FG pixels → Cross-Attn K/V. Consistent with Dense Matching diagnosis.
 
     Architecture | 架构:
-        Support FG pixels [N, 1280] → Importance MLP → scores → Top-K
-        Selected tokens [K, 1280] → Token Projection → [K, 256]
-        Query P3+P4 → Fusion → CrossAttn(Q=query, K=selected, V=selected)
+        Support FG pixels [N, C] → random sample → [K≤128, C]
+        → Token Projection → [K, 256]
+        Query P3+P4 → Fusion → CrossAttn(Q=query, K/V=sampled_tokens)
         → Upsample → Mask
 
-    ~1.4M params. K=64 by default (sparse but spatially diverse).
+    ~1.3M params.
     """
 
     def __init__(self, feat_dim_p3: int = 640, feat_dim_p4: int = 1280,
-                 hidden_dim: int = 256, num_tokens: int = 64):
+                 hidden_dim: int = 256, max_tokens: int = 128):
         super().__init__()
         self.hidden_dim = hidden_dim
-        self.num_tokens = num_tokens
+        self.max_tokens = max_tokens
 
-        # P3/P4 projection + gate (same as P3P4CrossAttn)
+        # P3/P4 projection + gate
         self.proj_p3 = nn.Sequential(
             nn.Conv2d(feat_dim_p3, hidden_dim, 1, bias=False),
             nn.BatchNorm2d(hidden_dim), nn.ReLU(inplace=True),
@@ -513,19 +511,13 @@ class SparseSupportCrossAttnDecoder(nn.Module):
             nn.Linear(128, hidden_dim), nn.Sigmoid(),
         )
 
-        # Token importance scorer: 1280 → 64 → 1 (sigmoid)
-        self.token_score = nn.Sequential(
-            nn.Linear(feat_dim_p4, 64), nn.ReLU(inplace=True),
-            nn.Linear(64, 1), nn.Sigmoid(),
-        )
-
-        # Token projection: 1280 → 256 (shared across all tokens)
+        # Token projection: C → 256 (shared, no selection bias)
         self.token_proj = nn.Sequential(
             nn.Linear(feat_dim_p4, hidden_dim), nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # Proto gate uses mean of selected tokens
+        # Proto gate uses mean of sampled tokens
         self.proto_gate_mlp = nn.Sequential(
             nn.Linear(feat_dim_p4, 128), nn.ReLU(inplace=True),
             nn.Linear(128, hidden_dim), nn.Sigmoid(),
@@ -546,44 +538,46 @@ class SparseSupportCrossAttnDecoder(nn.Module):
         )
         self.mask_head = nn.Conv2d(32, 1, 1, bias=True)
 
+    def _sample_tokens(self, support_tokens_raw: torch.Tensor) -> torch.Tensor:
+        """Random sample up to max_tokens from support FG pixels (no learned bias)."""
+        N = support_tokens_raw.shape[0]
+        if N <= self.max_tokens:
+            return support_tokens_raw
+        indices = torch.randperm(N, device=support_tokens_raw.device)[:self.max_tokens]
+        return support_tokens_raw[indices]
+
     def _cross_attention(self, q, kv_tokens):
-        """Cross-attention: Q from query, K/V from support tokens. K>1 → softmax."""
+        """Cross-attention: Q from query, K/V from support tokens."""
         B, C, H, W = q.shape
         K = kv_tokens.shape[0]
         q_flat = q.reshape(B, C, -1).permute(0, 2, 1)  # [B, N, C]
         kv = kv_tokens.unsqueeze(0).expand(B, -1, -1)  # [B, K, C]
         scale = C ** -0.5
-        attn = (q_flat @ kv.transpose(1, 2) * scale).softmax(dim=-1)  # [B, N, K]
-        attended = attn @ kv  # [B, N, C]
+        attn = (q_flat @ kv.transpose(1, 2) * scale).softmax(dim=-1)
+        attended = attn @ kv
         attended = attended.permute(0, 2, 1).reshape(B, C, H, W)
         return q + attended
 
     def forward(self, query_p3, query_p4, support_tokens_raw, target_size=None):
         """
-        :param support_tokens_raw: [N_total, 1280] — all support FG pixel vectors
+        :param support_tokens_raw: [N_total, C] — all support FG pixel vectors
         """
-        # ── Importance-based token selection ──
-        N = support_tokens_raw.shape[0]
-        if N > self.num_tokens:
-            scores = self.token_score(support_tokens_raw).squeeze(-1)  # [N]
-            _, topk_idx = scores.topk(min(self.num_tokens, N))
-            selected = support_tokens_raw[topk_idx]  # [K, 1280]
-        else:
-            selected = support_tokens_raw  # [N, 1280]
+        # Random sample tokens (no learned selection → no shortcut)
+        selected = self._sample_tokens(support_tokens_raw)
 
         # Project selected tokens
         proto_tokens = self.token_proj(selected)  # [K, 256]
 
-        # P3+P4 fusion (using mean of selected as gate signal)
+        # P3+P4 fusion
         f3 = self.proj_p3(query_p3)
         f4 = self.proj_p4(F.interpolate(query_p4,
             size=query_p3.shape[2:], mode="bilinear", align_corners=False))
 
-        proto_cond = selected.mean(dim=0)  # [1280]
+        proto_cond = selected.mean(dim=0)
         alpha = self.proto_gate_mlp(proto_cond)
         fused = alpha[None, :, None, None] * f3 + (1 - alpha)[None, :, None, None] * f4
 
-        # Cross-attention with selected spatial tokens
+        # Cross-attention with spatial tokens
         x = self._cross_attention(fused, proto_tokens)
 
         # Upsample
