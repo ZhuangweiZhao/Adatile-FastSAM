@@ -237,7 +237,7 @@ class P3P4FiLMFusionDecoder(nn.Module):
 
     _logger = get_logger("P3P4FiLMFusionDecoder")
 
-    def __init__(self, feat_dim_p3: int = 640, feat_dim_p4: int = 1280,
+    def __init__(self, feat_dim_p3: int = 960, feat_dim_p4: int = 1280,
                  fusion_dim: int = 256, proto_dim: int = 1280):
         super().__init__()
         self.fusion_dim = fusion_dim
@@ -361,7 +361,7 @@ class P3P4CrossAttnDecoder(nn.Module):
     ~1.3M params. Supports multi-prototype (K>1 → standard softmax attention).
     """
 
-    def __init__(self, feat_dim_p3: int = 640, feat_dim_p4: int = 1280,
+    def __init__(self, feat_dim_p3: int = 960, feat_dim_p4: int = 1280,
                  hidden_dim: int = 256, num_prototypes: int = 1):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -491,7 +491,7 @@ class SparseSupportCrossAttnDecoder(nn.Module):
     ~1.3M params.
     """
 
-    def __init__(self, feat_dim_p3: int = 640, feat_dim_p4: int = 1280,
+    def __init__(self, feat_dim_p3: int = 960, feat_dim_p4: int = 1280,
                  hidden_dim: int = 256, max_tokens: int = 128):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -699,19 +699,19 @@ def build_decoder(method: str, **kwargs) -> nn.Module:
             temperature=kwargs.get("temperature", 0.1))
     elif method == "p3p4film":
         return P3P4FiLMFusionDecoder(
-            feat_dim_p3=kwargs.get("feat_dim_p3", 640),
+            feat_dim_p3=kwargs.get("feat_dim_p3", 960),
             feat_dim_p4=kwargs.get("feat_dim_p4", 1280),
             fusion_dim=kwargs.get("fusion_dim", 256),
             proto_dim=kwargs.get("feat_dim_p4", 1280))
     elif method == "p3p4crossattn":
         return P3P4CrossAttnDecoder(
-            feat_dim_p3=kwargs.get("feat_dim_p3", 640),
+            feat_dim_p3=kwargs.get("feat_dim_p3", 960),
             feat_dim_p4=kwargs.get("feat_dim_p4", 1280),
             hidden_dim=kwargs.get("fusion_dim", 256),
             num_prototypes=kwargs.get("num_prototypes", 1))
     elif method == "sparsesupport":
         return SparseSupportCrossAttnDecoder(
-            feat_dim_p3=kwargs.get("feat_dim_p3", 640),
+            feat_dim_p3=kwargs.get("feat_dim_p3", 960),
             feat_dim_p4=kwargs.get("feat_dim_p4", 1280),
             max_tokens=kwargs.get("num_tokens", 128))
     else:
