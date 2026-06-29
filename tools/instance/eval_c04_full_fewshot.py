@@ -566,13 +566,14 @@ class SparseSupportCrossAttnDecoder(nn.Module):
         return q + attended
 
     def forward(self, query_p3, query_p4, support_tokens_raw, target_size=None,
-                return_attn: bool = False):
+                return_attn: bool = False, return_fused: bool = False):
         """
         :param support_tokens_raw: [N_total, C] — all support FG pixel vectors
-        :param return_attn: if True, return (logit, attn_map, is_fg_token)
+        :param return_attn: if True, return (logit, attn_map)
             attn_map: [B, H, W, K] cross-attention weights at P3 resolution
-            is_fg_token: [K] bool — which sampled tokens correspond to FG (all True, since
-                         support_tokens_raw are already FG pixels; kept for interface consistency)
+        :param return_fused: if True, also return the fused feature after Cross-Attention
+            (before upsample). Used for feature space diagnosis.
+            Returns (logit, fused_feat) or (logit, attn_map, fused_feat) if both True.
         """
         # Random sample tokens (no learned selection → no shortcut)
         selected = self._sample_tokens(support_tokens_raw)
@@ -595,6 +596,9 @@ class SparseSupportCrossAttnDecoder(nn.Module):
         else:
             x = self._cross_attention(fused, proto_tokens)
 
+        # Save fused feature before upsample (for feature space diagnosis)
+        fused_feat = x  # [B, 256, H_p3, W_p3] — Cross-Attention output
+
         # Upsample
         x = self.up1(x)
         x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
@@ -607,8 +611,12 @@ class SparseSupportCrossAttnDecoder(nn.Module):
         if target_size is not None:
             x = F.interpolate(x, size=target_size, mode="bilinear", align_corners=False)
 
-        if return_attn:
+        if return_attn and return_fused:
+            return x, attn_map, fused_feat
+        elif return_attn:
             return x, attn_map
+        elif return_fused:
+            return x, fused_feat
         return x
 
 
