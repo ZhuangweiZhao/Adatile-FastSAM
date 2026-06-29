@@ -89,6 +89,10 @@ def parse_args():
     p.add_argument("--episodes-per-epoch", type=int, default=200)
     p.add_argument("--eval-episodes", type=int, default=200)
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--backbone-lr", type=float, default=1e-5,
+                   help="Learning rate for partial-finetune backbone params "
+                   "(default 1e-5, 100x smaller than decoder). "
+                   "Only used when --partial-finetune != 0.")
     p.add_argument("--weight-decay", type=float, default=5e-4,
                    help="权重衰减 (few-shot 推荐 5e-4，减少过拟合)")
     p.add_argument("--warmup-epochs", type=int, default=10,

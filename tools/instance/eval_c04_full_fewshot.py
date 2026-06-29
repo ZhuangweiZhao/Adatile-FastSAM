@@ -1806,7 +1806,22 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
 
     logger.log_info(f"{tag}/opt",
                    f"Total optimizable: {sum(p.numel() for p in opt_params):,} params")
-    opt = torch.optim.AdamW(opt_params, lr=args.lr,
+
+    # ── Differential LR: backbone params use lower LR | 差异学习率 ──
+    backbone_lr = getattr(args, 'backbone_lr', 1e-5)
+    if ft_params:
+        ft_ids = {id(p) for p in ft_params}
+        decoder_params = [p for p in opt_params if id(p) not in ft_ids]
+        param_groups = [
+            {"params": decoder_params, "lr": args.lr},
+            {"params": ft_params, "lr": backbone_lr},
+        ]
+        logger.log_info(f"{tag}/opt",
+                       f"Differential LR: decoder={args.lr:.1e}, backbone={backbone_lr:.1e}")
+    else:
+        param_groups = opt_params
+
+    opt = torch.optim.AdamW(param_groups, lr=args.lr,
                             betas=(0.9, 0.95), weight_decay=args.weight_decay)
 
     from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
