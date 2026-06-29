@@ -386,11 +386,13 @@ class CATSAMAFewShotDecoder(nn.Module):
 
         # ── 1. FFT handcrafted features (if enabled) | FFT 手工特征 ──
         if self.use_fft and support_imgs is not None:
-            # 对 support images 做 FFT 高通滤波
-            # FFT high-pass on support images
-            hf_p3 = self.fft_extractor(support_imgs, target_size=(H3, W3))
+            # 对 K 张 support images 做 FFT → mean across K → 扩展 batch 到 query
+            # K support images → FFT → mean across K → expand to query batch
+            hf_p3_k = self.fft_extractor(support_imgs, target_size=(H3, W3))  # [K, prompt_dim, H3, W3]
+            hf_p3 = hf_p3_k.mean(dim=0, keepdim=True).expand(B, -1, -1, -1)   # [B, prompt_dim, H3, W3]
             H4, W4 = query_p4.shape[2:]
-            hf_p4 = self.fft_extractor(support_imgs, target_size=(H4, W4))
+            hf_p4_k = self.fft_extractor(support_imgs, target_size=(H4, W4))  # [K, prompt_dim, H4, W4]
+            hf_p4 = hf_p4_k.mean(dim=0, keepdim=True).expand(B, -1, -1, -1)   # [B, prompt_dim, H4, W4]
         else:
             # Fallback: zero handcrafted features (仅用 FG token embedding)
             hf_p3 = torch.zeros(B, self.prompt_dim, H3, W3, device=query_p3.device)
