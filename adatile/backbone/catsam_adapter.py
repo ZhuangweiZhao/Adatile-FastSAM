@@ -164,23 +164,23 @@ class CrossPromptGenerator(nn.Module):
         hidden_ratio: MLP 瓶颈比例 | MLP bottleneck ratio (0.25 = CAT-SAM-A default).
     """
 
-    def __init__(self, feat_dim: int = 1280, prompt_dim: int = 256,
-                 hidden_ratio: float = 0.25):
+    def __init__(self, token_in_dim: int = 1280, feat_out_dim: int = 1280,
+                 prompt_dim: int = 256, hidden_ratio: float = 0.25):
         super().__init__()
-        self.feat_dim = feat_dim
+        self.token_in_dim = token_in_dim
+        self.feat_out_dim = feat_out_dim
         self.prompt_dim = prompt_dim
         hidden_dim = int(prompt_dim * hidden_ratio)
 
         # Support FG token → embedding feature (复刻 embedding_generator)
         # Support FG token → embedding feature (replicates embedding_generator)
+        # 输入维度始终是 support token 的维度 (P4=1280), 与 query 尺度无关
+        # Input dim is always support token dim (P4=1280), regardless of query scale
         self.token_proj = nn.Sequential(
-            nn.Linear(feat_dim, prompt_dim),
+            nn.Linear(token_in_dim, prompt_dim),
             nn.ReLU(inplace=True),
             nn.Linear(prompt_dim, prompt_dim),
         )
-
-        # FFT handcrafted → align to prompt_dim (已由 FFTPromptExtractor 处理)
-        # FFT handcrafted → aligned to prompt_dim (handled by FFTPromptExtractor)
 
         # Lightweight MLP: prompt_dim → prompt_dim (复刻 lightweight_mlp)
         # Lightweight MLP: prompt_dim → prompt_dim (replicates lightweight_mlp)
@@ -190,12 +190,12 @@ class CrossPromptGenerator(nn.Module):
             nn.Conv2d(hidden_dim, prompt_dim, kernel_size=1, bias=False),
         )
 
-        # Shared MLP: prompt_dim → feat_dim (复刻 shared_mlp, 输出回原特征空间)
-        # Shared MLP: prompt_dim → feat_dim (replicates shared_mlp, output to feat space)
+        # Shared MLP: prompt_dim → feat_out_dim (复刻 shared_mlp, 输出回 query 特征空间)
+        # Shared MLP: prompt_dim → feat_out_dim (replicates shared_mlp, output to query feat space)
         self.shared_mlp = nn.Sequential(
             nn.Conv2d(prompt_dim, hidden_dim, kernel_size=1, bias=False),
             nn.GELU(),
-            nn.Conv2d(hidden_dim, feat_dim, kernel_size=1, bias=False),
+            nn.Conv2d(hidden_dim, feat_out_dim, kernel_size=1, bias=False),
         )
 
         self._init_weights()
@@ -239,8 +239,8 @@ class CrossPromptGenerator(nn.Module):
         # ── 3. Lightweight MLP → per-position prompt ──
         prompt = self.lightweight_mlp(joint)  # [B, prompt_dim, H, W]
 
-        # ── 4. Shared MLP → project back to feature space → residual add ──
-        delta = self.shared_mlp(prompt)  # [B, C_q, H, W]
+        # ── 4. Shared MLP → project back to query feature space → residual add ──
+        delta = self.shared_mlp(prompt)  # [B, feat_out_dim, H, W]
         return query_feat + delta
 
     @property
@@ -299,11 +299,17 @@ class CATSAMAFewShotDecoder(nn.Module):
             self.fft_extractor = FFTPromptExtractor(freq_rate=0.25, prompt_dim=prompt_dim)
 
         # ── Cross Prompt Generators (per scale) | 交叉 Prompt 生成器（每尺度）──
+        # token_in_dim: support tokens 始终来自 P4 (1280-dim)
+        # feat_out_dim: 输出到各自 query 尺度 (P4→1280, P3→960)
+        # token_in_dim: support tokens always from P4 (1280-dim)
+        # feat_out_dim: output to respective query scale (P4→1280, P3→960)
         self.prompt_gen_p4 = CrossPromptGenerator(
-            feat_dim=feat_dim_p4, prompt_dim=prompt_dim, hidden_ratio=0.25,
+            token_in_dim=feat_dim_p4, feat_out_dim=feat_dim_p4,
+            prompt_dim=prompt_dim, hidden_ratio=0.25,
         )
         self.prompt_gen_p3 = CrossPromptGenerator(
-            feat_dim=feat_dim_p3, prompt_dim=prompt_dim, hidden_ratio=0.25,
+            token_in_dim=feat_dim_p4, feat_out_dim=feat_dim_p3,
+            prompt_dim=prompt_dim, hidden_ratio=0.25,
         )
 
         # ── P3/P4 压缩投影 | P3/P4 compression bottleneck ──
