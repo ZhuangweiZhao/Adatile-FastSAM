@@ -620,6 +620,172 @@ class SparseSupportCrossAttnDecoder(nn.Module):
         return x
 
 
+class CostVolumeDecoder(nn.Module):
+    """
+    Cost Volume Decoder — Support-Query Correlation → Mask.
+    代价体积解码器 — 支持-查询显式像素对应 → 掩码.
+
+    核心理念 | Core Idea:
+        Support FG pixels 与 Query pixels 之间的余弦相似度是类别无关的
+        (category-agnostic)。Decoder 直接输入显式的 correlation maps,
+        而非 learned Cross-Attention features, 最大限度减少 Base shortcut。
+
+    Architecture | 架构:
+        1. Support FG pixels → random sample → token_proj → [K, 256]
+        2. Query P3/P4 → proj → L2-normalize → [256, H, W]
+        3. Cosine similarity → [K, H, W] correlation maps per scale
+        4. AdaptiveMaxPool + AdaptiveAvgPool over K → [16+16, H, W] per scale
+        5. Concat P3 + P4 → [64, H_p3, W_p3]
+        6. Small CNN (4 conv layers, ~180K params) → mask logit
+
+    Key property | 关键特性:
+        Cosine similarity is parameter-free → works equally on Base and Novel.
+        Only token_proj + CNN decoder are learned → lightweight, less shortcut risk.
+
+    ~180K total params.
+    """
+
+    def __init__(self, feat_dim_p3: int = 960, feat_dim_p4: int = 1280,
+                 token_dim: int = 256, corr_dim: int = 32,
+                 hidden_dim: int = 128, max_tokens: int = 128,
+                 temperature: float = 0.1):
+        super().__init__()
+        self.token_dim = token_dim
+        self.corr_dim = corr_dim
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+
+        # Token projection: 1280 → 256 (learnable PCA-like reduction)
+        # 不引入非线性 — 保留特征空间的线性结构
+        self.token_proj = nn.Linear(feat_dim_p4, token_dim, bias=False)
+
+        # Query projections: 960/1280 → 256
+        self.proj_p3 = nn.Sequential(
+            nn.Conv2d(feat_dim_p3, token_dim, 1, bias=False),
+            nn.BatchNorm2d(token_dim), nn.ReLU(inplace=True),
+        )
+        self.proj_p4 = nn.Sequential(
+            nn.Conv2d(feat_dim_p4, token_dim, 1, bias=False),
+            nn.BatchNorm2d(token_dim), nn.ReLU(inplace=True),
+        )
+
+        # Decoder: correlation maps → mask
+        # Input: [64, H, W] = P3(32) + P4(32)
+        in_ch = corr_dim * 2  # max(16) + mean(16) + P3 + P4 = 32 + 32 = 64
+        self.decoder = nn.Sequential(
+            nn.Conv2d(in_ch, hidden_dim, 3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden_dim), nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden_dim), nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim, hidden_dim // 2, 3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden_dim // 2), nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim // 2, 1, 1, bias=True),
+        )
+
+    @property
+    def num_prototypes(self):
+        """Compat with prototype-based evaluation code."""
+        return 1
+
+    def _sample_tokens(self, tokens_raw: torch.Tensor) -> torch.Tensor:
+        """Random sample up to max_tokens from support FG pixels (no learned bias)."""
+        N = tokens_raw.shape[0]
+        if N <= self.max_tokens:
+            return tokens_raw
+        indices = torch.randperm(N, device=tokens_raw.device)[:self.max_tokens]
+        return tokens_raw[indices]
+
+    def _build_correlation(self, query_feat: torch.Tensor,
+                           support_tokens: torch.Tensor) -> torch.Tensor:
+        """
+        构建多尺度相关性体积 | Build correlation volume for one scale.
+
+        :param query_feat: [B, C, H, W] — projected query features
+        :param support_tokens: [K, C] — projected support tokens
+        :return: [B, corr_dim, H, W] — pooled correlation (max + mean halves)
+        """
+        B, C, H, W = query_feat.shape
+        K = support_tokens.shape[0]
+
+        # L2-normalize for cosine similarity
+        q_flat = F.normalize(query_feat.reshape(B, C, -1), dim=1)  # [B, C, N_q]
+        s_norm = F.normalize(support_tokens, dim=-1)  # [K, C]
+
+        # Cosine similarity: q · s → [B, N_q, K]
+        q_t = q_flat.permute(0, 2, 1)  # [B, N_q, C]
+        s_t = s_norm.unsqueeze(0).expand(B, -1, -1).transpose(1, 2)  # [B, C, K]
+        corr_raw = torch.bmm(q_t, s_t) / self.temperature  # [B, N_q, K]
+
+        # Softmax over K: for each query pixel, which support token matches best?
+        corr = corr_raw.softmax(dim=-1)  # [B, N_q, K]
+
+        # Reshape to [B, K, H, W]
+        corr = corr.permute(0, 2, 1).reshape(B, K, H, W)
+
+        # Pool over K dimension (handles variable token count)
+        # → [B, K, H*W] for AdaptivePool1d
+        corr_flat = corr.reshape(B, K, H * W).permute(0, 2, 1)  # [B, H*W, K]
+
+        half_dim = self.corr_dim // 2
+        corr_max = F.adaptive_max_pool1d(corr_flat, half_dim)  # [B, H*W, 16]
+        corr_mean = F.adaptive_avg_pool1d(corr_flat, half_dim)  # [B, H*W, 16]
+
+        corr_pooled = torch.cat([corr_max, corr_mean], dim=-1)  # [B, H*W, 32]
+        corr_pooled = corr_pooled.permute(0, 2, 1).reshape(B, self.corr_dim, H, W)
+
+        return corr_pooled
+
+    def forward(self, query_p3, query_p4, support_tokens_raw, target_size=None,
+                return_attn: bool = False, return_fused: bool = False):
+        """
+        :param query_p3: [B, 960, H3, W3]
+        :param query_p4: [B, 1280, H4, W4]
+        :param support_tokens_raw: [N, 1280] — all support FG pixel vectors
+        :param target_size: (H, W) output mask size
+        :param return_attn: ignored (compat with SparseSupport interface)
+        :param return_fused: if True, return (logit, corr_cat)
+        """
+        B = query_p3.shape[0]
+
+        # 1. Sample + project support tokens
+        sampled = self._sample_tokens(support_tokens_raw)
+        s_tokens = self.token_proj(sampled)  # [K, 256]
+
+        # 2. Project query features
+        q3 = self.proj_p3(query_p3)  # [B, 256, H3, W3]
+        q4 = self.proj_p4(query_p4)  # [B, 256, H4, W4]
+
+        # 3. Build correlation at each scale
+        corr3 = self._build_correlation(q3, s_tokens)  # [B, 32, H3, W3]
+        corr4 = self._build_correlation(q4, s_tokens)  # [B, 32, H4, W4]
+
+        # 4. Upsample P4 correlation to P3 size
+        corr4_up = F.interpolate(corr4, size=corr3.shape[2:],
+                                  mode="bilinear", align_corners=False)
+
+        # 5. Concat + decode
+        corr_cat = torch.cat([corr3, corr4_up], dim=1)  # [B, 64, H3, W3]
+
+        # Upsample to target size
+        x = corr_cat
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = self.decoder[0:3](x)  # conv1
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = self.decoder[3:6](x)  # conv2
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = self.decoder[6:9](x)  # conv3
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = self.decoder[9:](x)   # 1×1 → mask
+
+        if target_size is not None:
+            x = F.interpolate(x, size=target_size, mode="bilinear",
+                            align_corners=False)
+
+        if return_fused:
+            return x, corr_cat
+        return x
+
+
 class ContrastiveProtoDecoder(nn.Module):
     """
     Contrastive Prototype Decoder | 对比原型解码器.
@@ -722,6 +888,12 @@ def build_decoder(method: str, **kwargs) -> nn.Module:
             feat_dim_p3=kwargs.get("feat_dim_p3", 960),
             feat_dim_p4=kwargs.get("feat_dim_p4", 1280),
             max_tokens=kwargs.get("num_tokens", 128))
+    elif method == "costvolume":
+        return CostVolumeDecoder(
+            feat_dim_p3=kwargs.get("feat_dim_p3", 960),
+            feat_dim_p4=kwargs.get("feat_dim_p4", 1280),
+            max_tokens=kwargs.get("num_tokens", 128),
+            temperature=kwargs.get("temperature", 0.1))
     else:
         raise ValueError(f"Unknown decoder: {method}")
 
@@ -929,7 +1101,7 @@ def train_episode(decoder, backbone, support_idxs, query_idx,
 
     # Forward - support + query backbone (no grad on frozen backbone)
     with torch.no_grad():
-        is_sparse = getattr(decoder, '__class__', type(decoder)).__name__ == "SparseSupportCrossAttnDecoder"
+        is_sparse = getattr(decoder, '__class__', type(decoder)).__name__ in ("SparseSupportCrossAttnDecoder", "CostVolumeDecoder")
         if is_sparse:
             fg_proto = _extract_support_tokens(backbone, support_imgs, support_masks,
                                                 feature_level)
@@ -1018,7 +1190,7 @@ def validate_all_classes_batched(decoder, backbone, train_ds, val_ds,
     内存 | Memory: O(chunk_size × shot × feature_size) instead of O(all_tiles × feature_size)
     """
     num_proto = getattr(decoder, 'num_prototypes', 1)
-    is_sparse = decoder.__class__.__name__ == "SparseSupportCrossAttnDecoder"
+    is_sparse = decoder.__class__.__name__ in ("SparseSupportCrossAttnDecoder", "CostVolumeDecoder")
     t_start = time.perf_counter()
 
     # 每轮验证前清空 tile 缓存 | Clear tile cache before each validation
@@ -1246,7 +1418,7 @@ def evaluate_full(decoder, backbone, train_ds, val_ds, device,
     :return: dict with miou_mean (standard), miou_std, per_class_iou, ...
     """
     num_proto = getattr(decoder, 'num_prototypes', 1)
-    is_sparse = decoder.__class__.__name__ == "SparseSupportCrossAttnDecoder"
+    is_sparse = decoder.__class__.__name__ in ("SparseSupportCrossAttnDecoder", "CostVolumeDecoder")
     class_to_images = {c: train_ds.class_to_images(c) for c in target_classes}
     rng = np.random.RandomState(42)
     per_cls_ious = defaultdict(list)
