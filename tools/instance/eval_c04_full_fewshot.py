@@ -546,8 +546,13 @@ class SparseSupportCrossAttnDecoder(nn.Module):
         indices = torch.randperm(N, device=support_tokens_raw.device)[:self.max_tokens]
         return support_tokens_raw[indices]
 
-    def _cross_attention(self, q, kv_tokens):
-        """Cross-attention: Q from query, K/V from support tokens."""
+    def _cross_attention(self, q, kv_tokens, return_attn: bool = False):
+        """Cross-attention: Q from query, K/V from support tokens.
+
+        交叉注意力: Q 来自 query, K/V 来自 support tokens.
+
+        :param return_attn: if True, also return attention weights [B, N, K]
+        """
         B, C, H, W = q.shape
         K = kv_tokens.shape[0]
         q_flat = q.reshape(B, C, -1).permute(0, 2, 1)  # [B, N, C]
@@ -556,11 +561,18 @@ class SparseSupportCrossAttnDecoder(nn.Module):
         attn = (q_flat @ kv.transpose(1, 2) * scale).softmax(dim=-1)
         attended = attn @ kv
         attended = attended.permute(0, 2, 1).reshape(B, C, H, W)
+        if return_attn:
+            return q + attended, attn.reshape(B, H, W, K)
         return q + attended
 
-    def forward(self, query_p3, query_p4, support_tokens_raw, target_size=None):
+    def forward(self, query_p3, query_p4, support_tokens_raw, target_size=None,
+                return_attn: bool = False):
         """
         :param support_tokens_raw: [N_total, C] — all support FG pixel vectors
+        :param return_attn: if True, return (logit, attn_map, is_fg_token)
+            attn_map: [B, H, W, K] cross-attention weights at P3 resolution
+            is_fg_token: [K] bool — which sampled tokens correspond to FG (all True, since
+                         support_tokens_raw are already FG pixels; kept for interface consistency)
         """
         # Random sample tokens (no learned selection → no shortcut)
         selected = self._sample_tokens(support_tokens_raw)
@@ -578,7 +590,10 @@ class SparseSupportCrossAttnDecoder(nn.Module):
         fused = alpha[None, :, None, None] * f3 + (1 - alpha)[None, :, None, None] * f4
 
         # Cross-attention with spatial tokens
-        x = self._cross_attention(fused, proto_tokens)
+        if return_attn:
+            x, attn_map = self._cross_attention(fused, proto_tokens, return_attn=True)
+        else:
+            x = self._cross_attention(fused, proto_tokens)
 
         # Upsample
         x = self.up1(x)
@@ -591,6 +606,9 @@ class SparseSupportCrossAttnDecoder(nn.Module):
 
         if target_size is not None:
             x = F.interpolate(x, size=target_size, mode="bilinear", align_corners=False)
+
+        if return_attn:
+            return x, attn_map
         return x
 
 
