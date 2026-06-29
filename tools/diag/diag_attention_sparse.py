@@ -428,10 +428,16 @@ def diagnose_attention(checkpoint_path: str, backbone, decoder, train_ds, val_ds
         with torch.no_grad():
             q_feats = backbone(query_img)
 
+            # Ensure support tokens are on the same device as decoder
+            # 确保 support tokens 与 decoder 在同一设备上
+            decoder_device = next(decoder.parameters()).device
+            tokens_dev = all_fg_tokens.to(decoder_device)
+
             # Decoder forward with attention extraction
             logit, trained_attn = decoder(
-                q_feats["p3"], q_feats["p4"],
-                all_fg_tokens,
+                q_feats["p3"].to(decoder_device),
+                q_feats["p4"].to(decoder_device),
+                tokens_dev,
                 target_size=tuple(query_mask.shape),
                 return_attn=True,
             )
