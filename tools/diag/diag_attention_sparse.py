@@ -350,11 +350,15 @@ def diagnose_attention(checkpoint_path: str, backbone, decoder, train_ds, val_ds
     print(f"Loading checkpoint: {checkpoint_path}")
     print(f"{'='*70}")
     ckpt = torch.load(checkpoint_path, map_location=device_t, weights_only=False)
-    decoder.load_state_dict(ckpt["decoder"])
-    decoder.to(device_t)
-    decoder.eval()
-    print(f"Checkpoint loaded. Epoch={ckpt.get('epoch', '?')}, "
-          f"val_mIoU={ckpt.get('val_miou', '?')}")
+
+    # Handle both formats: raw state_dict vs wrapped {"decoder": ..., "epoch": ...}
+    if isinstance(ckpt, dict) and "decoder" in ckpt:
+        decoder.load_state_dict(ckpt["decoder"])
+        print(f"Checkpoint loaded (wrapped). Epoch={ckpt.get('epoch', '?')}, "
+              f"val_mIoU={ckpt.get('val_miou', '?')}")
+    else:
+        decoder.load_state_dict(ckpt)
+        print(f"Checkpoint loaded (raw state_dict). Keys: {len(ckpt)} params")
 
     # ── Pre-sample episodes | 预采样 episode ──
     class_to_train = {c: train_ds.class_to_images(c) for c in target_classes}
