@@ -65,7 +65,7 @@ def parse_args():
     p.add_argument("--decoder", type=str, default="film",
                    choices=["baseline", "film", "crossattn", "contrastive",
                             "p3p4film", "p3p4crossattn", "sparsesupport",
-                            "costvolume"])
+                            "costvolume", "catsama"])
     p.add_argument("--feature-level", type=str, default="p3p4",
                    choices=["p3", "p4", "p8", "p3p4"])
     p.add_argument("--num-prototypes", type=int, default=4)
@@ -462,6 +462,9 @@ def main():
         args.feature_level = "p3p4"
     elif args.decoder == "costvolume":
         # costvolume requires p3p4 features, force it
+        args.feature_level = "p3p4"
+    elif args.decoder == "catsama":
+        # catsama requires p3p4 features, force it
         args.feature_level = "p3p4"
     decoder_kwargs = {"feat_dim": feat_dim, "num_prototypes": args.num_prototypes}
     if args.feature_level == "p3p4":

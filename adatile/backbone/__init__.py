@@ -15,10 +15,18 @@ extracts multi-scale feature maps via forward hooks (P4, P8).
 
 from adatile.backbone.fastsam_backbone import FastSAMBackbone, build_backbone
 from adatile.backbone.feature_adapter import ResidualAdapter, MultiScaleAdapter
+from adatile.backbone.catsam_adapter import (
+    FFTPromptExtractor,
+    CrossPromptGenerator,
+    CATSAMAFewShotDecoder,
+)
 
 __all__ = [
     "FastSAMBackbone",
     "build_backbone",
     "ResidualAdapter",
     "MultiScaleAdapter",
+    "FFTPromptExtractor",
+    "CrossPromptGenerator",
+    "CATSAMAFewShotDecoder",
 ]

@@ -894,6 +894,15 @@ def build_decoder(method: str, **kwargs) -> nn.Module:
             feat_dim_p4=kwargs.get("feat_dim_p4", 1280),
             max_tokens=kwargs.get("num_tokens", 128),
             temperature=kwargs.get("temperature", 0.1))
+    elif method == "catsama":
+        from adatile.backbone.catsam_adapter import CATSAMAFewShotDecoder
+        return CATSAMAFewShotDecoder(
+            feat_dim_p3=kwargs.get("feat_dim_p3", 960),
+            feat_dim_p4=kwargs.get("feat_dim_p4", 1280),
+            prompt_dim=kwargs.get("prompt_dim", 256),
+            hidden_dim=kwargs.get("hidden_dim", 128),
+            max_tokens=kwargs.get("num_tokens", 128),
+            use_fft=kwargs.get("use_fft", True))
     else:
         raise ValueError(f"Unknown decoder: {method}")
 
@@ -903,10 +912,14 @@ def build_decoder(method: str, **kwargs) -> nn.Module:
 # ═══════════════════════════════════════════════════════════════════
 
 def _decoder_forward(decoder, backbone, query_img, fg_prototype, target_size,
-                     feature_level="p4"):
+                     feature_level="p4", support_imgs=None):
     """统一的 decoder 前向调用, 处理单层和 p3p4 融合 | Unified decoder forward."""
     feats = backbone(query_img)
     if feature_level == "p3p4":
+        # CAT-SAM-A decoder needs support_imgs for FFT features
+        if hasattr(decoder, 'use_fft') and support_imgs is not None:
+            return decoder(feats["p3"], feats["p4"], fg_prototype,
+                          target_size=target_size, support_imgs=support_imgs)
         return decoder(feats["p3"], feats["p4"], fg_prototype, target_size=target_size)
     else:
         return decoder(feats[feature_level], fg_prototype, target_size=target_size)
@@ -1108,7 +1121,7 @@ def train_episode(decoder, backbone, support_idxs, query_idx,
     )
     _grad_ctx = torch.enable_grad() if _backbone_has_trainable else torch.no_grad()
     with _grad_ctx:
-        is_sparse = getattr(decoder, '__class__', type(decoder)).__name__ in ("SparseSupportCrossAttnDecoder", "CostVolumeDecoder")
+        is_sparse = getattr(decoder, '__class__', type(decoder)).__name__ in ("SparseSupportCrossAttnDecoder", "CostVolumeDecoder", "CATSAMAFewShotDecoder")
         if is_sparse:
             fg_proto = _extract_support_tokens(backbone, support_imgs, support_masks,
                                                 feature_level)
@@ -1149,11 +1162,11 @@ def train_episode(decoder, backbone, support_idxs, query_idx,
     if use_amp:
         with torch.amp.autocast(device.type):
             logit = _decoder_forward(decoder, backbone, query_img, fg_proto,
-                                     tsize, feature_level)
+                                     tsize, feature_level, support_imgs=support_imgs)
             loss, components = focal_dice_loss(logit, query_mask, gap_weight=gap_weight)
     else:
         logit = _decoder_forward(decoder, backbone, query_img, fg_proto,
-                                 tsize, feature_level)
+                                 tsize, feature_level, support_imgs=support_imgs)
         loss, components = focal_dice_loss(logit, query_mask, gap_weight=gap_weight)
     t_decoder = time.perf_counter()
 
@@ -1197,7 +1210,7 @@ def validate_all_classes_batched(decoder, backbone, train_ds, val_ds,
     内存 | Memory: O(chunk_size × shot × feature_size) instead of O(all_tiles × feature_size)
     """
     num_proto = getattr(decoder, 'num_prototypes', 1)
-    is_sparse = decoder.__class__.__name__ in ("SparseSupportCrossAttnDecoder", "CostVolumeDecoder")
+    is_sparse = decoder.__class__.__name__ in ("SparseSupportCrossAttnDecoder", "CostVolumeDecoder", "CATSAMAFewShotDecoder")
     t_start = time.perf_counter()
 
     # 每轮验证前清空 tile 缓存 | Clear tile cache before each validation
@@ -1425,7 +1438,7 @@ def evaluate_full(decoder, backbone, train_ds, val_ds, device,
     :return: dict with miou_mean (standard), miou_std, per_class_iou, ...
     """
     num_proto = getattr(decoder, 'num_prototypes', 1)
-    is_sparse = decoder.__class__.__name__ in ("SparseSupportCrossAttnDecoder", "CostVolumeDecoder")
+    is_sparse = decoder.__class__.__name__ in ("SparseSupportCrossAttnDecoder", "CostVolumeDecoder", "CATSAMAFewShotDecoder")
     class_to_images = {c: train_ds.class_to_images(c) for c in target_classes}
     rng = np.random.RandomState(42)
     per_cls_ious = defaultdict(list)
