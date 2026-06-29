@@ -471,6 +471,135 @@ class P3P4CrossAttnDecoder(nn.Module):
         return x
 
 
+class SparseSupportCrossAttnDecoder(nn.Module):
+    """
+    Sparse Support Memory Cross-Attention Decoder.
+    稀疏支持记忆交叉注意力解码器.
+
+    核心创新 | Core Innovation:
+        不再用 KMeans 聚类原型，而是直接从 support FG 像素中 learnably select
+        Top-K 个代表性 token → 保留空间多样性 → Cross-Attention。
+
+    Instead of KMeans proto clustering, directly select Top-K representative
+    tokens from all support FG pixels via learnable importance scoring.
+    This preserves spatial diversity for cross-attention.
+
+    Architecture | 架构:
+        Support FG pixels [N, 1280] → Importance MLP → scores → Top-K
+        Selected tokens [K, 1280] → Token Projection → [K, 256]
+        Query P3+P4 → Fusion → CrossAttn(Q=query, K=selected, V=selected)
+        → Upsample → Mask
+
+    ~1.4M params. K=64 by default (sparse but spatially diverse).
+    """
+
+    def __init__(self, feat_dim_p3: int = 640, feat_dim_p4: int = 1280,
+                 hidden_dim: int = 256, num_tokens: int = 64):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_tokens = num_tokens
+
+        # P3/P4 projection + gate (same as P3P4CrossAttn)
+        self.proj_p3 = nn.Sequential(
+            nn.Conv2d(feat_dim_p3, hidden_dim, 1, bias=False),
+            nn.BatchNorm2d(hidden_dim), nn.ReLU(inplace=True),
+        )
+        self.proj_p4 = nn.Sequential(
+            nn.Conv2d(feat_dim_p4, hidden_dim, 1, bias=False),
+            nn.BatchNorm2d(hidden_dim), nn.ReLU(inplace=True),
+        )
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(feat_dim_p4, 128), nn.ReLU(inplace=True),
+            nn.Linear(128, hidden_dim), nn.Sigmoid(),
+        )
+
+        # Token importance scorer: 1280 → 64 → 1 (sigmoid)
+        self.token_score = nn.Sequential(
+            nn.Linear(feat_dim_p4, 64), nn.ReLU(inplace=True),
+            nn.Linear(64, 1), nn.Sigmoid(),
+        )
+
+        # Token projection: 1280 → 256 (shared across all tokens)
+        self.token_proj = nn.Sequential(
+            nn.Linear(feat_dim_p4, hidden_dim), nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        # Proto gate uses mean of selected tokens
+        self.proto_gate_mlp = nn.Sequential(
+            nn.Linear(feat_dim_p4, 128), nn.ReLU(inplace=True),
+            nn.Linear(128, hidden_dim), nn.Sigmoid(),
+        )
+
+        # Upsample path
+        self.up1 = nn.Sequential(
+            nn.Conv2d(hidden_dim, 128, 3, padding=1, bias=False),
+            nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+        )
+        self.up2 = nn.Sequential(
+            nn.Conv2d(128, 64, 3, padding=1, bias=False),
+            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+        )
+        self.up3 = nn.Sequential(
+            nn.Conv2d(64, 32, 3, padding=1, bias=False),
+            nn.BatchNorm2d(32), nn.ReLU(inplace=True),
+        )
+        self.mask_head = nn.Conv2d(32, 1, 1, bias=True)
+
+    def _cross_attention(self, q, kv_tokens):
+        """Cross-attention: Q from query, K/V from support tokens. K>1 → softmax."""
+        B, C, H, W = q.shape
+        K = kv_tokens.shape[0]
+        q_flat = q.reshape(B, C, -1).permute(0, 2, 1)  # [B, N, C]
+        kv = kv_tokens.unsqueeze(0).expand(B, -1, -1)  # [B, K, C]
+        scale = C ** -0.5
+        attn = (q_flat @ kv.transpose(1, 2) * scale).softmax(dim=-1)  # [B, N, K]
+        attended = attn @ kv  # [B, N, C]
+        attended = attended.permute(0, 2, 1).reshape(B, C, H, W)
+        return q + attended
+
+    def forward(self, query_p3, query_p4, support_tokens_raw, target_size=None):
+        """
+        :param support_tokens_raw: [N_total, 1280] — all support FG pixel vectors
+        """
+        # ── Importance-based token selection ──
+        N = support_tokens_raw.shape[0]
+        if N > self.num_tokens:
+            scores = self.token_score(support_tokens_raw).squeeze(-1)  # [N]
+            _, topk_idx = scores.topk(min(self.num_tokens, N))
+            selected = support_tokens_raw[topk_idx]  # [K, 1280]
+        else:
+            selected = support_tokens_raw  # [N, 1280]
+
+        # Project selected tokens
+        proto_tokens = self.token_proj(selected)  # [K, 256]
+
+        # P3+P4 fusion (using mean of selected as gate signal)
+        f3 = self.proj_p3(query_p3)
+        f4 = self.proj_p4(F.interpolate(query_p4,
+            size=query_p3.shape[2:], mode="bilinear", align_corners=False))
+
+        proto_cond = selected.mean(dim=0)  # [1280]
+        alpha = self.proto_gate_mlp(proto_cond)
+        fused = alpha[None, :, None, None] * f3 + (1 - alpha)[None, :, None, None] * f4
+
+        # Cross-attention with selected spatial tokens
+        x = self._cross_attention(fused, proto_tokens)
+
+        # Upsample
+        x = self.up1(x)
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = self.up2(x)
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = self.up3(x)
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = self.mask_head(x)
+
+        if target_size is not None:
+            x = F.interpolate(x, size=target_size, mode="bilinear", align_corners=False)
+        return x
+
+
 class ContrastiveProtoDecoder(nn.Module):
     """
     Contrastive Prototype Decoder | 对比原型解码器.
@@ -568,6 +697,11 @@ def build_decoder(method: str, **kwargs) -> nn.Module:
             feat_dim_p4=kwargs.get("feat_dim_p4", 1280),
             hidden_dim=kwargs.get("fusion_dim", 256),
             num_prototypes=kwargs.get("num_prototypes", 1))
+    elif method == "sparsesupport":
+        return SparseSupportCrossAttnDecoder(
+            feat_dim_p3=kwargs.get("feat_dim_p3", 640),
+            feat_dim_p4=kwargs.get("feat_dim_p4", 1280),
+            num_tokens=kwargs.get("num_tokens", 64))
     else:
         raise ValueError(f"Unknown decoder: {method}")
 
@@ -608,6 +742,44 @@ def _extract_prototype(backbone, support_imgs, support_masks, feature_level, num
     else:
         proto = compute_fg_prototype(support_feats_list, support_masks)
     return proto
+
+
+def _extract_support_tokens(backbone, support_imgs, support_masks, feature_level):
+    """
+    收集所有 support FG 像素的空间特征 token。
+    Collect all support FG pixel spatial feature tokens.
+
+    与 prototype 不同: 不做 mean pooling，保留每个 FG 像素的独立特征向量。
+    Unlike prototype: no mean pooling — keeps each FG pixel as independent token.
+
+    :return: [N_total, C] tensor of all support FG pixel vectors
+    """
+    feats = backbone(support_imgs)
+    if feature_level == "p3p4":
+        lvl = "p4"
+    else:
+        lvl = feature_level
+
+    s_fm = feats[lvl]  # [K, C, H_l, W_l]
+    tokens = []
+    for i in range(len(support_masks)):
+        # Resize mask to feature map size
+        mask = support_masks[i]
+        mask_resized = F.interpolate(
+            mask.unsqueeze(0).unsqueeze(0).float(),
+            size=s_fm.shape[2:], mode="nearest"
+        ).squeeze() > 0.5
+        if mask_resized.sum() < 4:
+            continue
+        # Extract FG feature vectors: [C, H*W] -> select FG -> [N_i, C]
+        fg_vecs = s_fm[i, :, mask_resized].permute(1, 0)  # [N_i, C]
+        tokens.append(fg_vecs)
+
+    if not tokens:
+        # Fallback: use all support pixels (rare edge case)
+        return s_fm.reshape(len(support_masks), s_fm.shape[1], -1).permute(0, 2, 1).reshape(-1, s_fm.shape[1])
+
+    return torch.cat(tokens, dim=0)  # [N_total, C]
 
 
 def _extract_feats_for_proto(backbone, support_imgs, feature_level):
@@ -737,16 +909,25 @@ def train_episode(decoder, backbone, support_idxs, query_idx,
 
     # Forward - support + query backbone (no grad on frozen backbone)
     with torch.no_grad():
-        num_proto = getattr(decoder, 'num_prototypes', 1)
-        fg_proto = _extract_prototype(backbone, support_imgs, support_masks,
-                                      feature_level, num_proto)
+        is_sparse = getattr(decoder, '__class__', type(decoder)).__name__ == "SparseSupportCrossAttnDecoder"
+        if is_sparse:
+            fg_proto = _extract_support_tokens(backbone, support_imgs, support_masks,
+                                                feature_level)
+        else:
+            num_proto = getattr(decoder, 'num_prototypes', 1)
+            fg_proto = _extract_prototype(backbone, support_imgs, support_masks,
+                                          feature_level, num_proto)
         t_proto = time.perf_counter()
 
-        # Check empty prototype
-        if fg_proto.dim() == 1 and fg_proto.sum() == 0:
-            return None, None
-        if fg_proto.dim() == 2 and fg_proto.sum() == 0:
-            return None, None
+        # Check empty support
+        if is_sparse:
+            if fg_proto.shape[0] < 4:
+                return None, None
+        else:
+            if fg_proto.dim() == 1 and fg_proto.sum() == 0:
+                return None, None
+            if fg_proto.dim() == 2 and fg_proto.sum() == 0:
+                return None, None
 
         # ── Query-aware Dynamic Prototype | 查询感知动态原型 ──
         if use_dynamic_proto:
@@ -817,6 +998,7 @@ def validate_all_classes_batched(decoder, backbone, train_ds, val_ds,
     内存 | Memory: O(chunk_size × shot × feature_size) instead of O(all_tiles × feature_size)
     """
     num_proto = getattr(decoder, 'num_prototypes', 1)
+    is_sparse = decoder.__class__.__name__ == "SparseSupportCrossAttnDecoder"
     t_start = time.perf_counter()
 
     # 每轮验证前清空 tile 缓存 | Clear tile cache before each validation
@@ -911,7 +1093,23 @@ def validate_all_classes_batched(decoder, backbone, train_ds, val_ds,
                 s_p4s = [tile_to_feat[("train", si)] for si in s_idxs]
             s_masks = [_get_mask(train_ds, "train", si, cls_id) for si in s_idxs]
 
-            if num_proto > 1:
+            if is_sparse:
+                # Collect FG tokens from pre-computed support features
+                tokens = []
+                for i in range(len(s_idxs)):
+                    m = _get_mask(train_ds, "train", s_idxs[i], cls_id)
+                    m_resized = F.interpolate(
+                        m.unsqueeze(0).unsqueeze(0).float(),
+                        size=s_p4s[i].shape[1:], mode="nearest"
+                    ).squeeze() > 0.5
+                    if m_resized.sum() >= 4:
+                        tokens.append(s_p4s[i][:, m_resized].permute(1, 0))
+                if not tokens:
+                    continue
+                proto = torch.cat(tokens, dim=0)  # [N_total, C]
+                if proto.shape[0] < 4:
+                    continue
+            elif num_proto > 1:
                 proto = compute_multi_prototype(
                     s_p4s, s_masks, num_prototypes=num_proto
                 )
@@ -1028,6 +1226,7 @@ def evaluate_full(decoder, backbone, train_ds, val_ds, device,
     :return: dict with miou_mean (standard), miou_std, per_class_iou, ...
     """
     num_proto = getattr(decoder, 'num_prototypes', 1)
+    is_sparse = decoder.__class__.__name__ == "SparseSupportCrossAttnDecoder"
     class_to_images = {c: train_ds.class_to_images(c) for c in target_classes}
     rng = np.random.RandomState(42)
     per_cls_ious = defaultdict(list)
@@ -1089,18 +1288,24 @@ def evaluate_full(decoder, backbone, train_ds, val_ds, device,
         query_img = val_ds.load_image(qi).unsqueeze(0).to(device)
         query_mask = val_ds.render_class_mask(qi, query_class).to(device)
 
-        support_p4s = _extract_feats_for_proto(backbone, support_imgs, feature_level)
-        if num_proto > 1:
-            fg_proto = compute_multi_prototype(
-                support_p4s, support_masks, num_prototypes=num_proto
-            )
-            if (fg_proto.dim() == 1 and fg_proto.sum() == 0) or \
-               (fg_proto.dim() == 2 and fg_proto.sum() == 0):
+        if is_sparse:
+            fg_proto = _extract_support_tokens(backbone, support_imgs, support_masks,
+                                                feature_level)
+            if fg_proto.shape[0] < 4:
                 continue
         else:
-            fg_proto = compute_fg_prototype(support_p4s, support_masks)
-            if fg_proto.sum() == 0:
-                continue
+            support_p4s = _extract_feats_for_proto(backbone, support_imgs, feature_level)
+            if num_proto > 1:
+                fg_proto = compute_multi_prototype(
+                    support_p4s, support_masks, num_prototypes=num_proto
+                )
+                if (fg_proto.dim() == 1 and fg_proto.sum() == 0) or \
+                   (fg_proto.dim() == 2 and fg_proto.sum() == 0):
+                    continue
+            else:
+                fg_proto = compute_fg_prototype(support_p4s, support_masks)
+                if fg_proto.sum() == 0:
+                    continue
 
         # ── Query: backbone → decoder(proto) → mask ──
         logit = _decoder_forward(
