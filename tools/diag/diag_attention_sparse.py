@@ -475,10 +475,12 @@ def diagnose_attention(checkpoint_path: str, backbone, decoder, train_ds, val_ds
         t_H, t_W, t_K = t_attn.shape
 
         # Resize query mask to P3 resolution for FG/BG masking
+        # Keep on same device as t_attn to avoid CPU/CUDA mismatch
         q_mask_p3 = F.interpolate(
             query_mask.unsqueeze(0).unsqueeze(0).float(),
             size=(t_H, t_W), mode="nearest"
         ).squeeze() > 0.5
+        q_mask_p3 = q_mask_p3.to(t_attn.device)
 
         # 1. Entropy
         entropy_metrics = compute_attention_entropy(t_attn)
@@ -510,7 +512,8 @@ def diagnose_attention(checkpoint_path: str, backbone, decoder, train_ds, val_ds
 
         oracle_entropy_metrics = compute_attention_entropy(o_attn_p3)
         oracle_eff_metrics = compute_effective_tokens(o_attn_p3)
-        oracle_peak_metrics = compute_fg_attention_peakiness(o_attn_p3, q_mask_p3)
+        oracle_peak_metrics = compute_fg_attention_peakiness(
+            o_attn_p3, q_mask_p3.to(o_attn_p3.device))
 
         # ── Record results | 记录结果 ──
         result = {
