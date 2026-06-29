@@ -1905,25 +1905,31 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
     # ── 辅助函数: 收集/恢复所有可训练参数 (decoder + adapter + backbone) ──
     # Helpers: collect/restore all trainable params (decoder + adapter + backbone)
     def _collect_trainable_state():
-        """收集所有可训练参数 → flat dict with prefixed keys.
-        Collect all trainable params → flat dict with prefixed keys."""
+        """收集所有可训练参数 + BN buffers → flat dict with prefixed keys.
+        Collect all trainable params + BN buffers → flat dict with prefixed keys."""
         state = {}
+        # Decoder params + BN buffers
+        for name, buf in decoder.named_buffers():
+            state[f"decoder.{name}"] = buf.clone()
         for name, param in decoder.named_parameters():
             if param.requires_grad:
                 state[f"decoder.{name}"] = param.data.clone()
+        # Adapter params + BN buffers
         if hasattr(backbone, '_adapters') and backbone._adapters is not None:
+            for name, buf in backbone._adapters.named_buffers():
+                state[f"adapter.{name}"] = buf.clone()
             for name, param in backbone._adapters.named_parameters():
                 if param.requires_grad:
                     state[f"adapter.{name}"] = param.data.clone()
-        # 收集 backbone 部分解冻的参数 (YOLO model params 不在 backbone.named_parameters() 中)
-        # Collect backbone partial-finetune params (YOLO model params not in backbone.named_parameters())
+        # Backbone partial-finetune params
         for i, param in enumerate(backbone.model.model.parameters()):
             if param.requires_grad:
                 state[f"backbone.{i}"] = param.data.clone()
         return state
 
     def _restore_trainable_state(state: dict):
-        """从 flat dict 恢复所有可训练参数 | Restore all trainable params from flat dict."""
+        """从 flat dict 恢复所有可训练参数 + BN buffers.
+        Restore all trainable params + BN buffers from flat dict."""
         decoder_state = {}
         adapter_state = {}
         backbone_params = {}  # idx → tensor
@@ -1935,9 +1941,9 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
             elif k.startswith("backbone."):
                 backbone_params[int(k[len("backbone."):])] = v
         if decoder_state:
-            decoder.load_state_dict(decoder_state)
+            decoder.load_state_dict(decoder_state, strict=True)
         if adapter_state and hasattr(backbone, '_adapters') and backbone._adapters is not None:
-            backbone._adapters.load_state_dict(adapter_state)
+            backbone._adapters.load_state_dict(adapter_state, strict=True)
         if backbone_params:
             for i, param in enumerate(backbone.model.model.parameters()):
                 if i in backbone_params:
@@ -2039,7 +2045,12 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
             current_state = _collect_trainable_state()
             for k in ema_state:
                 if k in current_state:
-                    ema_state[k] = alpha * ema_state[k] + (1 - alpha) * current_state[k]
+                    # BN buffers (running_mean/running_var) 不参与 EMA 平滑, 直接复制
+                    # BN buffers are NOT EMA-smoothed, copied directly
+                    if "running_mean" in k or "running_var" in k or "num_batches_tracked" in k:
+                        ema_state[k] = current_state[k].clone()
+                    else:
+                        ema_state[k] = alpha * ema_state[k] + (1 - alpha) * current_state[k]
 
         # ── SWA Update | 随机权重平均 ──
         if epoch >= swa_start:
