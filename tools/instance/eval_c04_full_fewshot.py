@@ -695,7 +695,7 @@ def build_decoder(method: str, **kwargs) -> nn.Module:
         return SparseSupportCrossAttnDecoder(
             feat_dim_p3=kwargs.get("feat_dim_p3", 640),
             feat_dim_p4=kwargs.get("feat_dim_p4", 1280),
-            num_tokens=kwargs.get("num_tokens", 64))
+            max_tokens=kwargs.get("num_tokens", 128))
     else:
         raise ValueError(f"Unknown decoder: {method}")
 
