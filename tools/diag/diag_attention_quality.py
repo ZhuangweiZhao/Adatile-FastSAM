@@ -236,11 +236,11 @@ def run_attention_episode(
     support_imgs, support_masks_orig = [], []
     for si in support_idxs:
         img = dataset.load_image(int(si)).to(device)
-        mask = dataset.render_class_mask(int(si), class_id).to(device)
+        mask = dataset.render_class_mask(int(si), class_id)
         if dataset.crop_support and mask.sum() > 64:
             img, mask = dataset._roi_crop(img, mask)
         support_imgs.append(img)
-        support_masks_orig.append(mask)
+        support_masks_orig.append(mask.to(device))
     support_batch = torch.stack(support_imgs)
 
     # Load query
