@@ -245,13 +245,8 @@ class PreCutTileAdapter:
         self._cache_order.append(tile_idx)
 
     def _evict_if_needed(self):
-        """LRU 淘汰 | LRU eviction."""
-        while len(self._img_cache) + len(self._mask_cache) > self._CACHE_MAX * 2:
-            if not self._cache_order:
-                break
-            oldest = self._cache_order.pop(0)
-            self._img_cache.pop(oldest, None)
-            self._mask_cache.pop(oldest, None)
+        """No-op: cache bounded by validation episode count, well within server RAM."""
+        pass
 
     def __len__(self):
         return len(self._tiles)
