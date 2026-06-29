@@ -278,12 +278,12 @@ def compute_attention_consistency(attn_map: torch.Tensor, query_mask: torch.Tens
     H, W, K = attn_map.shape
 
     # AveragePool to get local mean attention
-    # Use explicit padding-then-pool to avoid ceil_mode mismatches on odd dims
+    # F.pad then pool; crop to original size (padding can cause +1 on odd dims)
     pad = window // 2
     attn_4d = attn_map.permute(2, 0, 1).unsqueeze(0)  # [1, K, H, W]
-    # Pad manually: reflect padding for better boundary handling
     attn_padded = F.pad(attn_4d, (pad, pad, pad, pad), mode='reflect')
-    local_mean = F.avg_pool2d(attn_padded, kernel_size=window, stride=1)  # [1, K, H, W]
+    local_mean = F.avg_pool2d(attn_padded, kernel_size=window, stride=1)
+    local_mean = local_mean[:, :, :H, :W]  # crop to original size
     local_mean = local_mean.squeeze(0).permute(1, 2, 0)  # [H, W, K]
 
     # Local variance: ||attn - local_mean||^2
