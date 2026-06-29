@@ -1099,8 +1099,15 @@ def train_episode(decoder, backbone, support_idxs, query_idx,
     query_mask = query_mask.unsqueeze(0).unsqueeze(0).to(device)  # [1,1,H,W]
     t_load_query = time.perf_counter()
 
-    # Forward - support + query backbone (no grad on frozen backbone)
-    with torch.no_grad():
+    # Forward - support + query backbone
+    # 当 adapter 或 partial-finetune 激活时，需要 backbone 的梯度
+    # When adapter or partial-finetune is active, backbone needs gradients
+    _backbone_has_trainable = (
+        (hasattr(backbone, '_adapters') and backbone._adapters is not None) or
+        any(p.requires_grad for p in backbone.model.model.parameters())
+    )
+    _grad_ctx = torch.enable_grad() if _backbone_has_trainable else torch.no_grad()
+    with _grad_ctx:
         is_sparse = getattr(decoder, '__class__', type(decoder)).__name__ in ("SparseSupportCrossAttnDecoder", "CostVolumeDecoder")
         if is_sparse:
             fg_proto = _extract_support_tokens(backbone, support_imgs, support_masks,
@@ -1762,16 +1769,30 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
     # Optimizer & Scheduler
     # beta2=0.95 适合少样本: 有效记忆 ~20 步 (vs 默认 0.999 的 ~1000 步)
     # beta2=0.95 for few-shot: effective memory ~20 steps (vs default 0.999 ~1000 steps)
-    # 优化器参数: decoder + 可选的 backbone LoRA
-    # Optimizer params: decoder + optional backbone LoRA
+    # 优化器参数: decoder + adapter (if any) + partial-finetune backbone (if any)
+    # Optimizer params: decoder + adapter (if any) + partial-finetune backbone (if any)
     opt_params = list(decoder.parameters())
-    lora_params = [p for p in backbone.parameters() if p.requires_grad and p is not decoder]
-    lora_params = [p for p in lora_params if p not in set(opt_params)]
-    if lora_params:
-        opt_params += lora_params
+
+    # 收集 adapter 参数 | Collect adapter params
+    adapter_params = []
+    if hasattr(backbone, '_adapters') and backbone._adapters is not None:
+        adapter_params = list(backbone._adapters.parameters())
+        opt_params += adapter_params
         logger.log_info(f"{tag}/opt",
-                       f"Optimizing {sum(p.numel() for p in opt_params):,} params "
-                       f"(+{sum(p.numel() for p in lora_params):,} LoRA)")
+                       f"+{sum(p.numel() for p in adapter_params):,} adapter params")
+
+    # 收集部分解冻的 backbone 参数 (YOLO model, 非 nn.Module 子模块)
+    # Collect partial-finetune backbone params (YOLO model, not an nn.Module child)
+    ft_params = [p for p in backbone.model.model.parameters() if p.requires_grad]
+    existing_ids = {id(p) for p in opt_params}
+    ft_params = [p for p in ft_params if id(p) not in existing_ids]
+    if ft_params:
+        opt_params += ft_params
+        logger.log_info(f"{tag}/opt",
+                       f"+{sum(p.numel() for p in ft_params):,} partial-finetune params")
+
+    logger.log_info(f"{tag}/opt",
+                   f"Total optimizable: {sum(p.numel() for p in opt_params):,} params")
     opt = torch.optim.AdamW(opt_params, lr=args.lr,
                             betas=(0.9, 0.95), weight_decay=args.weight_decay)
 
@@ -1852,7 +1873,51 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
     # ── EMA Model | 指数移动平均 ──
     # EMA stabilizes few-shot training by smoothing weight updates across episodes
     ema_decay = getattr(args, 'ema_decay', 0.999)
-    ema_state = {k: v.clone() for k, v in decoder.state_dict().items()} if ema_decay > 0 else None
+
+    # ── 辅助函数: 收集/恢复所有可训练参数 (decoder + adapter + backbone) ──
+    # Helpers: collect/restore all trainable params (decoder + adapter + backbone)
+    def _collect_trainable_state():
+        """收集所有可训练参数 → flat dict with prefixed keys.
+        Collect all trainable params → flat dict with prefixed keys."""
+        state = {}
+        for name, param in decoder.named_parameters():
+            if param.requires_grad:
+                state[f"decoder.{name}"] = param.data.clone()
+        if hasattr(backbone, '_adapters') and backbone._adapters is not None:
+            for name, param in backbone._adapters.named_parameters():
+                if param.requires_grad:
+                    state[f"adapter.{name}"] = param.data.clone()
+        # 收集 backbone 部分解冻的参数 (YOLO model params 不在 backbone.named_parameters() 中)
+        # Collect backbone partial-finetune params (YOLO model params not in backbone.named_parameters())
+        for i, param in enumerate(backbone.model.model.parameters()):
+            if param.requires_grad:
+                state[f"backbone.{i}"] = param.data.clone()
+        return state
+
+    def _restore_trainable_state(state: dict):
+        """从 flat dict 恢复所有可训练参数 | Restore all trainable params from flat dict."""
+        decoder_state = {}
+        adapter_state = {}
+        backbone_params = {}  # idx → tensor
+        for k, v in state.items():
+            if k.startswith("decoder."):
+                decoder_state[k[len("decoder."):]] = v
+            elif k.startswith("adapter."):
+                adapter_state[k[len("adapter."):]] = v
+            elif k.startswith("backbone."):
+                backbone_params[int(k[len("backbone."):])] = v
+        if decoder_state:
+            decoder.load_state_dict(decoder_state)
+        if adapter_state and hasattr(backbone, '_adapters') and backbone._adapters is not None:
+            backbone._adapters.load_state_dict(adapter_state)
+        if backbone_params:
+            for i, param in enumerate(backbone.model.model.parameters()):
+                if i in backbone_params:
+                    param.data.copy_(backbone_params[i])
+
+    ema_state = {} if ema_decay > 0 else None
+    if ema_decay > 0:
+        ema_state = _collect_trainable_state()
 
     # ── SWA config | 随机权重平均 ──
     swa_start = getattr(args, 'swa_start_epoch', 0)
@@ -1943,24 +2008,28 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
         # ── EMA Update | 指数移动平均更新 ──
         if ema_state is not None:
             alpha = min(1.0 - 1.0 / (epoch + 1), ema_decay)
+            current_state = _collect_trainable_state()
             for k in ema_state:
-                ema_state[k] = alpha * ema_state[k] + (1 - alpha) * decoder.state_dict()[k]
+                if k in current_state:
+                    ema_state[k] = alpha * ema_state[k] + (1 - alpha) * current_state[k]
 
         # ── SWA Update | 随机权重平均 ──
         if epoch >= swa_start:
+            current_state = _collect_trainable_state()
             if swa_state is None:
-                swa_state = {k: v.clone() for k, v in decoder.state_dict().items()}
+                swa_state = {k: v.clone() for k, v in current_state.items()}
                 swa_n = 1
             else:
                 for k in swa_state:
-                    swa_state[k] = (swa_state[k] * swa_n + decoder.state_dict()[k]) / (swa_n + 1)
+                    if k in current_state:
+                        swa_state[k] = (swa_state[k] * swa_n + current_state[k]) / (swa_n + 1)
                 swa_n += 1
 
         # Per-class best saving
         for cls_id, val_iou in per_cls_val.items():
             if val_iou > best_per_cls_iou[cls_id]:
                 best_per_cls_iou[cls_id] = val_iou
-                best_per_cls_state[cls_id] = {k: v.clone() for k, v in decoder.state_dict().items()}
+                best_per_cls_state[cls_id] = _collect_trainable_state()
 
         # Timing for this epoch
         t_epoch_train = t_train_done - t_epoch_start
@@ -1988,7 +2057,7 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
 
         if mval > best_val_miou:
             best_val_miou = mval
-            best_state = {k: v.clone() for k, v in decoder.state_dict().items()}
+            best_state = _collect_trainable_state()
             torch.save(best_state, str(output_dir / f"decoder_{decoder_type}_{shot}shot_best.pt"))
             best_epoch = epoch
 
@@ -2012,15 +2081,15 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
     # ── EMA Evaluation | EMA 模型评估 ──
     ema_result = None
     if ema_state is not None:
-        ema_backup = {k: v.clone() for k, v in decoder.state_dict().items()}
-        decoder.load_state_dict(ema_state)
+        ema_backup = _collect_trainable_state()
+        _restore_trainable_state(ema_state)
         decoder.eval()
         logger.log_info(f"{tag}/ema", "Evaluating EMA model...")
         ema_result = evaluate_full(decoder, backbone, train_ds, val_ds, device,
                                    shot, args.eval_episodes, target_classes,
                                    logger, f"{tag}/ema",
                                    feature_level=feature_level)
-        decoder.load_state_dict(ema_backup)
+        _restore_trainable_state(ema_backup)
         logger.log_info(f"{tag}/ema",
                        f"EMA mIoU={ema_result['miou_mean']*100:.2f}% "
                        f"(vs best_val={best_val_miou*100:.2f}%, "
@@ -2029,15 +2098,15 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
     # ── SWA Evaluation | SWA 模型评估 ──
     swa_result = None
     if swa_state is not None and swa_n >= 3:
-        swa_backup = {k: v.clone() for k, v in decoder.state_dict().items()}
-        decoder.load_state_dict(swa_state)
+        swa_backup = _collect_trainable_state()
+        _restore_trainable_state(swa_state)
         decoder.eval()
         logger.log_info(f"{tag}/swa", f"Evaluating SWA model (n={swa_n} epochs)...")
         swa_result = evaluate_full(decoder, backbone, train_ds, val_ds, device,
                                    shot, args.eval_episodes, target_classes,
                                    logger, f"{tag}/swa",
                                    feature_level=feature_level)
-        decoder.load_state_dict(swa_backup)
+        _restore_trainable_state(swa_backup)
         logger.log_info(f"{tag}/swa",
                        f"SWA mIoU={swa_result['miou_mean']*100:.2f}% "
                        f"(vs best_val={best_val_miou*100:.2f}%, "
@@ -2060,7 +2129,7 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
 
     # Restore best overall
     if best_state:
-        decoder.load_state_dict(best_state)
+        _restore_trainable_state(best_state)
 
     # Full Evaluation
     logger.log_info(f"{tag}/eval", "Evaluating best model...")

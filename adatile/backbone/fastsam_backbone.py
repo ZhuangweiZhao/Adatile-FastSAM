@@ -419,6 +419,69 @@ class FastSAMBackbone(nn.Module):
         """安全解冻：设置 requires_grad=True 但不调 .train() | Safe unfreeze: requires_grad=True, no .train()."""
         self._unfreeze()
 
+    def unfreeze_last_n_layers(self, n: int = 0) -> int:
+        """
+        部分解冻: 仅解冻 backbone 最后 n 层 (neck/FPT), 前面保持冻结。
+        Partial unfreeze: only unfreeze last n layers (neck/FPT), keep earlier frozen.
+
+        适合 Freeze vs Partial Fine-tune 对比实验:
+        - n=0: 完全冻结 (等同 freeze)
+        - n=5-10: 仅解冻 neck 层 (与 P3/P4 特征直接相关)
+        - n=-1: 全部解冻 (等同 unfreeze)
+
+        Suitable for Freeze vs Partial Fine-tune comparison:
+        - n=0: fully frozen (same as freeze)
+        - n=5-10: only unfreeze neck layers (directly related to P3/P4 features)
+        - n=-1: unfreeze all (same as unfreeze)
+
+        :param n: 解冻最后 N 层 (0=全部冻结, -1=全部解冻)
+                  Number of last layers to unfreeze (0=all frozen, -1=all unfrozen).
+        :return: 解冻的参数数量 | Number of unfrozen parameters.
+        """
+        if n == -1:
+            self._unfreeze()
+            n_params = sum(p.numel() for p in self.model.model.parameters())
+            self.logger.log_info(
+                "backbone/partial_unfreeze",
+                f"All layers unfrozen: {n_params:,} params",
+            )
+            self._freeze_backbone = False
+            return n_params
+
+        if n == 0:
+            self._apply_freeze()
+            self.logger.log_info(
+                "backbone/partial_unfreeze",
+                "All layers frozen (n=0)",
+            )
+            self._freeze_backbone = True
+            return 0
+
+        # 先全部冻结, 再选择性解冻最后 n 层
+        # Freeze all first, then selectively unfreeze last n layers
+        self._apply_freeze()
+
+        sequential = self.model.model.model
+        total_layers = len(sequential)
+        unfreeze_start = max(0, total_layers - n)
+
+        unfrozen_params = 0
+        for idx in range(unfreeze_start, total_layers):
+            layer = sequential[idx]
+            for param in layer.parameters():
+                param.requires_grad = True
+                unfrozen_params += param.numel()
+
+        # 同时需要把 hook 关联的层之外检测头的参数情况
+        # Also handle params outside the hooked layers if needed
+        self._freeze_backbone = False  # 部分解冻时允许梯度流
+        self.logger.log_info(
+            "backbone/partial_unfreeze",
+            f"Unfrozen last {n}/{total_layers} layers (idx {unfreeze_start}-{total_layers-1}), "
+            f"{unfrozen_params:,} trainable params",
+        )
+        return unfrozen_params
+
     def freeze(self) -> None:
         """安全冻结：设置 requires_grad=False | Safe freeze: requires_grad=False."""
         self._apply_freeze()

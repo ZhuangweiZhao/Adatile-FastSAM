@@ -75,6 +75,14 @@ def parse_args():
     p.add_argument("--lora-rank", type=int, default=0,
                    help="LoRA rank for FastSAM backbone (0=disabled, 4=light, 8=medium). "
                    "Adds ~50K params per rank to neck layers.")
+    p.add_argument("--adapter", action="store_true", default=False,
+                   help="Enable MultiScaleAdapter (Residual 1×1→3×3→1×1) at P3/P4. "
+                   "~273K params (hidden=128). Adapts detection features → few-shot correspondence.")
+    p.add_argument("--adapter-hidden-dim", type=int, default=128,
+                   help="Bottleneck dim for ResidualAdapter (default 128, light=64, heavy=256).")
+    p.add_argument("--partial-finetune", type=int, default=0,
+                   help="Unfreeze last N backbone layers (0=frozen, -1=all, 5-10=neck only). "
+                   "For Freeze vs Partial Fine-tune comparison experiments.")
     # ── Training ──
     p.add_argument("--epochs", type=int, default=60,
                    help="训练轮数 (少量推荐60，充分推荐100)")
@@ -398,13 +406,38 @@ def main():
     # ── Backbone ──
     backbone = FastSAMBackbone(freeze_backbone=args.freeze_encoder).to(device).eval()
 
+    # ── Partial Fine-tune | 部分解冻 ──
+    if args.partial_finetune != 0:
+        n_unfrozen = backbone.unfreeze_last_n_layers(args.partial_finetune)
+        logger.log_info("fewshot/model",
+                       f"Partial fine-tune: unfroze last {args.partial_finetune} layers "
+                       f"({n_unfrozen:,} trainable params)")
+        if args.partial_finetune > 0:
+            # 部分解冻时需要 backbone 参与训练但保持 eval mode
+            # Partial unfreeze: backbone participates in training but stays in eval mode
+            backbone._freeze_backbone = False
+
+    # ── Feature Adapter | 特征适配器 ──
+    if args.adapter:
+        from adatile.backbone.feature_adapter import MultiScaleAdapter
+        adapter = MultiScaleAdapter(
+            feat_dim_p3=feat_dim_p3 if args.feature_level == "p3p4" else 960,
+            feat_dim_p4=feat_dim_p4 if args.feature_level == "p3p4" else 1280,
+            hidden_dim=args.adapter_hidden_dim,
+        ).to(device)
+        backbone.set_adapters(adapter)
+        logger.log_info("fewshot/model",
+                       f"MultiScaleAdapter enabled: hidden={args.adapter_hidden_dim}, "
+                       f"+{adapter.num_params:,} trainable params")
+
     # ── LoRA | 低秩适配 ──
     if args.lora_rank > 0:
         n_lora = backbone.apply_lora(rank=args.lora_rank)
         logger.log_info("fewshot/model",
                        f"FastSAM backbone (frozen={args.freeze_encoder}, "
                        f"LoRA rank={args.lora_rank}, +{n_lora:,} params) on {device}")
-    else:
+    elif not args.adapter:
+        # 无 adapter 无 LoRA: 记录 standard backbone
         logger.log_info("fewshot/model",
                        f"FastSAM backbone (frozen={args.freeze_encoder}) on {device}")
 
