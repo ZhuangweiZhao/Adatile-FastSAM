@@ -1187,14 +1187,16 @@ def train_episode(decoder, backbone, support_idxs, query_idx,
             logit, query_feats = logit_query, None
         loss, components = focal_dice_loss(logit, query_mask, gap_weight=gap_weight)
 
-    # ── Contrastive Loss on P3/P4 features | P3/P4 特征上的对比损失 ──
+    # ── Contrastive Loss on P4 features | P4 特征上的对比损失 ──
     if contrastive_weight > 0 and contrastive_loss_fn is not None and query_feats is not None:
-        # Build support prototype from support features (computed earlier)
-        # 从 support 特征构建 prototype (均值)
-        support_proto_p4 = fg_proto.mean(dim=0)  # [C] — mean of all support FG tokens
+        # Build support prototype from support tokens (P4, already computed)
+        support_proto = fg_proto.mean(dim=0)  # [1280] — mean of all support FG tokens (P4)
+        # Resize query mask to P4 feature resolution
+        mask_p4 = F.interpolate(
+            query_mask.float(), size=query_feats["p4"].shape[2:], mode="nearest"
+        ).squeeze(1)  # [B, H4, W4]
         contrast_loss, contrast_comp = contrastive_loss_fn(
-            query_feats.get("p3"), query_feats.get("p4"),
-            query_mask.squeeze(1), support_proto_p4,
+            query_feats["p4"], mask_p4, support_proto,
         )
         loss = loss + contrastive_weight * contrast_loss
         components.update(contrast_comp)
@@ -1898,13 +1900,13 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
     contrastive_weight = getattr(args, 'contrastive_weight', 0.0)
     contrastive_loss_fn = None
     if contrastive_weight > 0:
-        from adatile.losses.contrastive import PixelSupConLossMultiScale
-        contrastive_loss_fn = PixelSupConLossMultiScale(
-            temperature=0.1, p3_weight=0.5, p4_weight=0.5,
+        from adatile.losses.contrastive import PixelSupConLoss
+        contrastive_loss_fn = PixelSupConLoss(
+            temperature=0.1, margin=0.3, uniform_weight=0.05,
         ).to(device)
         logger.log_info(f"{tag}/loss",
                        f"Pixel SupCon enabled: λ={contrastive_weight} "
-                       f"(P3+P4, temperature=0.1)")
+                       f"(P4, temperature=0.1)")
 
     # Class sampling weights (rare class oversampling)
     # 排除零样本类（如 iSAID 的 road 在 train 中可能为 0）| Exclude zero-sample classes
