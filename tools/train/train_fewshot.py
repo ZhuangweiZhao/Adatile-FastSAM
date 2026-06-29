@@ -83,6 +83,10 @@ def parse_args():
     p.add_argument("--partial-finetune", type=int, default=0,
                    help="Unfreeze last N backbone layers (0=frozen, -1=all, 5-10=neck only). "
                    "For Freeze vs Partial Fine-tune comparison experiments.")
+    p.add_argument("--contrastive-weight", type=float, default=0.0,
+                   help="Weight for pixel-level SupCon contrastive loss on P3/P4 features. "
+                   "0.0=disabled, 0.1-0.5 recommended. Adds metric learning objective "
+                   "alongside mask prediction loss.")
     # ── Training ──
     p.add_argument("--epochs", type=int, default=60,
                    help="训练轮数 (少量推荐60，充分推荐100)")

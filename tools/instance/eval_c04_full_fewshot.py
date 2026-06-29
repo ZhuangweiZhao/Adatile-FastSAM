@@ -912,17 +912,26 @@ def build_decoder(method: str, **kwargs) -> nn.Module:
 # ═══════════════════════════════════════════════════════════════════
 
 def _decoder_forward(decoder, backbone, query_img, fg_prototype, target_size,
-                     feature_level="p4", support_imgs=None):
-    """统一的 decoder 前向调用, 处理单层和 p3p4 融合 | Unified decoder forward."""
+                     feature_level="p4", support_imgs=None, return_feats=False):
+    """统一的 decoder 前向调用, 处理单层和 p3p4 融合 | Unified decoder forward.
+
+    :param return_feats: if True, return (logit, backbone_features_dict).
+                         用于 contrastive loss 等需要 raw features 的场景.
+    """
     feats = backbone(query_img)
     if feature_level == "p3p4":
         # CAT-SAM-A decoder needs support_imgs for FFT features
         if hasattr(decoder, 'use_fft') and support_imgs is not None:
-            return decoder(feats["p3"], feats["p4"], fg_prototype,
+            logit = decoder(feats["p3"], feats["p4"], fg_prototype,
                           target_size=target_size, support_imgs=support_imgs)
-        return decoder(feats["p3"], feats["p4"], fg_prototype, target_size=target_size)
+        else:
+            logit = decoder(feats["p3"], feats["p4"], fg_prototype, target_size=target_size)
     else:
-        return decoder(feats[feature_level], fg_prototype, target_size=target_size)
+        logit = decoder(feats[feature_level], fg_prototype, target_size=target_size)
+
+    if return_feats:
+        return logit, feats
+    return logit
 
 
 def _extract_prototype(backbone, support_imgs, support_masks, feature_level, num_proto):
@@ -1092,7 +1101,8 @@ def train_episode(decoder, backbone, support_idxs, query_idx,
                   train_ds, query_class, device, opt,
                   scaler=None, grad_clip=1.0, use_amp=False,
                   feature_level="p4", use_dynamic_proto=False,
-                  gap_weight=1.0):
+                  gap_weight=1.0, contrastive_weight=0.0,
+                  contrastive_loss_fn=None):
     """Single training episode: Support -> proto -> query -> loss -> backward.
 
     Support and Query BOTH come from train_ds (standard Few-shot protocol).
@@ -1157,17 +1167,37 @@ def train_episode(decoder, backbone, support_idxs, query_idx,
 
     t_backbone_support = time.perf_counter()
 
-    # Forward - query decoder (grad only through decoder)
+    # Forward - query decoder
     tsize = tuple(query_mask.shape[2:])
     if use_amp:
         with torch.amp.autocast(device.type):
-            logit = _decoder_forward(decoder, backbone, query_img, fg_proto,
-                                     tsize, feature_level, support_imgs=support_imgs)
+            logit, query_feats = _decoder_forward(
+                decoder, backbone, query_img, fg_proto,
+                tsize, feature_level, support_imgs=support_imgs,
+                return_feats=(contrastive_weight > 0))
             loss, components = focal_dice_loss(logit, query_mask, gap_weight=gap_weight)
     else:
-        logit = _decoder_forward(decoder, backbone, query_img, fg_proto,
-                                 tsize, feature_level, support_imgs=support_imgs)
+        logit_query = _decoder_forward(
+            decoder, backbone, query_img, fg_proto,
+            tsize, feature_level, support_imgs=support_imgs,
+            return_feats=(contrastive_weight > 0))
+        if contrastive_weight > 0:
+            logit, query_feats = logit_query
+        else:
+            logit, query_feats = logit_query, None
         loss, components = focal_dice_loss(logit, query_mask, gap_weight=gap_weight)
+
+    # ── Contrastive Loss on P3/P4 features | P3/P4 特征上的对比损失 ──
+    if contrastive_weight > 0 and contrastive_loss_fn is not None and query_feats is not None:
+        # Build support prototype from support features (computed earlier)
+        # 从 support 特征构建 prototype (均值)
+        support_proto_p4 = fg_proto.mean(dim=0)  # [C] — mean of all support FG tokens
+        contrast_loss, contrast_comp = contrastive_loss_fn(
+            query_feats.get("p3"), query_feats.get("p4"),
+            query_mask.squeeze(1), support_proto_p4,
+        )
+        loss = loss + contrastive_weight * contrast_loss
+        components.update(contrast_comp)
     t_decoder = time.perf_counter()
 
     opt.zero_grad()
@@ -1864,6 +1894,18 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
     use_amp = args.amp and device.type == "cuda"
     scaler = torch.amp.GradScaler(device.type) if use_amp else None
 
+    # ── Contrastive Loss | 像素对比损失 ──
+    contrastive_weight = getattr(args, 'contrastive_weight', 0.0)
+    contrastive_loss_fn = None
+    if contrastive_weight > 0:
+        from adatile.losses.contrastive import PixelSupConLossMultiScale
+        contrastive_loss_fn = PixelSupConLossMultiScale(
+            temperature=0.1, p3_weight=0.5, p4_weight=0.5,
+        ).to(device)
+        logger.log_info(f"{tag}/loss",
+                       f"Pixel SupCon enabled: λ={contrastive_weight} "
+                       f"(P3+P4, temperature=0.1)")
+
     # Class sampling weights (rare class oversampling)
     # 排除零样本类（如 iSAID 的 road 在 train 中可能为 0）| Exclude zero-sample classes
     class_image_counts = {c: len(train_ds.class_to_images(c)) for c in target_classes}
@@ -2002,7 +2044,9 @@ def train_and_evaluate(decoder, backbone, train_ds, val_ds, device,
                                 scaler=scaler, grad_clip=args.grad_clip,
                                 use_amp=use_amp, feature_level=feature_level,
                                 use_dynamic_proto=args.use_dynamic_proto,
-                                gap_weight=gap_weights_fixed.get(query_class, 1.0))
+                                gap_weight=gap_weights_fixed.get(query_class, 1.0),
+                                contrastive_weight=contrastive_weight,
+                                contrastive_loss_fn=contrastive_loss_fn)
             if loss is not None:
                 total_loss += loss
                 n_eps += 1
