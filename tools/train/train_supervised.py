@@ -236,6 +236,109 @@ class SupervisedSegDataset(Dataset):
 
 
 # ═══════════════════════════════════════════════════════════════════
+# 预切 Tile 数据集 (896×896) | Pre-Cut Tile Dataset
+# ═══════════════════════════════════════════════════════════════════
+
+class PrecutTileDataset(Dataset):
+    """
+    预切 896×896 tile 全监督分割数据集 | Pre-cut 896×896 Tile Dataset.
+
+    从 ``iSAID5i_tiles/tile_896`` 格式加载，格式为 images/ + labels/ + metadata.json。
+    Loads from ``iSAID5i_tiles/tile_896`` format: images/ + labels/ + metadata.json.
+
+    Parameters
+    ----------
+    root : str
+        Tile 数据根目录 (e.g. "data/iSAID5i_tiles/tile_896").
+    split : str
+        "train" 或 "val".
+    novel_ids : list[int] | None
+        Novel 类 ID 列表。训练时设置为 IGNORE_INDEX。
+    base_ids : list[int] | None
+        Base 类 ID 列表。用于过滤 tile：仅保留包含至少一个 Base 类的 tile。
+        Base class IDs. Used to filter tiles: only keep tiles containing >=1 Base class.
+    """
+
+    def __init__(
+        self,
+        root: str = "data/iSAID5i_tiles/tile_896",
+        split: str = "train",
+        novel_ids: list[int] | None = None,
+        base_ids: list[int] | None = None,
+    ):
+        self.root = Path(root)
+        self.split = split
+        self.novel_ids = set(novel_ids) if novel_ids else set()
+        self.base_ids = set(base_ids) if base_ids else set()
+
+        # ── 加载 metadata | Load metadata ──
+        meta_path = self.root / split / "metadata.json"
+        if not meta_path.exists():
+            raise FileNotFoundError(f"Metadata not found: {meta_path}")
+        with open(meta_path) as f:
+            self._meta = json.load(f)
+
+        self.tile_size = self._meta.get("tile_size", 896)
+        self._img_dir = self.root / split / "images"
+        self._label_dir = self.root / split / "labels"
+
+        # ── 过滤 tile | Filter tiles ──
+        all_tiles = self._meta["tiles"]
+        if self.base_ids:
+            # 仅保留包含至少一个 Base 类的 tile | Keep tiles with >=1 Base class
+            self._tiles = [
+                t for t in all_tiles
+                if any(c in self.base_ids for c in t.get("classes", []))
+            ]
+        else:
+            self._tiles = list(all_tiles)
+
+        n_total = len(all_tiles)
+        n_kept = len(self._tiles)
+        filter_info = f"(filtered {n_kept}/{n_total}, base_only)" if self.base_ids else f"(all {n_total})"
+        print(f"[PrecutTileDataset] {split}: {n_kept} tiles, "
+              f"tile_size={self.tile_size}px, {filter_info}, "
+              f"novel_ids={sorted(self.novel_ids) if self.novel_ids else 'none'}")
+
+    def _get_img_path(self, tile_name: str) -> Path:
+        return self._img_dir / f"{tile_name}.png"
+
+    def _get_label_path(self, tile_name: str) -> Path:
+        return self._label_dir / f"{tile_name}_label.png"
+
+    def __len__(self) -> int:
+        return len(self._tiles)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        tile_info = self._tiles[idx]
+        tile_name = tile_info["tile_name"]
+
+        # ── 加载图像 | Load image ──
+        img_path = self._get_img_path(tile_name)
+        img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+        if img is None:
+            raise ValueError(f"Cannot read image: {img_path}")
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        img_tensor = torch.from_numpy(img).permute(2, 0, 1).float()
+
+        # ── 加载标签 | Load label ──
+        mask_path = self._get_label_path(tile_name)
+        mask = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
+        if mask is None:
+            raise ValueError(f"Cannot read label: {mask_path}")
+        if mask.ndim == 3:
+            mask = mask[:, :, 0]
+        mask_tensor = torch.from_numpy(mask.astype(np.int64))
+
+        # ── Novel 类像素 → IGNORE_INDEX | Novel class pixels → ignore ──
+        if self.novel_ids:
+            for nid in self.novel_ids:
+                mask_tensor[mask_tensor == nid] = IGNORE_INDEX
+
+        return {"image": img_tensor, "mask": mask_tensor, "tile_name": tile_name}
+
+
+# ═══════════════════════════════════════════════════════════════════
 # 损失函数 | Loss Functions
 # ═══════════════════════════════════════════════════════════════════
 
@@ -588,6 +691,8 @@ def parse_args():
     # ── 数据 | Data ──
     p.add_argument("--data-root", type=str, default=DEFAULT_DATA_ROOT,
                    help=f"iSAID-5i 数据根目录 | iSAID-5i data root (default: {DEFAULT_DATA_ROOT})")
+    p.add_argument("--tile-root", type=str, default=None,
+                   help="预切 tile 目录 (896×896) | Pre-cut tile root (e.g. data/iSAID5i_tiles/tile_896)")
     p.add_argument("--fold", type=int, default=-1,
                    choices=[-1, 0, 1, 2],
                    help="Fold ID: -1=全量所有类, 0/1/2=仅 Base 类 | "
@@ -689,14 +794,30 @@ def main():
     # ── 构建数据集 | Build datasets ──
     logger.log_info("supervised/data", "Loading datasets...")
 
-    train_ds = SupervisedSegDataset(
-        root=args.data_root, split="train", fold=args.fold,
-        novel_ids=novel_ids,
-    )
-    val_ds = SupervisedSegDataset(
-        root=args.data_root, split="val", fold=args.fold,
-        novel_ids=novel_ids,
-    )
+    if args.tile_root:
+        # 预切 tile 格式 (896×896) | Pre-cut tile format
+        logger.log_info("supervised/data",
+            f"Using pre-cut tiles: {args.tile_root} (tile_size=896)")
+        train_ds = PrecutTileDataset(
+            root=args.tile_root, split="train",
+            novel_ids=novel_ids,
+            base_ids=base_ids if args.fold >= 0 else None,
+        )
+        val_ds = PrecutTileDataset(
+            root=args.tile_root, split="val",
+            novel_ids=novel_ids,
+            base_ids=base_ids if args.fold >= 0 else None,
+        )
+    else:
+        # 标准 iSAID-5i 格式 (256×256) | Standard iSAID-5i format
+        train_ds = SupervisedSegDataset(
+            root=args.data_root, split="train", fold=args.fold,
+            novel_ids=novel_ids,
+        )
+        val_ds = SupervisedSegDataset(
+            root=args.data_root, split="val", fold=args.fold,
+            novel_ids=novel_ids,
+        )
 
     # ── 类别平衡权重 | Class-balanced weights ──
     class_weight = None
