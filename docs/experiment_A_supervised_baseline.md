@@ -272,6 +272,45 @@ helicopter       0.000    ❌❌ Dead (2 tiles, 1.4K px)     —
 
 ---
 
+### 3.8 Run [J] `supervised_J_p3p4_full_nocb_256` — P3+P4, No CB, Full Unfreeze ✅ NEW (云端)
+
+**最佳**: E18, **mIoU=0.4199**, pixel_acc=0.9331
+
+```
+Class              IoU    Assessment                     vs [C] Frozen
+─────────────────────────────────────────────────────────────────────
+tennis_court     0.852    ✅ Excellent                   +0.015 ↑
+storage_tank     0.784    ✅ Good                        -0.015
+baseball_diamond 0.701    ✅ Good                        -0.005
+ship             0.649    ✅ Good                        -0.012
+soccer           0.390    ⚠️ Low                          +0.022 ↑
+ground_track     0.244    ⚠️ Low                          -0.018
+large_vehicle    0.144    ❌ Very low                     +0.003
+bridge           0.014    ❌ Near zero                    +0.006
+helicopter       0.000    ❌❌ Dead                         —
+plane            0.000    ❌❌ Dead                         —
+─────────────────────────────────────────────────────────────────────
+mIoU             0.4199                                  -0.0004 ↓
+```
+
+**配置**: P3+P4 + Full Unfreeze (72M backbone + 273K decoder, lr=1e-5), RTX 5090
+
+| Epoch | Train Loss | Val mIoU | Val Acc |
+|:-----:|----------:|--------:|--------:|
+| 1 | 0.3572 | 0.3593 | 0.9108 |
+| 5 | 0.1760 | 0.4174 | 0.9316 |
+| **18** | **0.0955** | **0.4199** | 0.9331 |
+| 50 | 0.0574 | 0.4123 | 0.9354 |
+
+**关键发现**:
+- ★ **Backbone FT + 多尺度融合 → 零协同效应，甚至微降 (-0.0004)**
+- 与 [C] Frozen 的训练曲线几乎完全一致（E1 loss 同为 0.3572）
+- tennis_court 和 soccer 微升，ship 和 storage_tank 微降 — 纯重分布，无净增益
+
+> **256² 最终结论**: 无论 Frozen/Partial/Full backbone，无论 P4/P3/P3P4 decoder，天花板 mIoU≈0.42。Backbone 微调在 256² 下完败——唯一有效的提升来自空间分辨率（P3+P4 > P3 > P4）。**突破需要更大的 tile。**
+
+---
+
 ## 4. 跨 Run 对比 | Cross-Run Comparison
 
 ### 4.1 消融矩阵 (256²) — Freeze vs Partial vs Full
@@ -438,20 +477,25 @@ mIoU             0.4103                                  +0.0014            +0.0
 
 P3 stride-8 特征使 **plane 首次稳定突破 0** (0.020)，证明高分辨率特征是小目标分割的前提。但当前 P3+P4 decoder 仅 273K（P4-only 的 38%），容量不足导致 E5 即过拟合。
 
-### 5.4 Backbone 微调的价值（已证伪）
+### 5.4 Backbone 微调的价值（已完全证伪）
 
-> **三重证据链: Frozen (0.4089) ≈ Partial 31M (0.4090) ≈ Full 72M (0.4103)。256² 天花板 = mIoU≈0.41。**
+> **四重证据链: Frozen vs Full-FT，两种 decoder 架构下均无增益。**
 
-| | Frozen [A] | Partial [G] | Full [H] | Δ (Frozen→Full) |
+```
+            P4-only decoder              P3+P4 decoder
+Frozen      [A] 0.4089                   [C] 0.4203
+Full-FT     [H] 0.4103 (+0.0014)         [J] 0.4199 (-0.0004)
+─────────────────────────────────────────────────────────
+Δ(FT)       +0.0014 (忽略不计)            -0.0004 (微降)
+```
+
+| | P4 Frozen | P4 Full | P3P4 Frozen | P3P4 Full |
 |---|---|:---:|:---:|:---:|
-| mIoU | 0.4089 | 0.4090 | 0.4103 | **+0.0014** |
-| 最佳 epoch | E17 | E8 | E13 | 收敛加速 |
-| Backbone params | 0 | 31M | 72M | — |
-| large_vehicle | 0.113 | 0.138 | 0.151 | **唯一持续改善** |
-| plane/helicopter | 0 | 0 | 0 | 无解 |
-| 过拟合 | 无 | 无 | 无 | 都稳定 |
+| mIoU | 0.4089 | 0.4103 | **0.4203** | 0.4199 |
+| Backbone params | 0 | 72M | 0 | 72M |
+| 稀有类 | 死 | 死 | 死 | 死 |
 
-> **结论**: 256² (16×16 feature) 下瓶颈是空间分辨率，不是特征质量、模型容量或训练策略。72M backbone 参数也创造不出 stride-16 中丢失的小目标信息。**突破需要更大 tile 或 P3 多尺度融合。**
+> **结论**: 256² 下 backbone 微调 **对任何 decoder 架构都无效**。瓶颈是空间分辨率 (16×16 / 32×32 feature cells)，不是特征质量。**唯一有效的提升来自多尺度融合 (+0.0114)。进一步突破必须用更大的 tile。**
 
 ### 5.5 Decoder 容量与泛化
 
@@ -497,9 +541,10 @@ P3+P4 (273K)        [C_896] 待跑         [D_896] 待跑        [F] 待跑
 | Run | ID | Config | mIoU | Best Epoch | Notes |
 |-----|-----|--------|:----:|:----------:|------|
 | [C] | `C_p3p4_nocb_256` | P3+P4, 256², no-CB, Frozen | **0.4203** | E14 | ★ 最高分 |
-| [I] | `I_p3_only_nocb_256` | P3-only, 256², no-CB, Frozen | 0.4106 | E17 | 253K > 716K, 分辨率优先 |
-| [H] | `H_full_p4_nocb_256` | P4, 256², no-CB, Full-FT (72M) | 0.4103 | E13 | 三重证据链闭合 |
-| [G] | `G_partial5_p4_nocb_256` | P4, 256², no-CB, Partial-FT (31M) | 0.4090 | E8 | 收敛 2× 快 |
+| [J] | `J_p3p4_full_nocb_256` | P3+P4, 256², no-CB, Full-FT (72M) | 0.4199 | E18 | FT 无协同效应 |
+| [I] | `I_p3_only_nocb_256` | P3-only, 256², no-CB, Frozen | 0.4106 | E17 | 253K > 716K |
+| [H] | `H_full_p4_nocb_256` | P4, 256², no-CB, Full-FT (72M) | 0.4103 | E13 | FT 微量增益 |
+| [G] | `G_partial5_p4_nocb_256` | P4, 256², no-CB, Partial-FT (31M) | 0.4090 | E8 | 收敛加速 |
 | [A] | `0629_2237` | P4, 256², no-CB, Frozen | 0.4089 | E17 | Baseline |
 | [B] | `0702_2038` | P4, 256², CB, Frozen | 0.3950 | E40 | CB hurts |
 | [D] | `0630_0646` | P3+P4, 256², CB, Frozen | 0.3946 | E5 | plane=0.020, overfit |

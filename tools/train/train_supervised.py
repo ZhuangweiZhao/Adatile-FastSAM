@@ -101,11 +101,23 @@ class SupervisedSegDataset(Dataset):
         split: str = "train",
         fold: int = -1,
         novel_ids: list[int] | None = None,
+        k_shot: int = 0,
+        k_shot_seed: int = 42,
     ):
+        """
+        Parameters
+        ----------
+        k_shot : int
+            K-shot 少样本模式: 每类最多采样 K 个 tile (0=全量 | full data).
+            K-shot few-shot mode: sample at most K tiles per class (0=full data).
+        k_shot_seed : int
+            K-shot 采样的随机种子 | Random seed for K-shot sampling.
+        """
         self.root = Path(root)
         self.split = split
         self.fold = fold
         self.novel_ids = set(novel_ids) if novel_ids else set()
+        self.k_shot = k_shot
 
         # ── 路径设置 | Path setup ──
         self._img_dir = self.root / split / "images"
@@ -161,10 +173,74 @@ class SupervisedSegDataset(Dataset):
 
         self._tile_names = valid_names
 
+        # ── K-shot 少样本采样 | K-shot subsampling ──
+        if k_shot > 0 and split == "train" and self.novel_ids:
+            self._tile_names = self._subsample_k_shot(k_shot, k_shot_seed)
+
         # ── 日志 | Log ──
         mode_str = f"fold={fold}, base-only" if fold >= 0 else "full (all 15 classes)"
+        ks_str = f", k={k_shot}-shot" if k_shot > 0 and split == "train" else ""
         print(f"[SupervisedSegDataset] {split}: {len(self._tile_names)} tiles, "
-              f"{mode_str}, novel_ids={sorted(self.novel_ids) if self.novel_ids else 'none'}")
+              f"{mode_str}{ks_str}, novel_ids={sorted(self.novel_ids) if self.novel_ids else 'none'}")
+
+    def _subsample_k_shot(self, k: int, seed: int) -> list[str]:
+        """
+        K-shot 采样: 每类最多随机选 K 个 tile | K-shot sampling: at most K tiles per class.
+
+        扫描所有 train tile 的掩码，对每个 Base 类随机选 K 个包含该类的 tile，
+        最后取所有被选中 tile 的并集。确保小类别有机会被表示。
+        Scan all train tile masks, randomly select K tiles per Base class,
+        then take the union of all selected tiles.
+        """
+        import random
+        rng = random.Random(seed)
+
+        # ── 确定 Base 类 | Determine Base classes ──
+        base_ids = sorted(set(range(1, 16)) - self.novel_ids)
+
+        # ── 扫描每个 tile 包含哪些类 | Scan which classes each tile contains ──
+        tile_to_classes: dict[str, set[int]] = {}
+        for name in self._tile_names:
+            mask_path = self._get_mask_path(name)
+            if not mask_path.exists():
+                tile_to_classes[name] = set()
+                continue
+            mask = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
+            if mask is None:
+                tile_to_classes[name] = set()
+                continue
+            if mask.ndim == 3:
+                mask = mask[:, :, 0]
+            classes = set(np.unique(mask).tolist()) - {0}
+            # 只保留 Base 类 | Keep only Base classes
+            tile_to_classes[name] = classes & set(base_ids)
+
+        # ── 每类随机选 K 个 tile | Randomly select K tiles per class ──
+        selected: set[str] = set()
+        for cls_id in base_ids:
+            candidates = [name for name, classes in tile_to_classes.items()
+                         if cls_id in classes]
+            if not candidates:
+                continue
+            n_pick = min(k, len(candidates))
+            picked = rng.sample(candidates, n_pick)
+            selected.update(picked)
+
+        print(f"[SupervisedSegDataset] K-shot (k={k}, seed={seed}): "
+              f"selected {len(selected)} tiles across {len(base_ids)} Base classes")
+
+        # 打印每类实际采样数 | Print actual samples per class
+        class_counts = {c: 0 for c in base_ids}
+        for name in selected:
+            for c in tile_to_classes.get(name, set()):
+                class_counts[c] = class_counts.get(c, 0) + 1
+        cls_lines = []
+        for cls_id in base_ids:
+            n_full = sum(1 for classes in tile_to_classes.values() if cls_id in classes)
+            cls_lines.append(f"  {cls_id}: {class_counts[cls_id]}/{n_full}")
+        print(f"[SupervisedSegDataset] Per-class tile coverage:\n" + "\n".join(cls_lines))
+
+        return sorted(selected)
 
     # ── 文件名处理 | Filename handling ──
 
@@ -746,6 +822,11 @@ def parse_args():
                    help="输出目录 | Output directory (default: runs/supervised_<timestamp>)")
     p.add_argument("--seed", type=int, default=42,
                    help="随机种子 | Random seed (default: 42)")
+    p.add_argument("--k-shot", type=int, default=0,
+                   help="K-shot 少样本模式: 每类最多 K 个 train tile (0=全量) | "
+                        "K-shot mode: at most K train tiles per class (0=full data)")
+    p.add_argument("--k-shot-seed", type=int, default=42,
+                   help="K-shot 采样随机种子 | K-shot sampling seed (default: 42)")
     p.add_argument("--save-every", type=int, default=0,
                    help="每 N epoch 保存一次 checkpoint (0=仅最佳) | Save ckpt every N epochs (0=best only)")
 
@@ -821,6 +902,7 @@ def main():
         train_ds = SupervisedSegDataset(
             root=args.data_root, split="train", fold=args.fold,
             novel_ids=novel_ids,
+            k_shot=args.k_shot, k_shot_seed=args.k_shot_seed,
         )
         val_ds = SupervisedSegDataset(
             root=args.data_root, split="val", fold=args.fold,
