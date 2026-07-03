@@ -314,6 +314,8 @@ def train_episode(
 
     optimizer.zero_grad()
     loss.backward()
+    # 梯度裁剪，防止 BatchNorm/多层级联导致梯度爆炸 | Gradient clipping to prevent gradient explosion
+    torch.nn.utils.clip_grad_norm_(decoder.parameters(), max_norm=1.0)
     optimizer.step()
 
     return loss.item(), {

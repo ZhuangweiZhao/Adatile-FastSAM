@@ -115,16 +115,16 @@ class AdaptiveSparseDecoder(nn.Module):
         # Compress P4 features to refined features for improving proto mask detail
         self.feat_proj = nn.Sequential(
             nn.Conv2d(in_channels, 256, kernel_size=1, bias=False),
-            nn.BatchNorm2d(256),
+            nn.InstanceNorm2d(256, affine=True),  # InstanceNorm: bs=1 安全 | bs=1 safe
             nn.ReLU(inplace=True),
         )
 
         self.feat_refine = nn.Sequential(
             nn.Conv2d(256, 128, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(128),
+            nn.InstanceNorm2d(128, affine=True),
             nn.ReLU(inplace=True),
             nn.Conv2d(128, 64, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(64),
+            nn.InstanceNorm2d(64, affine=True),
             nn.ReLU(inplace=True),
         )
 
@@ -136,7 +136,7 @@ class AdaptiveSparseDecoder(nn.Module):
         if use_fdr:
             self.fdr_gate = nn.Sequential(
                 nn.Conv2d(64 + 1, 32, kernel_size=3, padding=1, bias=False),
-                nn.BatchNorm2d(32),
+                nn.InstanceNorm2d(32, affine=True),
                 nn.ReLU(inplace=True),
                 nn.Conv2d(32, 1, kernel_size=1),
                 nn.Sigmoid(),
@@ -149,7 +149,7 @@ class AdaptiveSparseDecoder(nn.Module):
         # Map refined features to per-pixel FG logit
         self.mask_head = nn.Sequential(
             nn.Conv2d(64, 32, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(32),
+            nn.InstanceNorm2d(32, affine=True),
             nn.ReLU(inplace=True),
             nn.Conv2d(32, 1, kernel_size=1),
         )
@@ -165,9 +165,11 @@ class AdaptiveSparseDecoder(nn.Module):
                 nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.BatchNorm2d):
-                nn.init.ones_(module.weight)
-                nn.init.zeros_(module.bias)
+            elif isinstance(module, (nn.BatchNorm2d, nn.InstanceNorm2d)):
+                if module.weight is not None:
+                    nn.init.ones_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
     def forward(
         self,
