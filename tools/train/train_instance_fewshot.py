@@ -151,8 +151,14 @@ def focal_loss(pred: torch.Tensor, target: torch.Tensor, gamma: float = 2.0) -> 
     :param pred: [H, W] 预测概率 [0, 1] | Predicted probability.
     :param target: [H, W] 二值 GT | Binary GT.
     :param gamma: Focal gamma 参数 | Focal gamma parameter.
+
+    注意: eps=1e-4 而非 1e-8，避免 pred≈1 时 1/(1-pred)=1e8 梯度过大导致 NaN。
+    航拍 tile 中 FG 占比低 (<5%)，模型容易学成"全预测 BG"，此时 eps=1e-8
+    会使少数误判 FG 像素产生爆炸梯度。增大 eps 有效截断此路径。
+    Note: eps=1e-4 vs 1e-8 prevents gradient explosion (1/(1-pred)→1e8) when
+    model confidently mispredicts BG as FG on rare-class tiles.
     """
-    eps = 1e-8
+    eps = 1e-4
     pred = torch.clamp(pred, eps, 1.0 - eps)
     bce = -target * torch.log(pred) - (1 - target) * torch.log(1 - pred)
     pt = pred * target + (1 - pred) * (1 - target)
@@ -163,16 +169,22 @@ def combined_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
     alpha: float = 0.5,
+    focal_gamma: float = 5.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """
     组合损失: alpha * Focal + (1-alpha) * Dice | Combined: Focal + Dice.
+
+    注意: focal_gamma=5.0 (而非默认 2.0) 用于遥感极端类别不平衡。
+    航拍 tile 中 FG 占比常 < 5%, γ=5.0 相比 γ=2.0 能更有效地抑制易分 BG 样本的梯度。
+    Note: focal_gamma=5.0 (vs default 2.0) for extreme remote sensing class imbalance.
+    FG ratio <5% in aerial tiles, γ=5.0 better suppresses easy BG pixel gradients.
 
     :param pred: [H, W] 预测概率 | Predicted probability.
     :param target: [H, W] 二值 GT | Binary GT.
     :param alpha: Focal 权重 | Focal weight (Dice = 1-alpha).
     :return: (total_loss, {"focal": float, "dice": float})
     """
-    fl = focal_loss(pred, target)
+    fl = focal_loss(pred, target, gamma=focal_gamma)
     dl = dice_loss(pred, target)
     return alpha * fl + (1 - alpha) * dl, {"focal": fl.item(), "dice": dl.item()}
 
@@ -203,25 +215,45 @@ class EpisodeSampler:
         class_ids: list[int],
         k_shot: int = 5,
         seed: int = 42,
+        min_tiles: int = 30,
     ):
+        """
+        :param min_tiles: 每类最少 tile 数。低于此值的类会导致梯度 NaN（数据太少
+            无法学到有意义的 prototype），自动从采样中排除。
+            Minimum tiles per class. Classes below this cause gradient NaN
+            (insufficient data for meaningful prototype) — auto-excluded.
+        """
         self.dataset = dataset
         self.class_ids = class_ids
         self.k_shot = k_shot
         self.rng = random.Random(seed)
         self.episode_count = 0
 
-        # 预构建每类的 tile 列表 | Pre-build tile list per class
+        # 预构建每类的 tile 列表 + 过滤数据过少的类 | Pre-build + filter scarce classes
         self._class_tiles: dict[int, list[int]] = {}
+        self._excluded: dict[int, int] = {}  # 被排除的类及其 tile 数
+
         for cls_id in class_ids:
             tiles = dataset.class_to_tiles(cls_id)
-            if tiles:
+            if tiles and len(tiles) >= min_tiles:
                 self._class_tiles[cls_id] = tiles
+            elif tiles:
+                self._excluded[cls_id] = len(tiles)
 
         valid = len(self._class_tiles)
+        if self._excluded:
+            from adatile.utils.label_mapping import ISAID5I_CATEGORIES
+            excluded_str = ", ".join(
+                f"{ISAID5I_CATEGORIES.get(c, f'cls{c}')}({c}:{n})"
+                for c, n in self._excluded.items()
+            )
+            print(f"[EpisodeSampler] Excluded {len(self._excluded)} scarce classes "
+                  f"(<{min_tiles} tiles): {excluded_str}")
         print(f"[EpisodeSampler] {valid}/{len(class_ids)} classes have tiles "
-              f"(k_shot={k_shot})")
+              f"(k_shot={k_shot}, min_tiles={min_tiles})")
         if valid == 0:
-            raise ValueError("No classes have tiles! Check dataset mode (must be 'tile').")
+            raise ValueError("No classes have enough tiles! "
+                             f"min_tiles={min_tiles}. Check dataset mode (must be 'tile').")
 
     def sample(self) -> dict:
         """
