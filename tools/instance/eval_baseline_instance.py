@@ -90,7 +90,7 @@ def main():
 
     # ── 加载 FastSAM | Load FastSAM ──
     logger.log_info("model", "Loading FastSAM...")
-    model = FastSAM(str(_PROJECT_ROOT / "thirdLibrary" / "FastSAM" / "FastSAM-x.pt"))
+    model = FastSAM(str(_PROJECT_ROOT / "thirdLibrary" / "FastSAM" / "weights" / "FastSAM-x.pt"))
     device = torch.device(args.device)
     model.model.to(device)
 
