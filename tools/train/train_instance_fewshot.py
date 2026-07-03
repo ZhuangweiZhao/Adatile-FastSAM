@@ -374,9 +374,9 @@ def evaluate_coco(
                 continue
 
             # GT union mask (same class instances merged)
-            gt_union = torch.zeros(256, 256, dtype=torch.bool)
+            gt_union = torch.zeros(256, 256, dtype=torch.bool, device=device)
             for inst in gt_instances:
-                gt_union = torch.logical_or(gt_union, inst["mask"])
+                gt_union = torch.logical_or(gt_union, inst["mask"].to(device))
 
             # Support prototype（使用 GT mask 的 FG 区域）
             # For evaluation, construct a "perfect" support from GT
