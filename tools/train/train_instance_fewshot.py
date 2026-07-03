@@ -312,10 +312,44 @@ def train_episode(
     # ── 5. 损失 | Loss ──
     loss, loss_dict = combined_loss(pred_full, query_mask.float())
 
+    # NaN 诊断 | NaN diagnostic — 精确定位崩溃点
+    if torch.isnan(loss) or torch.isinf(loss):
+        logger = get_logger("instance_fewshot")
+        logger.log_info("nan_diag", f"NaN/Inf loss at class_id={class_id}!")
+        logger.log_info("nan_diag", f"  p4: nan={p4.isnan().any().item()}, inf={p4.isinf().any().item()}, "
+                        f"range=[{p4.min().item():.4f}, {p4.max().item():.4f}]")
+        logger.log_info("nan_diag", f"  proto_masks: nan={proto_masks.isnan().any().item()}, "
+                        f"inf={proto_masks.isinf().any().item()}, "
+                        f"range=[{proto_masks.min().item():.4f}, {proto_masks.max().item():.4f}]")
+        logger.log_info("nan_diag", f"  support_proto: nan={support_proto.isnan().any().item()}, "
+                        f"range=[{support_proto.min().item():.4f}, {support_proto.max().item():.4f}]")
+        logger.log_info("nan_diag", f"  pred_full: nan={pred_full.isnan().any().item()}, "
+                        f"inf={pred_full.isinf().any().item()}, "
+                        f"range=[{pred_full.min().item():.4f}, {pred_full.max().item():.4f}]")
+        if fdr_map is not None:
+            logger.log_info("nan_diag", f"  fdr_map: nan={fdr_map.isnan().any().item()}, "
+                            f"inf={fdr_map.isinf().any().item()}, "
+                            f"range=[{fdr_map.min().item():.4f}, {fdr_map.max().item():.4f}]")
+        logger.log_info("nan_diag", f"  query_mask: sum={query_mask.sum().item()}, "
+                        f"unique={query_mask.unique().tolist()}")
+
     optimizer.zero_grad()
     loss.backward()
-    # 梯度裁剪，防止 BatchNorm/多层级联导致梯度爆炸 | Gradient clipping to prevent gradient explosion
+    # 梯度裁剪 | Gradient clipping
     torch.nn.utils.clip_grad_norm_(decoder.parameters(), max_norm=1.0)
+
+    # 检测梯度 NaN | Detect gradient NaN — 跳过坏 episode
+    grad_nan = False
+    for name, param in decoder.named_parameters():
+        if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+            logger = get_logger("instance_fewshot")
+            logger.log_info("nan_diag", f"  GRAD NaN in {name}")
+            grad_nan = True
+    if grad_nan:
+        optimizer.zero_grad()
+        return 999.0, {"loss": 999.0, "focal": 999.0, "dice": 999.0,
+                       "pred_mean": 0.0, "class_id": class_id}
+
     optimizer.step()
 
     return loss.item(), {
