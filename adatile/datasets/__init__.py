@@ -27,3 +27,8 @@ from adatile.datasets.vaihingen_tiles import VaihingenTileDataset
 from adatile.datasets.loveda_tiles import LoveDATileDataset
 from adatile.datasets.isaid_tile_wrapper import ISAIDTileWrapper
 from adatile.datasets.p4_cache import P4Cache
+from adatile.datasets.isaid_instance import (
+    ISAIDInstanceDataset,
+    sample_k_shot_tiles,
+    instances_to_dense_mask,
+)

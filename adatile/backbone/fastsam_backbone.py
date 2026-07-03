@@ -563,12 +563,28 @@ class FastSAMBackbone(nn.Module):
             # ── 跳过 Detect/Segment head | Skip Detect/Segment head ──
             cls_name = m.__class__.__name__
             if cls_name in ("Detect", "Segment", "DetectSegment"):
+                # ── 保存 Segment head 的输入特征 | Save Segment head input features ──
+                # 这些特征有正确的通道数，用于 proto mask 提取
+                # These features have the correct channel count for proto mask extraction
+                # x = [P3, P4, P5] at the channels the Segment head expects
+                if isinstance(x, list) and len(x) >= 1:
+                    self._segment_inputs = x
                 break
             x = m(x)
             y.append(x if m.i in getattr(detection_model, 'save', []) else None)
 
-    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        """前向传播，返回多尺度特征图 | Forward pass, returns multi-scale feature maps."""
+    def forward(self, x: torch.Tensor, extract_proto: bool = False) -> dict[str, torch.Tensor]:
+        """
+        前向传播，返回多尺度特征图 | Forward pass, returns multi-scale feature maps.
+
+        :param x: 输入图像张量 [B, 3, H, W] | Input image tensor.
+        :param extract_proto: 是否提取 FastSAM proto masks [B, 32, H/4, W/4]。
+            这些 proto masks 是预训练的基函数，可通过线性组合生成实例掩码：
+            mask = sigmoid(coefficients @ proto_masks)。
+            Whether to extract FastSAM proto masks. These are pretrained basis functions
+            that generate instance masks via linear combination.
+        :return: dict with keys "p3", "p4", "p8", and optionally "proto".
+        """
         if self._hook_p4_idx is None or self._hook_p8_idx is None or self._hook_p3_idx is None:
             self._probe_strides(x)
             self._register_final_hooks()
@@ -594,6 +610,30 @@ class FastSAMBackbone(nn.Module):
             result["p4"] = f
         if "p8" in self._features:
             result["p8"] = self._features["p8"]
+
+        # ── Proto Mask 提取 | Proto Mask Extraction ──
+        # FastSAM 的 Segmentation head 包含 Proto 模块，将 P3 特征映射为 32 个基掩码。
+        # 这些 proto masks 可通过线性组合生成任意实例掩码：
+        #     instance_mask = sigmoid(coefficients @ proto_masks)
+        # FastSAM's Segmentation head contains a Proto module that maps P3 features
+        # to 32 basis masks. These can linearly combine to form any instance mask.
+        if extract_proto and hasattr(self, '_segment_inputs') and self._segment_inputs:
+            try:
+                detection_model = self.model.model
+                segment_head = detection_model.model[-1]
+
+                if hasattr(segment_head, 'proto'):
+                    # 使用 Segment head 接收的原始 P3 特征（正确的通道数）
+                    # Use the original P3 features that the Segment head receives (correct channels)
+                    # _segment_inputs[0] = P3 at Segment head's expected channels (e.g. 320)
+                    p3_seg = self._segment_inputs[0]  # [B, C_seg, H/8, W/8]
+                    proto_masks = segment_head.proto(p3_seg)  # [B, 32, H/4, W/4]
+                    result["proto"] = proto_masks
+            except Exception as e:
+                self.logger.log_warn(
+                    "backbone/proto",
+                    f"Proto extraction failed: {e}",
+                )
 
         # ── 应用 Adapter (CAT-SAM 迁移) | Apply Adapters (CAT-SAM port) ──
         if getattr(self, '_adapters', None) is not None:
