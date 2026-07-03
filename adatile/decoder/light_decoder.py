@@ -293,3 +293,118 @@ class LightDecoderP3P4(nn.Module):
         """
         logit = self.forward(features, target_size=target_size)
         return logit.argmax(dim=1)
+
+
+class LightDecoderP3(nn.Module):
+    """
+    轻量解码器 (纯 P3) | Lightweight Decoder (P3-only).
+
+    P3 特征 (stride-8, 960ch) → 渐进上采样 → 分割掩码。
+    相比 P4-only (LightDecoder)，P3 起点分辨率高 2× (stride-8 vs stride-16)，
+    仅需 3 次上采样即可到达原始分辨率 (vs P4 的 4 次)。
+
+    P3 features (stride-8, 960ch) → gradual upsampling → segmentation mask.
+    Compared to P4-only, P3 starts at 2× higher resolution (stride-8 vs stride-16),
+    needing only 3 upsampling steps (vs 4 for P4).
+
+    参数量 | Params: ~250K (比 P4-only 716K 更轻 | lighter than P4-only 716K).
+
+    用途 | Purpose:
+        单独测量 P3 特征质量，与 P4-only 分离 P3/P4 各自贡献。
+        Isolate P3 feature quality from P4, measure individual contribution.
+
+    用法 | Usage::
+        decoder = LightDecoderP3(in_channels=960, num_classes=16)
+        feats = backbone(img)  # {"p3": [B,960,H/8,W/8]}
+        logit = decoder(feats, target_size=(256, 256))
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 960,
+        num_classes: int = 16,
+    ):
+        super().__init__()
+        self.logger = get_logger("decoder.p3")
+        self.num_classes = num_classes
+
+        # ── Stage 1: stride-8, 压缩通道 | Compress channels at stride-8 ──
+        self.stage1 = nn.Sequential(
+            nn.Conv2d(in_channels, 128, kernel_size=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+        )
+
+        # ── Stage 2: stride-8 → stride-4 | H/8 → H/4 ──
+        self.stage2 = nn.Sequential(
+            nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+        )
+
+        # ── Stage 3: stride-4 → stride-2 | H/4 → H/2 ──
+        self.stage3 = nn.Sequential(
+            nn.Conv2d(64, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+        )
+
+        # ── Head (stride-2 → target) | Output projection ──
+        self.head = nn.Conv2d(32, num_classes, kernel_size=1, bias=True)
+
+        # ── 参数统计 | Parameter stats ──
+        n_total = sum(p.numel() for p in self.parameters())
+        n_trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        self.logger.log_info(
+            "light_decoder_p3/init",
+            f"LightDecoderP3: in_ch={in_channels}, num_classes={num_classes}, "
+            f"params={n_total:,} (trainable={n_trainable:,})",
+        )
+
+    def forward(
+        self,
+        features: dict[str, torch.Tensor],
+        target_size: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
+        """
+        前向传播 | Forward pass.
+
+        :param features: {"p3": [B, 960, H/8, W/8]}
+        :param target_size: (H, W) 目标尺寸。None → stride-2 的 logit。
+        :return: logit [B, num_classes, *, *] — raw logits (for CrossEntropyLoss).
+        """
+        x = features["p3"]  # [B, 960, H/8, W/8]
+
+        # Stage 1: compress at stride-8
+        x = self.stage1(x)  # [B, 64, H/8, W/8]
+
+        # Stage 2: H/8 → H/4
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = self.stage2(x)  # [B, 64, H/4, W/4]
+
+        # Stage 3: H/4 → H/2
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = self.stage3(x)  # [B, 32, H/2, W/2]
+
+        # Final upsample to target
+        if target_size is not None:
+            x = F.interpolate(x, size=target_size, mode="bilinear", align_corners=False)
+
+        logit = self.head(x)  # [B, num_classes, *, *]
+        return logit  # raw logit, NO activation
+
+    def predict(
+        self,
+        features: dict[str, torch.Tensor],
+        target_size: tuple[int, int],
+    ) -> torch.Tensor:
+        """
+        预测分割掩码 | Predict segmentation mask.
+
+        :return: [B, H, W] int64 class indices.
+        """
+        logit = self.forward(features, target_size=target_size)
+        return logit.argmax(dim=1)

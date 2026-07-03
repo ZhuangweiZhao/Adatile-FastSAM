@@ -55,7 +55,7 @@ from adatile.logging.backends import ConsoleBackend, FileBackend
 from adatile.utils.seed import set_seed, get_worker_init_fn
 from adatile.utils.env import get_env_info, save_env_info
 from adatile.backbone import FastSAMBackbone
-from adatile.decoder.light_decoder import LightDecoder, LightDecoderP3P4
+from adatile.decoder.light_decoder import LightDecoder, LightDecoderP3, LightDecoderP3P4
 from adatile.utils.label_mapping import ISAID5I_CATEGORIES, ISAID5I_FOLDS
 
 # ═══════════════════════════════════════════════════════════════════
@@ -731,6 +731,8 @@ def parse_args():
                    help="类别权重上限 (default: 10.0) | Class weight cap (default: 10.0)")
     p.add_argument("--use-p3", action="store_true",
                    help="使用 P3+P4 多尺度融合解码器 (LightDecoderP3P4) | Use P3+P4 multi-scale decoder")
+    p.add_argument("--use-p3-only", action="store_true", default=False,
+                   help="使用纯 P3 解码器 (LightDecoderP3) | Use P3-only decoder")
 
     # ── 硬件 | Hardware ──
     p.add_argument("--device", type=str,
@@ -884,7 +886,15 @@ def main():
         logger.log_info("supervised/model",
             f"Full backbone unfrozen: {n_total_bb:,} trainable params")
 
-    if args.use_p3:
+    if args.use_p3_only:
+        # 纯 P3 解码器 | P3-only decoder
+        with torch.no_grad():
+            probe = backbone(torch.randn(1, 3, 256, 256).to(device))
+            p3_ch = probe["p3"].shape[1]
+        decoder = LightDecoderP3(in_channels=p3_ch, num_classes=NUM_OUT_CH).to(device)
+        logger.log_info("supervised/model",
+            f"Using LightDecoderP3 (P3-only): p3_ch={p3_ch}")
+    elif args.use_p3:
         # P3+P4 多尺度融合解码器 | P3+P4 multi-scale fusion decoder
         with torch.no_grad():
             probe = backbone(torch.randn(1, 3, 256, 256).to(device))

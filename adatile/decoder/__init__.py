@@ -9,11 +9,12 @@ adatile.decoder — 分割掩码解码器 | Segmentation mask decoder.
 
 from adatile.decoder.linear_probe import LinearProbe
 from adatile.decoder.fusion_probe import FusionProbe
-from adatile.decoder.light_decoder import LightDecoder, LightDecoderP3P4
+from adatile.decoder.light_decoder import LightDecoder, LightDecoderP3, LightDecoderP3P4
 
 __all__ = [
     "LinearProbe",
     "FusionProbe",
     "LightDecoder",
+    "LightDecoderP3",
     "LightDecoderP3P4",
 ]
