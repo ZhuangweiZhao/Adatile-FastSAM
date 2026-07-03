@@ -1,25 +1,56 @@
-# CLAUDE.md — AdaTile-FastSAM v2
+# CLAUDE.md — AdaTile-FastSAM v3
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
 
-**AdaTile-FastSAM**: Adaptive Sparse FastSAM for Few-Shot High-Resolution Instance Segmentation.
+**AdaTile-FastSAM**: High-Resolution Few-Shot Instance Segmentation with Adaptive Sparse Computation.
 
-**Two-Paper Strategy (2026-06-21):**
-- **Paper A** (Proto Sparsity / Learned Sparse Proto Routing): Archived on `main`. Evidence chain E007→E011-U complete. ICIP/CCIG target.
-- **Paper B** (Dual Sparsity / Spatial Sparsity / AdaTile): Active on `paper-b`. Theory chain B-00→B-03 CLOSED. B-04 Decoder verified. B-05->B-09 few-shot + cross-dataset expansion in progress.
+**v3 Restructuring (2026-07-03):**
+- **Paper A + B merged → Single Paper.** All resources focused on one publication.
+- **Task unified**: High-Resolution Few-Shot Instance Segmentation (not FSS, not Sparse-only).
+- **Protocol changed**: Custom Instance Few-Shot Split (弃用 iSAID-5i FSS protocol).
+- **Module unified**: Ada-SPM + FDR → **SPM (Sparse Perception Module)**.
+- **Evaluation switched**: mIoU → **COCO AP** as primary metric.
 
-**Core innovations:**
-1. **Ada-SPM** — density-supervised sparse perception module: learns importance maps → Top-K tile selection (Paper A)
-2. **Foreground Density Router (FDR)** — 75K params, Pareto optimal spatial router: learns objectness/density, not edges or class semantics (Paper B)
-3. **Decoupled Sparse Training** — decoder always receives full features; SPM/Router trained via GT-driven losses in parallel
+**Core innovation — Adaptive Sparse Computation:**
+1. **SPM (Sparse Perception Module)** — Importance Head + Dynamic Tile Router. Unified from Ada-SPM + FDR. Predicts tile importance → Top-K selection.
+2. **Adaptive Decoder** — ProtoCoeffPredictor (support prototype → 32 mask coefficients) + P4 Feature Refinement (spatial detail compensation) + Mask Head.
+3. **Few-Shot Fine-tuning Protocol** — Base pre-training → K-shot Novel fine-tune → direct inference (not Episode-based FSS).
+
+## One-Sentence Summary
+
+> **FastSAM fails on aerial imagery (AP=0.015, 27× domain gap). We enable it via Few-Shot Fine-tuning with Adaptive Sparse Computation — competitive performance while processing only ~40% of image tiles.**
 
 ## Git Branches
 
 ```
-main      → Paper A archive (all E-series experiments)
-paper-b   → Paper B active development (B-series + C-series few-shot experiments)
+main      → Paper A archive (E-series experiments, historical reference)
+paper-b   → Active development (v3: all new experiments)
+```
+
+## Paper Narrative (v3)
+
+```
+1. Introduction
+   SA-1B fails on aerial imagery (AP=0.015, 27× domain gap)
+   → Few-shot domain adaptation + Sparse computation
+
+2. Method (3 modules)
+   2.1 SPM (Sparse Perception Module)
+       ImportanceHead → tile importance map → TileRouter → Top-K tiles
+   2.2 Adaptive Decoder
+       ProtoCoeffPredictor → 32 coeffs + P4 Refinement → Mask
+   2.3 Few-Shot Fine-tuning Protocol
+       Base pre-train → K-shot fine-tune → direct inference
+
+3. Experiments
+   3.1 Zero-Shot Baseline (AP=0.015)
+   3.2 Spatial Sparsity (60% empty, Top-40% → 96.5% FG)
+   3.3 Few-Shot Scaling (K=1/3/5/10, SSI-1=88.6%)
+   3.4 SPM Efficiency (FLOPs vs AP Pareto frontier)
+   3.5 Decoder Ablation (ProtoOnly vs +Refinement, Δ=+34.5%)
+   3.6 Cross-Dataset (NWPU, category-agnostic)
 ```
 
 ## Development Rules
@@ -60,196 +91,181 @@ All experiment scripts must call `set_seed()` from `adatile.utils.seed`. This se
 ```
 adatile/
 ├── logging/         ✅ Structured logging (Console, File/JSONL, Wandb backends)
-├── backbone/        ✅ FastSAMBackbone (hook P4/P8, eval-mode enforced, freeze control)
+├── backbone/        ✅ FastSAMBackbone (hook P3/P4/P8, Proto extraction, eval-mode enforced)
 ├── config/          ✅ ExperimentConfig + ExperimentRecorder + generate_exp_id()
-├── metrics/         ✅ compute_miou, compute_dice, FPSMeter, count_params
-├── decoder/         ✅ LightDecoder, InstanceDecoder, LinearProbe, FusionProbe
-├── datasets/
-│   ├── base.py                 ✅ BaseSegDataset
-│   ├── mass_buildings.py       ✅ MassBuildings tile dataset
-│   ├── isaid.py                ✅ iSAID COCO dataset (full-image)
-│   ├── isaid_tiles.py          ✅ FastISAIDTileDataset (pre-cut 1024x1024 tiles)
-│   ├── isaid_tile_wrapper.py   ✅ Full-image→tile wrapper (bbox overlap, LRU P4 cache)
-│   ├── p4_cache.py             ✅ P4 precompute cache (GPU/CPU/fp16/persistent/build_fast)
-│   ├── loveda_tiles.py         ✅ LoveDA land-cover tiles (7-class dense, SSI<50)
-│   ├── nwpu.py                 ✅ NWPU-VHR-10 bbox-based weak masks (10-class)
-│   └── vaihingen_tiles.py      ✅ Vaihingen tiles (6-class dense land-cover)
+├── metrics/         ✅ compute_miou, compute_dice, FPSMeter, count_params, COCOInstanceEvaluator
+├── decoder/
+│   ├── light_decoder.py         ✅ LightDecoder (716K, P4-only)
+│   ├── light_decoder_p3p4.py    ✅ LightDecoderP3P4 (274K, multi-scale)
+│   └── adaptive_decoder.py      ✅ AdaptiveDecoder + ProtoOnlyDecoder (v2: InstanceNorm2d)
 ├── sparse/
-│   └── spatial_router.py    ✅ ForegroundDensityRouter, DensityHead, EdgeHead, TinyCNNRouter
-├── losses/           ✅ FocalLoss, DiceLoss, CombinedLoss
+│   ├── spm.py                   🔄 SparsePerceptionModule (renamed from spatial_router.py)
+│   │   ├── ImportanceHead       ← DensityHead (重命名)
+│   │   └── TileRouter           ← select_tiles()
+│   └── coefficient_predictor.py ✅ ProtoCoeffPredictor (3-layer MLP, ~427K)
+├── datasets/
+│   ├── isaid_tiles.py              ✅ FastISAIDTileDataset (1024² tiles)
+│   ├── isaid_tile_wrapper.py       ✅ Full-image→tile wrapper (bbox overlap, LRU P4 cache)
+│   ├── isaid_instance_fewshot.py   🔄 ISAIDInstanceFewShotDataset (NEW, 896², COCO format)
+│   ├── p4_cache.py                 ✅ P4 precompute cache (GPU/CPU/fp16)
+│   ├── nwpu.py                     ✅ NWPU-VHR-10 bbox-based weak masks (10-class)
+│   └── loveda_tiles.py             ✅ LoveDA land-cover tiles
+├── losses/           ✅ FocalLoss (eps=1e-4, γ=5.0), DiceLoss, CombinedLoss
 └── utils/
     ├── seed.py             ✅ Unified set_seed() with cuDNN deterministic
     ├── label_mapping.py    ✅ Per-split category ID mapping for iSAID
     ├── render.py           ✅ Shared render_category_mask() (canonical def)
-    └── prototype.py        ✅ compute_fg_prototype() (canonical, 4 files→1)
+    └── prototype.py        ✅ compute_fg_prototype() (canonical)
 
 tools/
 ├── data/                            # Data preprocessing
 │   ├── prep_isaid.py                iSAID COCO -> category-id masks (Step 0)
 │   ├── prep_isaid_tiles.py          Full pipeline: render mask -> cut tiles -> metadata
-│   ├── prep_cityscapes.py           Cityscapes -> tile format
-│   └── fix_labels.py                Repair tool: fix category ID mapping in instances JSON
-├── train/                           # Training entry points
-│   ├── train_isaid_mc.py            iSAID multi-class training entry point
-│   ├── train_b04.py                 B-04 end-to-end: FDR + Decoder training
-│   └── fdr_predictor.py             FDR wrapper (frozen MV3 + DensityHead)
-├── paper_a/                         # Paper A experiments (main branch)
-│   ├── eval_e007b_proto_vs_embedding.py   Proto vs Embedding fair comparison
-│   ├── eval_e008_spm_sparsity.py          SPM sparsity validation (A/B/C)
-│   ├── eval_e009_spm_router.py            Learned vs Fixed Router
-│   ├── eval_e009d_proto_usage.py          Effective Proto count analysis
-│   ├── eval_e009_verify.py                Router verification
-│   ├── eval_e010_isaid_mc.py              iSAID multi-class Proto vs Embedding
-│   ├── eval_e011_spm_isaid.py             SPM on iSAID
-│   ├── eval_e011t_tile_ablation.py        Tile size ablation (256-2048)
-│   └── eval_e011u_proto_capacity.py       Proto count scanning (2-64)
-├── paper_b/                         # Paper B experiments (paper-b branch)
-│   ├── eval_b00_tile_size_sensitivity.py   Spatial Sparsity: 7 tile sizes
-│   ├── eval_b01_oracle_topk.py             Oracle Top-K: FG retention, SSI definition
-│   ├── eval_b01_spatial_baseline.py        Tile foreground distribution analysis
-│   ├── eval_b02_learnability.py            Learnability: MV3 predict importance (r=0.889)
-│   ├── eval_b02_5_generalization.py        Generalization: category-agnostic, cross-dataset
-│   ├── eval_b03_router_architecture.py     FDR vs Edge ablation: R0/R1/R2/R3
-│   ├── eval_b05_oracle_importance.py       Oracle tile importance: multi-metric analysis
-│   ├── eval_b05_5_tile_size.py             Tile size x importance interaction
-│   ├── eval_b06_contribution_granularity.py  Contribution imbalance vs tile granularity
-│   ├── eval_b06_decoder_diag.py            Decoder diagnostics: per-class IoU
-│   ├── eval_b07_contribution_gt.py          GT contribution analysis
-│   ├── eval_b07_fdr_data_efficiency.py      FDR sample efficiency (1%-100% data)
-│   ├── eval_b08_fastsam_fewshot.py          FastSAM-FSS: few-shot on dense land-cover (LoveDA/Vaihingen)
-│   ├── eval_b09_nwpu_fewshot.py             FastSAM-FSS on NWPU-VHR-10 (bbox weak masks)
-│   └── eval_paper_b_pipeline.py             Unified Paper B pipeline (multi-dataset)
-├── instance/                        # C-series few-shot instance segmentation
-│   ├── eval_fastsam_zero_shot.py          FastSAM zero-shot baseline (mR@50≈41.5%)
-│   ├── run_c01_sweep.py                   Hyperparameter sweep runner (max_det×conf)
-│   ├── eval_c02a_fastsam_fewshot.py       Proto Matching baseline (1-shot mIoU=0.31%, proves P4≠proto)
-│   ├── eval_c02b_decoder_fewshot.py       Proto + Refine CNN (1-shot≈0.5%, training collapse)
-│   ├── eval_c03_catsam_fewshot.py         ★ Cross-Attn + Tile (1-shot mIoU=32.7%, 118× lift; ACTIVE)
-│   ├── eval_c04_full_fewshot.py           ★ Full 15-class few-shot instance seg (Phase D; ACTIVE)
+│   └── prep_isaid_instance.py       🔄 NEW: iSAID Instance Few-Shot Split
+├── train/                           # Training entry points (v3)
+│   ├── train_base.py                🔄 NEW: Base pre-training on 10 classes
+│   ├── train_fewshot.py             🔄 NEW: Novel K-shot fine-tune
+│   └── train_supervised.py          ✅ A-Series: full supervision (archived reference)
+├── eval/                            # Evaluation (v3)
+│   ├── eval_zero_shot.py            🔄 NEW: Zero-shot COCO AP baseline
+│   └── eval_fewshot.py              🔄 NEW: Few-shot COCO AP evaluation
+├── archive/                         # v2 archived scripts (reference only)
+│   ├── train_instance_fewshot.py    D-Series training script (v3 NaN fixes preserved)
+│   ├── eval_baseline_instance.py    D-00 zero-shot baseline
+│   ├── eval_c03_catsam_fewshot.py   C-03 Cross-Attention FSS
+│   └── eval_c04_full_fewshot.py     C-04 Full 15-class FSS
+├── paper_a/                         # Paper A archive (main branch, historical)
+├── paper_b/                         # B-Series experiments (reusable in v3)
+│   ├── eval_b00_tile_size_sensitivity.py   → V3-02
+│   ├── eval_b01_oracle_topk.py             → V3-03
+│   ├── eval_b02_learnability.py            → V3-04
+│   ├── eval_b03_router_architecture.py     → SPM ablation
+│   └── ...
 ├── diag/                            # Diagnostics
-│   ├── diag_b04_tiles.py               Tile dataset: mask values, fg_ratio
-│   ├── diag_b04_overfit.py             Overfit test (20 tiles x 100 epoch)
-│   ├── diag_b04_exp12.py               Exp1 (FG>5% multi-class) + Exp2 (binary)
-│   ├── diag_class_stats.py             COCO GT stats + tile stats + anomaly detection
-│   ├── diag_check_labels.py            Quick train/val label space consistency check
-│   ├── diag_trace_labels.py            Single-instance mapping chain trace
-│   └── test_loader.py                  Dataset loader validation
+│   ├── diag_b04_overfit.py
+│   ├── diag_class_stats.py
+│   ├── diag_check_labels.py
+│   └── diag_trace_labels.py
 └── viz/                             # Visualization
-    ├── viz_paper_a_p6.py               P6 feature visualization for Paper A
-    └── viz_paper_a_router.py           Router behavior visualization for Paper A
+    ├── viz_paper_a_p6.py
+    └── viz_paper_a_router.py
 ```
 
-## Key Lessons from v1 (MUST follow)
+## Key Lessons from v1/v2 (MUST follow)
 
 1. **YOLOv8 eval mode**: `model.train()` crashes YOLOv8 detect head. Keep eval mode + `requires_grad` control.
 2. **Decoder-SPM decoupled**: Decoder always receives full features. SPM trained in parallel.
 3. **Budget loss differentiable**: `(imp > 0.5).float().mean()` has zero gradient → use `(imp.mean − target)²`.
 4. **SPM three pillars**: GT density focal + Top-K BCE + budget loss. Missing any → importance collapse.
-5. **Episodic training**: Baseline MUST also use episodic training for fair comparison.
+5. **Episodic baseline**: Baseline MUST also use episodic training for fair comparison (not applicable in v3 few-shot fine-tuning).
 6. **Dice GT broadcast**: `unsqueeze(0)` with batch>1 → `[1,B,H,W]` broadcast explosion.
+7. **Focal for remote sensing**: eps=1e-4 (not 1e-8, prevents gradient explosion), γ=5.0 (extreme FG/BG imbalance).
+8. **BatchNorm→InstanceNorm**: bs=1 training requires InstanceNorm2d(affine=True) throughout decoder.
+9. **min_tiles filter**: Exclude classes with <30 tiles from training (prevents rare-class NaN).
+10. **FDR is tile-selector, NOT pixel-gate**: Per-pixel FDR gating on already-selected tiles is harmful (-2.2% mIoU).
 
-## Paper B Architecture
-
-```
-Paper B evidence chain:
-
-B-00: Tile Size Sensitivity       -> Spatial Sparsity EXISTS. All scales -- 60% empty at 1024px.
-B-01: Oracle Top-K                 -> Upper bound: Top40% tiles -> 96.5% FG, IDG=2.41x. Defines SSI.
-B-02: Learnability                 -> Importance IS LEARNABLE: Spearman r=0.889 (MV3 backbone).
-B-02.5: Generalization             -> Category-AGNOSTIC (holdout r=0.651), cross-dataset possible.
-B-03: Router Architecture          -> FDR 75K ~= R0 1.48M (Dr=-0.038). Edge != Importance (+0.009 only).
-B-04: End-to-End Integration       -> Decoder verified (val_fg5~0.47, E13). FDR training complete.
-B-05: Oracle Importance            -> What defines "important" tiles? Multi-metric analysis.
-B-06: Contribution Granularity     -> Contribution imbalance across tile sizes + decoder diagnostics.
-B-07: FDR Data Efficiency          -> 1%-100% data scaling, FDR-SES score.
-B-08: FastSAM Few-Shot (Dense Land-Cover)  -> LoveDA/Vaihingen: FastSAM + Prototype + Decoder, K=1/3/5.
-B-09: FastSAM Few-Shot (Instance)  -> NWPU-VHR-10: bbox weak masks, K-shot prototype matching.
-C-01->C-04: Full Few-Shot Pipeline -> iSAID 15-class instance seg, CAT-SAM baseline, Phase D sweep.
-```
-
-**C-series key results (see `RESEARCH_MAP.md` for full details):**
-- **C-01 FastSAM Zero-Shot**: mR@50≈41.5% (recall upper bound), bottleneck = max_det, not conf
-- **C-02A Proto Matching**: 1-shot mIoU=0.31% — proves P4×Proto matching mechanism fails, NOT that P4 lacks info
-- **C-03 Cross-Attention + Tile**: ★ 1-shot mIoU=32.7% (118× lift over C-02A). Shot saturation: 1≈3≈5 shot. Bottleneck: small_vehicle (11%), not few-shot count
-- **C-04 Full 15-Class**: Running. Tests whether C-03's 3-class findings hold on all iSAID classes
-
-**C-03 critical insight**: Full-image resize→P4 stride=16→small objects disappear→model learns "predict all background." **Tile is not an optimization — it's a necessity for FastSAM few-shot.**
-
-**Active development files** (2026-06-24): `tools/instance/eval_c03_catsam_fewshot.py` and `tools/instance/eval_c04_full_fewshot.py` are actively being edited. New modules: `adatile/datasets/isaid_tile_wrapper.py` (full-image→tile with bbox overlap + LRU cache), `adatile/datasets/p4_cache.py` (P4 precompute), `adatile/utils/prototype.py` (canonical `compute_fg_prototype`).
-
-**Paper B Laws (from B-00):**
-1. **Spatial Sparsity**: All scales are sparse — even 2048×2048 has 49.9% empty tiles
-2. **Foreground Concentration**: Top 17-48% tiles capture 95% FG (monotonic with tile size)
-3. **Scale-Sparsity Trade-off**: Larger tile → lower sparsity, higher FG capture needed
-
-**Paper B Core Hypothesis (post B-04 Decoder):**
-FastSAM P4 carries sufficient semantic information (val_fg5≈0.47). The question is now:
-> Can FDR reduce compute (Top-K% tiles) while preserving this ~0.47 mIoU?
-
-**Key scientific value**: Per-class analysis of dynamic selection impact, especially on rare/long-tail classes (helicopter, bridge, pool). If K=40% drops overall mIoU by 1% but helicopter by 50%, this becomes a compelling analysis point about dynamic compute vs. long-tail fairness.
-
-**Spatial Sparsity Index (SSI):**
-- SSI = Oracle Top40% FG retention. Pre-experiment, zero-cost criterion.
-- SSI > 70 → Router applicable (object-centric: iSAID, DOTA, xView)
-- SSI < 50 → Router meaningless (land-cover: LoveDA, Potsdam)
-
-**Foreground Density Router (FDR) — Paper B core module:**
-```
-Image → Frozen MV3 backbone → Feature Map → DensityHead (75K) → Importance Map → Top-K tiles
-```
-- Supervised by: `fg_ratio` (foreground density per tile) — NOT edges, NOT class labels
-- Learns: objectness / instance density, category-agnostic
-- `adatile/sparse/spatial_router.py` — `ForegroundDensityRouter`, `DensityHead`, `EdgeHead` (ablation only), `TinyCNNRouter` (lower-bound)
-
-**B-04 LightDecoder (for binary/multi-class dense segmentation):**
-```
-P4 [B,1280,H/16,W/16] → Conv(1280→64) → Upsample×2 → Conv(64→64) → Upsample×2
-                      → Conv(64→32) → Upsample×2 → Conv(32→32) → Upsample → Conv(32→1)
-```
-~800K params. See `adatile/decoder/light_decoder.py`.
-
-**Critical B-04 findings (revised 2026-06-21):**
-- **Double-mapping bug (ROOT CAUSE of val≈0.001)**: `prep_isaid.py` fixed annotations to standard ISAID IDs, but `render_category_mask()` applied `ACTUAL_TO_CODE_ID` a second time, permuting val class IDs into wrong label space. Train/val used different original numbering → single hardcoded table couldn't work for both. **Fixed**: per-split `build_mapping()` via name matching. After fix: E1 val_fg5=0.345, E13=0.472 — normal training curve.
-- **FG>5% filter (real but secondary)**: FG>1% filter keeps 34% BG-dominated tiles → noise dilutes foreground signal. FG>5% → 12% meaningful tiles. True contribution: ~0.05-0.10 mIoU improvement, NOT the 0.001→0.801 jump.
-- **Focal γ=5.0 + Dice**: For extreme class imbalance in remote sensing.
-- **Rare class oversampling**: basketball/pool/helicopter ×5. Note: pre-fix class counts were corrupted by double-mapping (e.g., pool appeared as 24 tiles, actually 189 after fix). True rare classes post-fix: helicopter=14 tiles, pool=189, basketball=189.
-- **Current Decoder capability (2026-06-21)**: train=0.757, val_fg5=0.472 (E13). 716K params, frozen FastSAM P4 only, single-scale. Hard ceiling ~0.50-0.55 due to frozen backbone limitation. Per-class weak spots: bridge=0.0, helicopter=0.09, pool=0.17 — genuine data scarcity, not bugs.
-
-## Config & Tooling
-
-- **pyproject.toml** is the single source of truth for: dependencies, pytest/ruff/mypy/black config, build system.
-- **Line length**: 100 (ruff + black both configured).
-- **Python**: ≥3.10.
-- Dev install: `pip install -e ".[dev,viz]"` (includes pytest, ruff, mypy, black, wandb, matplotlib).
-- Package metadata: `readme = "CLAUDE.md"` — this file IS the package description.
-- CLI entry points (planned): `adatile-train`, `adatile-eval` (see `[project.scripts]`).
-
-## Supplementary Docs
-
-- **`RESEARCH_MAP.md`** — Comprehensive, up-to-date research map with C-series results, architecture diagrams, roadmap, and lessons learned. More detailed than this file.
-- **`docs/c04_code_explanation.md`** — Line-by-line walkthrough of the C-04 full 15-class experiment script.
-
-## Data Pipeline
+## v3 Architecture
 
 ```
-iSAID COCO JSON                    Cityscapes
-      │                                │
-prep_isaid.py (fix annotations)  prep_cityscapes.py
-      │                                │
-prep_isaid_tiles.py ───────────────────┘
-  ├── Step 1: render_category_mask() → masks_full/
-  ├── Step 2: cut 1024×1024 tiles → images/ + masks/
-  └── Step 3: metadata JSON → metadata/{split}.json
+High-Res Image (H×W, up to 4000×4000)
       │
-FastISAIDTileDataset(root_dir, split, dense_labels=bool)
-  → {"image": [3,1024,1024], "mask": [1024,1024], "image_id": str}
+      ▼
+┌─────────────────────────────────────────┐
+│  FastSAM Backbone (frozen)              │
+│  ├── P3 [H/8, W/8, 960]                 │
+│  ├── P4 [H/16, W/16, 1280]   ← decoder  │
+│  ├── P8 [H/32, W/32, 1280]   ← SPM      │
+│  └── Proto [H/4, W/4, 32]               │
+└─────────────────────────────────────────┘
+      │              │              │
+      ▼              ▼              ▼
+┌──────────┐  ┌───────────┐  ┌────────────────┐
+│   SPM    │  │   Proto   │  │  Support Set    │
+│ P8→Imp.  │  │  Masks    │  │  K-shot/class   │
+│ →Tiles   │  │ [32,H,W]  │  │  → Prototype    │
+└────┬─────┘  └─────┬─────┘  └───────┬────────┘
+     │              │                 │
+     │   K tiles    │   crop to tile  │
+     └──────┬───────┘                 │
+            ▼                         ▼
+   ┌─────────────────────────────────────┐
+   │  Adaptive Decoder                   │
+   │  ├── ProtoCoeffPredictor (427K)     │
+   │  ├── Feature Refinement (P4, 714K)  │
+   │  └── Mask Head                      │
+   └─────────────────────────────────────┘
+            │
+            ▼
+   Instance Masks + Confidence Scores
+            │
+            ▼
+   COCO AP Evaluation (AP/AP50/AP75/APS)
 ```
 
-## Label Mapping (Critical)
+## v3 Experiment Line
 
-**Mapping only happens ONCE in `prep_isaid.py`.** All downstream code uses `ann["category_id"]` directly.
+```
+Phase 1: Zero-Shot Baseline
+  V3-01: FastSAM on iSAID Instance Split → AP=0.015
 
-Shared module: `adatile/utils/label_mapping.py` — `build_mapping()`, `ISAID_CATEGORIES`, `get_category_id()`. See module docstring for details.
+Phase 2: Spatial Sparsity (reuse B-00→B-03)
+  V3-02: Tile FG distribution → 60% empty @ 1024px
+  V3-03: Oracle Top-K → SSI, Top-40% → 96.5% FG
+  V3-04: SPM learnability → Spearman r=0.889
+
+Phase 3: Few-Shot Fine-tuning
+  V3-05: Base pre-training (10 classes, full data)
+  V3-06: K-shot scaling (K=1/3/5/10) → SSI-1=88.6%
+  V3-07: Decoder ablation (ProtoOnly vs +Refinement)
+  V3-08: Per-class breakdown
+
+Phase 4: Sparse Routing Efficiency
+  V3-09: SPM tile routing @ full-image
+  V3-10: Top-K% sweep → FLOPs vs AP Pareto
+  V3-11: FPS + GPU Memory measurement
+
+Phase 5: Cross-Dataset
+  V3-12: NWPU-VHR-10 few-shot transfer
+```
+
+## Module Naming Convention (v3)
+
+```
+SPM (Sparse Perception Module)    ← was FDR + Ada-SPM
+  └── ImportanceHead              ← was DensityHead
+  └── TileRouter                  ← was select_tiles()
+
+AdaptiveDecoder                   ← was AdaptiveSparseDecoder
+  └── ProtoCoeffPredictor         (unchanged)
+  └── FeatureRefinement           ← was feat_proj + feat_refine
+  └── MaskHead                    ← was mask_head
+```
+
+## Data Protocol (v3)
+
+```
+✅ iSAID Instance Few-Shot Split (NEW, 896² tiles)
+   Format: COCO JSON (instance segmentation)
+   Split:  Base (10 classes) → pre-train
+           Novel (5 classes)  → K-shot fine-tune
+           3-Fold cross-validation
+
+❌ iSAID-5i FSS protocol (DEPRECATED for v3)
+   Kept for historical reference only.
+```
+
+## Evaluation (v3)
+
+```
+Primary:
+  COCO AP, AP50, AP75, AP_small, AP_medium, AP_large
+
+Efficiency:
+  FLOPs, FPS, GPU Memory (peak)
+
+Supplementary:
+  mIoU (semantic level), AR, per-class IoU breakdown
+```
 
 ## Known Issues & Workarounds
 
@@ -274,19 +290,13 @@ pad_w = (32 - W % 32) % 32
 
 Full-size iSAID images (4000×4000+) cause OOM on GPUs < 12GB. Use `--max-image-size 2048` or `--device cpu`.
 
-### Tile preprocessing: all masks zero
+### Focal NaN on rare classes
 
-If `prep_isaid_tiles.py --steps 2,3` skips Step 1, tile masks are all `unique=[0]`. Always run `--steps 1,2,3` or ensure `masks_full/` already exists.
-
-### Decoder FG-mIoU stuck near 0 (train=0.71, val≈0.001)
-
-**Root cause: Double category ID mapping.** `render_category_mask()` applied `ACTUAL_TO_CODE_ID` on already-mapped annotations, permuting val class IDs. Train/val used different label spaces → model correctly learned train classes but val labels were gibberish. **Fix**: per-split `build_mapping()` in `prep_isaid.py`, remove second mapping in all `render_category_mask()` calls. After fix: E1 val_fg5=0.345.
-
-**Contributing factor**: FG>1% filter kept 34% BG-dominated tiles as noise. FG>5% filter → 12% meaningful tiles. Diagnosis: `tools/diag/diag_b04_exp12.py`, `tools/diag/diag_trace_labels.py`.
-
-### Category label mismatch between train/val
-
-iSAID train and val use different original category_id numbering. `prep_isaid.py` now uses per-split name-based mapping (`adatile/utils/label_mapping.py`). Diagnosis: `tools/diag/diag_trace_labels.py`.
+Three-layer protection:
+1. `min_tiles=30` filter in EpisodeSampler (exclude <30 tile classes)
+2. `focal_loss(eps=1e-4)` — caps gradient from 1e8 to 1e4
+3. `focal_loss(gamma=5.0)` — stronger BG suppression
+4. NaN skip + `optimizer.zero_grad()` safety net
 
 ### FileBackend data loss on crash
 
@@ -298,72 +308,40 @@ Fixed: `buffer_size=1`, `flush_interval=1.0` globally in `adatile/logging/backen
 # Dev install (full toolchain)
 pip install -e ".[dev,viz]"
 
-# Tests — all
+# Tests
 pytest tests/ -v
-
-# Tests — single file
-pytest tests/test_logging.py -v
-
-# Tests — single test function
-pytest tests/test_logging.py::test_file_backend -v
-
-# Tests — with coverage
 pytest tests/ -v --cov=adatile --cov-report=term-missing
 
-# Lint
+# Lint / Format
 ruff check adatile/
-
-# Type check (optional)
-mypy adatile/ --ignore-missing-imports
-
-# Format
 black adatile/ tests/
 
-# Data preprocessing (full pipeline from scratch)
-python tools/data/prep_isaid.py                         # Step 0: fix COCO JSON annotations
-python tools/data/prep_isaid_tiles.py \                 # Steps 1-3: render masks → cut tiles → metadata
-    --src-root data/iSAID_processed \
-    --dst-root data/iSAID_tiles \
-    --steps 1,2,3 --splits train,val
+# Data preprocessing (new v3 pipeline)
+python tools/data/prep_isaid.py                         # Step 0: fix COCO JSON
+python tools/data/prep_isaid_instance.py                # 🔄 NEW: Instance Few-Shot Split
 
-# Label validation
-python tools/diag/diag_check_labels.py --tile-root data/iSAID_tiles
-python tools/diag/diag_trace_labels.py --data-root data
+# v3 Training
+python tools/train/train_base.py --epochs 50 --batch-size 8    # 🔄 NEW: Base pre-training
+python tools/train/train_fewshot.py --k-shot 5 --fold 0        # 🔄 NEW: Few-shot fine-tune
 
-# Dataset diagnostics
-python tools/diag/diag_class_stats.py --isaid-root data/iSAID_processed --tile-root data/iSAID_tiles
-python tools/diag/diag_b04_tiles.py --tile-root data/iSAID_tiles
+# v3 Evaluation
+python tools/eval/eval_zero_shot.py --split val                 # 🔄 NEW
+python tools/eval/eval_fewshot.py --checkpoint best_model.pt    # 🔄 NEW
 
-# Overfit test (verify decoder can learn)
-python tools/diag/diag_b04_overfit.py --tile-root data/iSAID_tiles
-
-# Paper B experiments
+# B-Series (reusable in v3)
 python tools/paper_b/eval_b00_tile_size_sensitivity.py
 python tools/paper_b/eval_b01_oracle_topk.py
 python tools/paper_b/eval_b02_learnability.py
-
-# B-04 end-to-end (local test)
-python tools/train/train_b04.py --decoder-epochs 10 --fdr-epochs 5 --batch-size 4
-
-# B-04 full run (cloud server, RTX 5090)
-nohup python tools/train/train_b04.py \
-    --src-root /root/autodl-tmp/iSAID_processed \
-    --tile-root /root/autodl-tmp/iSAID_tiles \
-    --decoder-epochs 50 --fdr-epochs 20 --batch-size 8 \
-    > /root/autodl-tmp/b04.log 2>&1 &
-
-# C-series few-shot experiments (current focus)
-python tools/instance/eval_c03_catsam_fewshot.py    # Cross-Attention + Tile, 3-class
-python tools/instance/eval_c04_full_fewshot.py      # Full 15-class
 ```
+
+## Supplementary Docs
+
+- **`docs/V3_RESTRUCTURE_PLAN.md`** — v3 restructuring plan (strategy, module rename, data protocol, experiment line)
+- **`docs/PROJECT_MASTER.md`** — Full project overview (all A/B/C/D series + engineering)
+- **`docs/D_series_master.md`** — D-Series complete archive (5 experiments + NaN engineering)
+- **`RESEARCH_MAP.md`** — Research map with evidence chains and architecture diagrams
+- **`docs/c04_code_explanation.md`** — Line-by-line walkthrough of C-04 full 15-class experiment
 
 ## Persistent Memory
 
-Project memory stored at `C:\Users\20871\.claude\projects\E--A-postgraduate-stude-AdaTile-FastSAM\memory\`. Key files:
-- `two-paper-strategy.md` — Paper A/B split rationale and publication targets
-- `paper-b-evidence-chain.md` — Paper B complete theory chain: B-00→B-03 finalized
-- `spatial-sparsity-index.md` — SSI definition, criterion values, dataset applicability
-- `paper-a-final.md` — Paper A archive with file index and completion status
-- `publication-strategy.md` — Journal selection, reviewer attack points, scoring
-- `paper-positioning.md` — Related work analysis, overlap, differentiation
-- Various v1 lessons (decoder-gradient, dice-broadcast, importance-collapse, etc.)
+Project memory stored at `C:\Users\20871\.claude\projects\E--A-postgraduate-stude-AdaTile-FastSAM\memory\`. Index at `MEMORY.md`.
