@@ -702,7 +702,13 @@ def parse_args():
     p.add_argument("--freeze-backbone", action="store_true", default=True,
                    help="冻结 FastSAM backbone (默认: True) | Freeze FastSAM backbone (default: True)")
     p.add_argument("--no-freeze-backbone", action="store_false", dest="freeze_backbone",
-                   help="解冻 backbone | Unfreeze backbone")
+                   help="完全解冻 backbone (所有层) | Fully unfreeze all backbone layers")
+    p.add_argument("--partial-finetune", type=int, default=0,
+                   help="部分解冻: 仅解冻 backbone 最后 N 层 (0=全部冻结, -1=全部解冻, 5-10=仅 neck) | "
+                        "Partial unfreeze: unfreeze last N layers (0=all frozen, -1=all unfrozen, 5-10=neck only)")
+    p.add_argument("--backbone-lr", type=float, default=1e-5,
+                   help="Backbone 学习率 (默认: 1e-5, 为 decoder lr 的 1/100) | "
+                        "Backbone LR (default: 1e-5, 1/100 of decoder LR)")
     p.add_argument("--load-ckpt", type=str, default=None,
                    help="从 checkpoint 恢复训练 | Resume training from checkpoint")
 
@@ -864,9 +870,22 @@ def main():
     logger.log_info("supervised/model", "Building model...")
     backbone = FastSAMBackbone(freeze_backbone=args.freeze_backbone).to(device).eval()
 
+    # ── Backbone 微调策略 | Backbone finetune strategy ──
+    if args.partial_finetune != 0:
+        # 部分解冻: 仅最后 N 层 | Partial unfreeze: last N layers only
+        n_unfrozen = backbone.unfreeze_last_n_layers(args.partial_finetune)
+        logger.log_info("supervised/model",
+            f"Partial fine-tune: unfroze last {args.partial_finetune} backbone layers "
+            f"({n_unfrozen:,} trainable params)")
+    elif not args.freeze_backbone:
+        # 完全解冻 | Full unfreeze
+        backbone.unfreeze()
+        n_total_bb = sum(p.numel() for p in backbone.parameters())
+        logger.log_info("supervised/model",
+            f"Full backbone unfrozen: {n_total_bb:,} trainable params")
+
     if args.use_p3:
         # P3+P4 多尺度融合解码器 | P3+P4 multi-scale fusion decoder
-        # 自动探测 P3/P4 通道数 | Auto-detect P3/P4 channel counts
         with torch.no_grad():
             probe = backbone(torch.randn(1, 3, 256, 256).to(device))
             p3_ch = probe["p3"].shape[1]
@@ -896,13 +915,25 @@ def main():
         logger.log_info("supervised/model", f"Resumed from epoch {start_epoch}")
 
     # ── 优化器 + 调度器 | Optimizer + Scheduler ──
-    # 收集所有可训练参数 | Collect all trainable params
-    trainable_params = list(decoder.parameters())
-    if not args.freeze_backbone:
-        trainable_params += [p for p in backbone.parameters() if p.requires_grad]
+    # 分离参数组: Decoder 用 base LR, Backbone 用 backbone LR
+    # Separate param groups: Decoder at base LR, Backbone at lower LR
+    backbone_params = [p for p in backbone.parameters() if p.requires_grad]
+    decoder_params = list(decoder.parameters())
+
+    param_groups = [
+        {"params": decoder_params, "lr": args.lr},
+    ]
+    if backbone_params:
+        param_groups.append({
+            "params": backbone_params,
+            "lr": args.backbone_lr,
+        })
+        logger.log_info("supervised/optim",
+            f"Separate LRs: decoder={args.lr}, backbone={args.backbone_lr} "
+            f"({len(backbone_params)} backbone params)")
 
     optimizer = torch.optim.AdamW(
-        trainable_params,
+        param_groups,
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
