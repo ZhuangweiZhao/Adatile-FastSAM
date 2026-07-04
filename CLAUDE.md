@@ -106,7 +106,7 @@ adatile/
 ├── datasets/
 │   ├── isaid_tiles.py              ✅ FastISAIDTileDataset (1024² tiles)
 │   ├── isaid_tile_wrapper.py       ✅ Full-image→tile wrapper (bbox overlap, LRU P4 cache)
-│   ├── isaid_instance_fewshot.py   🔄 ISAIDInstanceFewShotDataset (NEW, 896², COCO format)
+│   ├── isaid_instance_fewshot.py   ✅ ISAIDInstanceFewShotDataset (v3, 896², COCO format)
 │   ├── p4_cache.py                 ✅ P4 precompute cache (GPU/CPU/fp16)
 │   ├── nwpu.py                     ✅ NWPU-VHR-10 bbox-based weak masks (10-class)
 │   └── loveda_tiles.py             ✅ LoveDA land-cover tiles
@@ -121,13 +121,13 @@ tools/
 ├── data/                            # Data preprocessing
 │   ├── prep_isaid.py                iSAID COCO -> category-id masks (Step 0)
 │   ├── prep_isaid_tiles.py          Full pipeline: render mask -> cut tiles -> metadata
-│   └── prep_isaid_instance.py       🔄 NEW: iSAID Instance Few-Shot Split
+│   └── prep_isaid_instance.py       ✅ iSAID Instance Few-Shot Split
 ├── train/                           # Training entry points (v3)
-│   ├── train_base.py                🔄 NEW: Base pre-training on 10 classes
-│   ├── train_fewshot.py             🔄 NEW: Novel K-shot fine-tune
+│   ├── train_base.py                ✅ V3-05: Base pre-training on 10 classes
+│   ├── train_fewshot.py             ✅ V3-06: Novel K-shot fine-tune (fixed support set)
 │   └── train_supervised.py          ✅ A-Series: full supervision (archived reference)
 ├── eval/                            # Evaluation (v3)
-│   ├── eval_zero_shot.py            🔄 NEW: Zero-shot COCO AP baseline
+│   ├── eval_zero_shot.py            ✅ V3-01: Zero-shot COCO AP baseline (AP=0.0182)
 │   └── eval_fewshot.py              🔄 NEW: Few-shot COCO AP evaluation
 ├── archive/                         # v2 archived scripts (reference only)
 │   ├── train_instance_fewshot.py    D-Series training script (v3 NaN fixes preserved)

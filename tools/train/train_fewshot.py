@@ -1,533 +1,706 @@
 #!/usr/bin/env python3
 """
-Few-Shot Training Entry Point (glue code) | 少样本训练入口（胶水层）.
-=====================================================
+V3-06: Novel 类 K-Shot 微调 | Novel Class K-Shot Fine-Tuning.
+==============================================================
 
-复用 eval_c04 的 train_episode/train_and_evaluate/evaluate_full 核心循环。
-只需替换 Dataset 为 FewShotEpisodeDataset, 其余不变。
+v3 协议 Phase 3 Step 2: 在 Novel 5 类上 K-shot 微调预训练的 Decoder。
+v3 Protocol Phase 3 Step 2: K-shot fine-tune pre-trained Decoder on Novel 5 classes.
+
+训练策略 | Training Strategy:
+    加载 Base 预训练 Decoder → 每个 Novel 类选 K 张 support tiles
+    → 微调 Decoder (降低 lr) → COCO AP 评估
+    Load Base pre-trained Decoder → select K support tiles per Novel class
+    → Fine-tune Decoder (reduced lr) → COCO AP evaluation
+
+核心设计 | Core Design:
+    - Support tiles 固定 (sample_k_shot, 非随机采样), 模拟真实 few-shot 场景
+    - Support tiles fixed (not random per step), simulating real few-shot scenario
+    - 可选: 冻结部分 Decoder (coeff_predictor 冻结, 仅微调 refinement)
+    - COCO AP 为主要评估指标 (非 mIoU)
+
+K-Shot 缩放 | K-Shot Scaling:
+    K=1/3/5/10 → AP vs K 曲线 → SSI-1=88.6% 饱和点
+
+与 v2 train_fewshot.py 的区别 | Differences from v2:
+    - v2: Episode-based FSS meta-learning (iSAID-5i, 256²)
+    - v3: Base→Novel fine-tune, fixed support set (896², COCO format)
+    - v3: 加载 Base 预训练权重, 不是从头训练
+    - v3: COCO AP 为主指标, 不是 mIoU
 
 用法 | Usage::
-    python tools/train/train_fewshot.py \
-        --src-root data/iSAID_processed \
-        --fold 0 --shot 1 --epochs 40 \
-        --decoder film --feature-level p3p4 \
-        --use-dynamic-proto --num-prototypes 4
+
+    # K=5 微调 (标准)
+    python tools/train/train_fewshot.py --fold 0 --k-shot 5 \
+        --checkpoint runs/v3_05_base_pretrain_F0_Adaptive_XXXX/best_model.pt
+
+    # K=1 微调 (极限)
+    python tools/train/train_fewshot.py --fold 0 --k-shot 1 \
+        --checkpoint runs/v3_05_base_pretrain_F0_Adaptive_XXXX/best_model.pt \
+        --epochs 30 --lr 5e-6
+
+    # Overfit 测试 (验证 pipeline)
+    python tools/train/train_fewshot.py --fold 0 --k-shot 10 --epochs 10 \
+        --overfit --classes 1
 """
 
-import sys, argparse, json
+from __future__ import annotations
+
+import sys, argparse, json, random
 from pathlib import Path
+from collections import defaultdict
 from datetime import datetime
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_PROJECT_ROOT))
+sys.path.insert(0, str(_PROJECT_ROOT / "thirdLibrary" / "FastSAM"))
+
+import numpy as np
+from tqdm import tqdm
 
 import torch
-import numpy as np
+import torch.nn as nn
+import torch.nn.functional as F
 
 from adatile.logging import get_logger
 from adatile.logging.backends import ConsoleBackend, FileBackend
 from adatile.utils.seed import set_seed
-from adatile.utils.env import get_env_info
 from adatile.backbone import FastSAMBackbone
-from adatile.utils.label_mapping import ISAID_CATEGORIES, ISAID5I_CATEGORIES, ISAID5I_FOLDS
-from adatile.datasets.isaid_tile_wrapper import ISAIDTileWrapper
-from adatile.datasets.fewshot_dataset import FewShotEpisodeDataset
-from adatile.datasets.fewshot_split import get_novel_classes
-from adatile.datasets.isaid5i import ISAID5iDataset
-
-# ── 复用 C-04 核心训练循环 | Reuse C-04 core training loop ──
-from tools.instance.eval_c04_full_fewshot import (
-    build_decoder, train_and_evaluate, evaluate_full,
+from adatile.sparse import SparsePerceptionModule
+from adatile.decoder.adaptive_sparse_decoder import AdaptiveSparseDecoder, ProtoOnlyDecoder
+from adatile.datasets.isaid_instance_fewshot import (
+    ISAIDInstanceFewShotDataset,
+    sample_k_shot,
+    ISAID_CATEGORIES as ISAID_CAT_NAMES,
 )
-from tools.instance.eval_c02a_fastsam_fewshot import ISAIDInstanceDataset
 
+
+# ═══════════════════════════════════════════════════════════════════
+# 常量 | Constants
+# ═══════════════════════════════════════════════════════════════════
+
+DEFAULT_DATA_ROOT = "data/iSAID_instance_fewshot"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 损失函数 | Loss Functions
+# ═══════════════════════════════════════════════════════════════════
+
+def focal_loss(pred, target, gamma=5.0, eps=1e-4):
+    """Focal Loss (binary) — γ=5.0 for remote sensing extreme FG/BG imbalance."""
+    pred = torch.clamp(pred, eps, 1.0 - eps)
+    bce = -target * torch.log(pred) - (1 - target) * torch.log(1 - pred)
+    pt = pred * target + (1 - pred) * (1 - target)
+    return ((1 - pt) ** gamma * bce).mean()
+
+
+def dice_loss(pred, target, smooth=1e-6):
+    """Dice Loss (binary)."""
+    inter = (pred * target).sum()
+    union = pred.sum() + target.sum()
+    return 1.0 - (2.0 * inter + smooth) / (union + smooth)
+
+
+def combined_loss(pred, target, alpha=0.5, focal_gamma=5.0):
+    """组合损失: alpha * Focal + (1-alpha) * Dice."""
+    fl = focal_loss(pred, target, gamma=focal_gamma)
+    dl = dice_loss(pred, target)
+    return alpha * fl + (1 - alpha) * dl, {"focal": fl.item(), "dice": dl.item()}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Support Prototype 计算 | Support Prototype Computation
+# ═══════════════════════════════════════════════════════════════════
+
+@torch.no_grad()
+def compute_support_prototype(
+    backbone: FastSAMBackbone,
+    support_images: torch.Tensor,       # [K, 3, H, W]
+    support_masks: torch.Tensor,        # [K, H, W] binary per-class
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    从 K 张 support 图像计算 FG prototype (L2-normalized).
+    Compute FG prototype from K support images (L2-normalized).
+
+    :return: [1280] prototype vector.
+    """
+    K = support_images.shape[0]
+    prototypes = []
+
+    for i in range(K):
+        img = support_images[i:i + 1].to(device)
+        mask = support_masks[i:i + 1].to(device)
+        feats = backbone(img)
+        p4 = feats["p4"]
+        mask_ds = F.interpolate(
+            mask.unsqueeze(0).float(), size=p4.shape[2:], mode="nearest"
+        ).squeeze(1)
+        fg = mask_ds > 0.5
+        if fg.sum() > 0:
+            proto = p4[:, :, fg.squeeze(0)].mean(dim=-1).squeeze(0)
+            prototypes.append(proto)
+
+    if not prototypes:
+        return torch.zeros(1280, device=device)
+    proto = torch.stack(prototypes).mean(dim=0)
+    return F.normalize(proto, dim=0)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# K-Shot Support Cache | 构建固定 Support Set
+# ═══════════════════════════════════════════════════════════════════
+
+def build_support_cache(
+    dataset: ISAIDInstanceFewShotDataset,
+    class_ids: list[int],
+    k_shot: int,
+    backbone: FastSAMBackbone,
+    device: torch.device,
+    seed: int = 42,
+) -> dict[int, torch.Tensor]:
+    """
+    为每个 Novel 类预计算 support prototype (固定 K-shot).
+    Pre-compute support prototype per Novel class (fixed K-shot).
+
+    在微调开始前调用一次，之后 prototype 不变（模拟真实 few-shot: support 固定）。
+    Called once before fine-tuning. Prototypes remain fixed (real few-shot: fixed support).
+
+    :return: {class_id: prototype_tensor [1280]}.
+    """
+    k_indices = sample_k_shot(dataset, k=k_shot, seed=seed, per_class=True)
+
+    class_to_support: dict[int, list[int]] = defaultdict(list)
+    for idx in k_indices:
+        sample = dataset[idx]
+        for inst in sample["instances"]:
+            cls_id = inst["category_id"]
+            if cls_id in class_ids and idx not in class_to_support[cls_id]:
+                class_to_support[cls_id].append(idx)
+
+    cache: dict[int, torch.Tensor] = {}
+    print(f"\n[SupportCache] Building K={k_shot} support prototypes:")
+
+    for cls_id in sorted(class_ids):
+        indices = class_to_support.get(cls_id, [])
+        if len(indices) == 0:
+            print(f"  ⚠ Class {cls_id} ({ISAID_CAT_NAMES.get(cls_id, '?')}): 0 support tiles!")
+            continue
+
+        support_imgs, support_masks = [], []
+        for idx in indices[:k_shot]:
+            sample = dataset[idx]
+            support_imgs.append(sample["image"])
+            H, W = sample["image"].shape[1:]
+            s_mask = torch.zeros(H, W, dtype=torch.float32)
+            for inst in sample["instances"]:
+                if inst["category_id"] == cls_id:
+                    s_mask = torch.logical_or(s_mask, inst["mask"]).float()
+            support_masks.append(s_mask)
+
+        support_imgs = torch.stack(support_imgs)
+        support_masks = torch.stack(support_masks)
+        proto = compute_support_prototype(backbone, support_imgs, support_masks, device)
+        cache[cls_id] = proto
+        print(f"  ✓ Class {cls_id:2d} ({ISAID_CAT_NAMES.get(cls_id, '?'):20s}): "
+              f"{len(indices[:k_shot])} support tiles → |proto|={proto.norm().item():.3f}")
+
+    print(f"  Total: {len(cache)}/{len(class_ids)} classes cached\n")
+    return cache
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 训练一步 (Few-Shot) | One Training Step (Few-Shot)
+# ═══════════════════════════════════════════════════════════════════
+
+def train_step_fewshot(
+    decoder: AdaptiveSparseDecoder | ProtoOnlyDecoder,
+    backbone: FastSAMBackbone,
+    spm: SparsePerceptionModule | None,
+    support_cache: dict[int, torch.Tensor],
+    query_img: torch.Tensor,             # [1, 3, H, W]
+    query_mask: torch.Tensor,            # [H, W] binary per-class GT
+    class_id: int,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    use_spm: bool = False,
+) -> tuple[float, dict]:
+    """
+    训练一步 (使用固定 support prototype) | Train step (fixed support prototype).
+
+    :return: (loss_value, metrics_dict).
+    """
+    decoder.train()
+
+    # ── 1. 预计算的 support prototype | Pre-computed support prototype ──
+    support_proto = support_cache[class_id].to(device)
+
+    # ── 2. Query → Backbone ──
+    feats = backbone(query_img.to(device), extract_proto=True)
+    p4 = feats["p4"]
+    proto_masks = feats.get("proto")
+    if proto_masks is None:
+        return 999.0, {"loss": 999.0, "focal": 999.0, "dice": 999.0,
+                       "pred_mean": 0.0, "class_id": class_id}
+
+    # ── 3. SPM ──
+    spm_map = None
+    if use_spm and spm is not None:
+        spm_map = spm(feats["p8"])
+
+    # ── 4. Decoder → Mask ──
+    if isinstance(decoder, ProtoOnlyDecoder):
+        pred_mask = decoder(proto_masks, support_proto)
+    else:
+        pred_mask = decoder(p4, proto_masks, support_proto, spm_map)
+    if pred_mask.dim() == 3:
+        pred_mask = pred_mask.squeeze(0)
+
+    pred_full = F.interpolate(
+        pred_mask.unsqueeze(0).unsqueeze(0),
+        size=query_mask.shape, mode="bilinear", align_corners=False,
+    ).squeeze(0).squeeze(0)
+
+    # ── 5. Loss ──
+    loss, loss_dict = combined_loss(pred_full, query_mask.float().to(device))
+
+    # ── 6. NaN 安全 | NaN Safety ──
+    if torch.isnan(loss) or torch.isinf(loss):
+        return 999.0, {"loss": 999.0, "focal": 999.0, "dice": 999.0,
+                       "pred_mean": 0.0, "class_id": class_id}
+
+    optimizer.zero_grad()
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(decoder.parameters(), max_norm=1.0)
+
+    grad_nan = False
+    for name, param in decoder.named_parameters():
+        if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+            grad_nan = True
+            break
+    if grad_nan:
+        optimizer.zero_grad()
+        return 999.0, {"loss": 999.0, "focal": 999.0, "dice": 999.0,
+                       "pred_mean": 0.0, "class_id": class_id}
+
+    optimizer.step()
+    return loss.item(), {
+        "loss": loss.item(), "focal": loss_dict["focal"], "dice": loss_dict["dice"],
+        "pred_mean": pred_full.mean().item(), "class_id": class_id,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# COCO AP 评估 | COCO AP Evaluation
+# ═══════════════════════════════════════════════════════════════════
+
+@torch.no_grad()
+def evaluate_coco_ap(
+    decoder: nn.Module,
+    backbone: FastSAMBackbone,
+    spm: SparsePerceptionModule | None,
+    support_cache: dict[int, torch.Tensor],
+    dataset: ISAIDInstanceFewShotDataset,
+    class_ids: list[int],
+    device: torch.device,
+    gt_anno_path: str,
+    use_spm: bool = False,
+    max_samples_per_class: int = 0,
+) -> dict:
+    """
+    COCO AP 评估 (v3 主指标) | COCO AP Evaluation (v3 primary metric).
+
+    对每个 Novel 类: prototype → val tiles → per-class mask
+    → connected components → per-instance masks → COCOeval.
+    For each Novel class: prototype → val tiles → mask → CC → instances → COCOeval.
+
+    :param dataset: val split dataset (mode should include Novel classes).
+    :param class_ids: Novel 类 ID | Novel class IDs.
+    :param gt_anno_path: COCO GT JSON path.
+    :param max_samples_per_class: 每类最多 tile 数 (0=全部).
+    :return: {"AP": float, "AP50": float, "AP75": float, "n_predictions": int, ...}.
+    """
+    from adatile.metrics.coco_eval import COCOInstanceEvaluator
+    import cv2
+
+    decoder.eval()
+    evaluator = COCOInstanceEvaluator(gt_anno_path, iouType="segm")
+    total_preds = 0
+
+    for cls_id in tqdm(class_ids, desc="Eval COCO AP", leave=False):
+        if cls_id not in support_cache:
+            continue
+        support_proto = support_cache[cls_id].to(device)
+        tile_indices = dataset.class_to_tiles(cls_id)
+
+        if max_samples_per_class > 0 and len(tile_indices) > max_samples_per_class:
+            tile_indices = random.Random(42).sample(tile_indices, max_samples_per_class)
+
+        for idx in tqdm(tile_indices, desc=f"  cls{cls_id}", leave=False):
+            sample = dataset[idx]
+            tile_id = sample["tile_id"]
+            H, W = sample["image"].shape[1:]
+
+            query_img = sample["image"].unsqueeze(0).to(device)
+            feats = backbone(query_img, extract_proto=True)
+            p4 = feats["p4"]
+            proto_masks = feats.get("proto")
+            if proto_masks is None:
+                continue
+
+            spm_map = None
+            if use_spm and spm is not None:
+                spm_map = spm(feats["p8"])
+
+            if isinstance(decoder, ProtoOnlyDecoder):
+                pred_prob = decoder(proto_masks, support_proto)
+            else:
+                pred_prob = decoder(p4, proto_masks, support_proto, spm_map)
+            if pred_prob.dim() == 3:
+                pred_prob = pred_prob.squeeze(0)
+
+            pred_full = F.interpolate(
+                pred_prob.unsqueeze(0).unsqueeze(0),
+                size=(H, W), mode="bilinear", align_corners=False,
+            ).squeeze(0).squeeze(0)
+
+            # 连通分量分解为 per-instance masks | Connected components → per-instance
+            pred_bin = (pred_full > 0.5).cpu().numpy().astype(np.uint8)
+            num_labels, labels = cv2.connectedComponents(pred_bin, connectivity=8)
+
+            for label_id in range(1, num_labels):
+                inst_mask = (labels == label_id)
+                area = inst_mask.sum()
+                if area < 16:
+                    continue
+                score = float(pred_full.cpu().numpy()[inst_mask].mean())
+                evaluator.add_prediction(
+                    image_id=tile_id, category_id=cls_id,
+                    mask=inst_mask, score=score,
+                )
+                total_preds += 1
+
+    if total_preds == 0:
+        return {"AP": 0.0, "AP50": 0.0, "AP75": 0.0, "n_predictions": 0}
+
+    coco_result = evaluator.evaluate()
+    coco_result["n_predictions"] = total_preds
+    return coco_result
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 参数解析 | Argument Parsing
+# ═══════════════════════════════════════════════════════════════════
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Few-Shot Training Entry Point")
-    # ── Data ──
-    p.add_argument("--dataset", type=str, default="fastsam",
-                   choices=["fastsam", "isaid5i"],
-                   help="Dataset protocol: 'fastsam' (896px tiles, custom splits) "
-                   "or 'isaid5i' (official iSAID-5i benchmark, 256px tiles, standard folds)")
-    p.add_argument("--src-root", type=str, required=True,
-                   help="fastsam: iSAID COCO JSON root | isaid5i: iSAID-5i dataset root "
-                   "(or any path when using --tile-root with custom tiles)")
-    p.add_argument("--tile-root", type=str, default=None,
-                   help="Custom pre-cut tiles root. Works with BOTH protocols: "
-                   "fastsam: loads via PreCutTileAdapter | isaid5i: uses official folds + custom tiles")
-    p.add_argument("--fold", type=int, required=True, choices=[0, 1, 2])
-    p.add_argument("--shot", type=int, default=1, help="K-shot (1/3/5)")
-    p.add_argument("--tile-size", type=int, default=896)
-    p.add_argument("--tile-stride", type=int, default=512)
-    p.add_argument("--crop-support", type=int, default=1, choices=[0, 1],
-                   help="ROI crop support images around GT mask (1=on, 0=off)")
-    # ── Model ──
-    p.add_argument("--decoder", type=str, default="film",
-                   choices=["baseline", "film", "crossattn", "contrastive",
-                            "p3p4film", "p3p4crossattn", "sparsesupport",
-                            "costvolume", "catsama"])
-    p.add_argument("--feature-level", type=str, default="p3p4",
-                   choices=["p3", "p4", "p8", "p3p4"])
-    p.add_argument("--num-prototypes", type=int, default=4)
-    p.add_argument("--freeze-encoder", action="store_true", default=True,
-                   help="Freeze FastSAM backbone (default: True)")
-    p.add_argument("--no-freeze-encoder", action="store_false", dest="freeze_encoder")
-    p.add_argument("--lora-rank", type=int, default=0,
-                   help="LoRA rank for FastSAM backbone (0=disabled, 4=light, 8=medium). "
-                   "Adds ~50K params per rank to neck layers.")
-    p.add_argument("--adapter", action="store_true", default=False,
-                   help="Enable MultiScaleAdapter (Residual 1×1→3×3→1×1) at P3/P4. "
-                   "~273K params (hidden=128). Adapts detection features → few-shot correspondence.")
-    p.add_argument("--adapter-hidden-dim", type=int, default=128,
-                   help="Bottleneck dim for ResidualAdapter (default 128, light=64, heavy=256).")
-    p.add_argument("--partial-finetune", type=int, default=0,
-                   help="Unfreeze last N backbone layers (0=frozen, -1=all, 5-10=neck only). "
-                   "For Freeze vs Partial Fine-tune comparison experiments.")
-    p.add_argument("--contrastive-weight", type=float, default=0.0,
-                   help="Weight for pixel-level SupCon contrastive loss on P3/P4 features. "
-                   "0.0=disabled, 0.1-0.5 recommended. Adds metric learning objective "
-                   "alongside mask prediction loss.")
-    # ── Training ──
-    p.add_argument("--epochs", type=int, default=60,
-                   help="训练轮数 (少量推荐60，充分推荐100)")
-    p.add_argument("--episodes-per-epoch", type=int, default=200)
-    p.add_argument("--eval-episodes", type=int, default=200)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--backbone-lr", type=float, default=1e-5,
-                   help="Learning rate for partial-finetune backbone params "
-                   "(default 1e-5, 100x smaller than decoder). "
-                   "Only used when --partial-finetune != 0.")
-    p.add_argument("--weight-decay", type=float, default=5e-4,
-                   help="权重衰减 (few-shot 推荐 5e-4，减少过拟合)")
-    p.add_argument("--warmup-epochs", type=int, default=10,
-                   help="学习率预热轮数 (长预热稳定早期训练)")
-    p.add_argument("--grad-clip", type=float, default=1.0)
-    p.add_argument("--amp", action="store_true")
-    p.add_argument("--val-episodes-per-class", type=int, default=30,
-                   help="每类验证episode数 (30→更可靠的checkpoint选择)")
-    p.add_argument("--val-batch-size", type=int, default=2,
-                   help="验证批大小 (6GB=1-2, 12GB=6, 24GB=12, 896px建议≤2)")
-    p.add_argument("--tile-cache-size", type=int, default=16)
-    p.add_argument("--ema-decay", type=float, default=0.997,
-                   help="EMA衰减率 (0.997→更快适应，适合noisy few-shot)")
-    p.add_argument("--swa-start-epoch", type=int, default=0,
-                   help="SWA起始轮 (0=auto=60%epochs)")
-    p.add_argument("--early-stop-patience", type=int, default=15,
-                   help="早停耐心 (0=禁用)")
-    p.add_argument("--use-dynamic-proto", action="store_true")
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--rur-ceiling", type=str, default="runs/tile_recall_ceiling.json")
-    # ── Output ──
-    p.add_argument("--output-dir", type=str, default=None)
+    p = argparse.ArgumentParser(
+        description="V3-06: Novel Class K-Shot Fine-Tuning"
+    )
+    # 数据 | Data
+    p.add_argument("--data-root", type=str, default=DEFAULT_DATA_ROOT)
+    p.add_argument("--fold", type=int, default=0, choices=[0, 1, 2])
+    # 模型 | Model
+    p.add_argument("--checkpoint", type=str, required=True,
+                   help="Base 预训练 checkpoint 路径 | Base pre-training checkpoint path")
+    p.add_argument("--decoder-type", type=str, default="adaptive",
+                   choices=["adaptive", "proto_only"])
+    # Few-Shot
+    p.add_argument("--k-shot", type=int, default=5,
+                   help="每类 support tile 数 | Support tiles per class")
+    p.add_argument("--classes", type=str, default="novel")
+    # 训练 | Training
+    p.add_argument("--epochs", type=int, default=20)
+    p.add_argument("--steps-per-epoch", type=int, default=200)
+    p.add_argument("--lr", type=float, default=1e-5,
+                   help="微调学习率 (比 base 低 10×) | Fine-tune LR (10× lower than base)")
+    p.add_argument("--weight-decay", type=float, default=5e-4)
+    p.add_argument("--freeze-coeff", action="store_true",
+                   help="冻结 coefficient predictor (仅微调 refinement)")
+    p.add_argument("--use-spm", action="store_true")
+    p.add_argument("--freeze-backbone", action="store_true", default=True)
+    p.add_argument("--no-freeze-backbone", dest="freeze_backbone", action="store_false")
+    # Overfit
+    p.add_argument("--overfit", action="store_true")
+    # 硬件 | Hardware
     p.add_argument("--device", type=str,
                    default="cuda" if torch.cuda.is_available() else "cpu")
+    # 输出 | Output
+    p.add_argument("--output-dir", type=str, default=None)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--eval-every", type=int, default=5)
+    p.add_argument("--eval-max-samples", type=int, default=50,
+                   help="COCO AP 评估每类最多 tile 数 (0=全部)")
+
     return p.parse_args()
 
 
-# ── 预切 Tile 快速适配器 | Pre-Cut Tile Fast Adapter ──
-# 当 --tile-root 指定时，跳过 ISAIDTileWrapper 的动态 tile grid 构建，
-# 直接从预切好的 tiles 加载，秒级初始化 (vs 动态构建的几分钟)。
-# 自动检测两种预切格式:
-#   Format A (iSAID_tiles_precut): dict metadata + labels/ + pre-built class_to_tiles
-#   Format B (iSAID_tiles): list metadata + masks/ + per-tile class_distribution
-
-class PreCutTileAdapter:
-    """
-    Lightweight adapter: pre-cut tiles → FewShotEpisodeDataset compatible API.
-    轻量适配器: 预切 tiles → FewShotEpisodeDataset 兼容接口.
-
-    提供 class_to_images / load_image / render_class_mask 三个必需方法。
-    Auto-detects metadata format (dict vs list).
-
-    Tile Cache: 内置 LRU tile 缓存，避免验证时重复磁盘 I/O。
-    Built-in LRU tile cache to avoid repeated disk I/O during validation.
-    """
-
-    # 类级别缓存容量 | Class-level cache capacity
-    _CACHE_MAX = 600  # tiles (~600 × 10MB = 6GB CPU RAM)
-
-    def __init__(self, tile_root: str, split: str):
-        import cv2
-        self._cv2 = cv2
-        self.split = split
-        self._root = Path(tile_root)
-
-        # LRU image cache: tile_idx → (image_tensor, mask_tensor)
-        self._img_cache: dict[int, torch.Tensor] = {}
-        self._mask_cache: dict[int, torch.Tensor] = {}
-        self._cache_order: list[int] = []  # 最近使用顺序 | access order (last=most recent)
-
-        # 检测格式: dict (precut) vs list (legacy) | Detect format
-        meta_path = self._root / "metadata" / f"{split}.json"
-        if not meta_path.exists():
-            # precut format: metadata.json at split level | 新格式: split 级别
-            meta_path = self._root / split / "metadata.json"
-            self._fmt = "precut"
-        else:
-            self._fmt = "legacy"
-
-        if not meta_path.exists():
-            raise FileNotFoundError(
-                f"Metadata not found at {self._root}/metadata/{split}.json "
-                f"or {self._root}/{split}/metadata.json"
-            )
-
-        with open(meta_path) as f:
-            self._meta = json.load(f)
-
-        # ── 根据格式设置路径和构建 class_to_tiles ──
-        from collections import defaultdict
-
-        if self._fmt == "precut":
-            # Format A: iSAID_tiles_precut
-            # {tile_size, stride, n_tiles, tiles: [{tile_name, classes, ...}], class_to_tiles: {str→[int]}}
-            self._img_dir = self._root / split / "images"
-            self._mask_dir = self._root / split / "labels"  # "labels" not "masks"!
-            self._tile_size = self._meta.get("tile_size", 896)
-            self._tiles = self._meta["tiles"]
-            # Pre-built class_to_tiles (string keys → convert to int)
-            self._cls_to_tiles = {
-                int(k): v for k, v in self._meta.get("class_to_tiles", {}).items()
-            }
-        else:
-            # Format B: iSAID_tiles (legacy list format)
-            # [{tile_name, img_id, class_distribution: {str→pixels}, ...}, ...]
-            self._img_dir = self._root / "images" / split
-            self._mask_dir = self._root / "masks" / split
-            self._tile_size = 1024  # legacy tiles are 1024×1024
-            self._tiles = self._meta  # list of tile dicts
-            # Build class_to_tiles from per-tile class_distribution
-            self._cls_to_tiles = defaultdict(list)
-            for i, tile_info in enumerate(self._meta):
-                for cls_str in tile_info.get("class_distribution", {}):
-                    self._cls_to_tiles[int(cls_str)].append(i)
-
-        total_tiles = len(self._tiles)
-        n_classes = len(self._cls_to_tiles)
-        print(f"[PreCutTileAdapter] {split}: {total_tiles} tiles ({self._tile_size}px), "
-              f"{n_classes} classes, fmt={self._fmt}")
-
-    def class_to_images(self, class_id: int):
-        """class_id → tile index list (兼容 ISAIDTileWrapper API)."""
-        return self._cls_to_tiles.get(class_id, [])
-
-    def load_image(self, tile_idx: int) -> torch.Tensor:
-        """加载 tile 图像 → [3, H, W] float32 (兼容 ISAIDTileWrapper API).
-        带 LRU 缓存 | With LRU cache."""
-        if tile_idx in self._img_cache:
-            self._touch_cache(tile_idx)
-            return self._img_cache[tile_idx]
-
-        tile_info = self._tiles[tile_idx]
-        if self._fmt == "precut":
-            fname = f"{tile_info['tile_name']}.png"
-        else:
-            fname = tile_info["tile_name"]
-        img = self._cv2.imread(str(self._img_dir / fname), self._cv2.IMREAD_COLOR)
-        if img is None:
-            raise ValueError(f"Corrupted image: {fname}")
-        img = self._cv2.cvtColor(img, self._cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        tensor = torch.from_numpy(img).permute(2, 0, 1).float()
-
-        self._img_cache[tile_idx] = tensor
-        self._cache_order.append(tile_idx)
-        self._evict_if_needed()
-        return tensor
-
-    def render_class_mask(self, tile_idx: int, class_id: int) -> torch.Tensor:
-        """渲染指定类别的二值掩码 → [H, W] float32 (兼容 ISAIDTileWrapper API).
-        带 LRU 缓存 | With LRU cache (caches raw label, extracts class_id each time)."""
-        # 缓存原始 label map | Cache raw label map
-        if tile_idx not in self._mask_cache:
-            tile_info = self._tiles[tile_idx]
-            if self._fmt == "precut":
-                fname = f"{tile_info['tile_name']}_label.png"
-            else:
-                fname = tile_info["tile_name"]
-            mask = self._cv2.imread(str(self._mask_dir / fname), self._cv2.IMREAD_UNCHANGED)
-            if mask is None:
-                raise ValueError(f"Corrupted mask: {fname}")
-            self._mask_cache[tile_idx] = torch.from_numpy(mask.astype(np.int64))
-            self._cache_order.append(tile_idx)
-            self._evict_if_needed()
-        else:
-            self._touch_cache(tile_idx)
-
-        return (self._mask_cache[tile_idx] == class_id).float()
-
-    def _touch_cache(self, tile_idx: int):
-        """将 tile_idx 移到访问顺序末尾 | Move tile_idx to end of access order."""
-        if tile_idx in self._cache_order:
-            self._cache_order.remove(tile_idx)
-        self._cache_order.append(tile_idx)
-
-    def _evict_if_needed(self):
-        """No-op: cache cleaned manually each validation."""
-        pass
-
-    def clear_cache(self):
-        """清空 tile 缓存（每次验证前调用）| Clear tile cache (called before each validation)."""
-        self._img_cache.clear()
-        self._mask_cache.clear()
-        self._cache_order.clear()
-
-    def __len__(self):
-        return len(self._tiles)
-
+# ═══════════════════════════════════════════════════════════════════
+# 主函数 | Main
+# ═══════════════════════════════════════════════════════════════════
 
 def main():
     args = parse_args()
     set_seed(args.seed)
     device = torch.device(args.device)
 
-    # ── Output dir ──
+    # ── 输出目录 | Output ──
     if args.output_dir is None:
-        args.output_dir = (f"runs/fewshot_f{args.fold}_k{args.shot}_"
-                          f"{datetime.now().strftime('%m%d_%H%M')}")
+        ts = datetime.now().strftime("%m%d_%H%M")
+        args.output_dir = f"runs/v3_06_fewshot_F{args.fold}_K{args.k_shot}_{ts}"
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    logger = get_logger("fewshot")
+    # ── 日志 | Logger ──
+    logger = get_logger("train_fewshot")
     logger.add_backend(ConsoleBackend())
     logger.add_backend(FileBackend(str(out_dir / "train.jsonl")))
 
-    # ── Dataset protocol selection | 数据集协议选择 ──
-    if args.dataset == "isaid5i":
-        # ═══ 标准 iSAID-5i 协议 | Standard iSAID-5i Protocol ═══
-        # 使用官方 Fold 划分 + 标准类别 ID
-        # --tile-root 可选: 指定自定义尺寸的预切 tiles (如 tile_896)
-        # 不指定时: 使用官方 256×256 ISAID5iDataset
-        from adatile.utils.label_mapping import ISAID5I_CATEGORIES, ISAID5I_FOLDS
-        CATEGORIES = ISAID5I_CATEGORIES
-        novel_ids = ISAID5I_FOLDS[args.fold]["novel"]
-        base_ids = ISAID5I_FOLDS[args.fold]["base"]
+    # ── 加载 Checkpoint | Load Checkpoint ──
+    ckpt_path = Path(args.checkpoint)
+    if not ckpt_path.exists():
+        logger.log_info("error", f"Checkpoint not found: {ckpt_path}")
+        sys.exit(1)
 
-        if args.tile_root:
-            # 自定义 tile 尺寸 + 官方 Fold | Custom tile size + official folds
-            logger.log_info("fewshot/config",
-                           f"Protocol: iSAID-5i (official folds) + custom tiles | "
-                           f"Fold {args.fold}, Shot={args.shot}")
-            logger.log_info("fewshot/config",
-                           f"Tile root: {args.tile_root}")
-            train_tiles = PreCutTileAdapter(args.tile_root, "train")
-            val_tiles = PreCutTileAdapter(args.tile_root, "val")
-            args.tile_size = getattr(train_tiles, '_tile_size', 896)
-        else:
-            # 官方 256×256 tiles | Official 256×256 tiles
-            args.tile_size = 256
-            logger.log_info("fewshot/config",
-                           f"Protocol: iSAID-5i (official) | Fold {args.fold}, Shot={args.shot}, "
-                           f"Tile={args.tile_size}px")
-            train_tiles = ISAID5iDataset(args.src_root, split="train", fold=args.fold)
-            val_tiles = ISAID5iDataset(args.src_root, split="val", fold=args.fold)
+    checkpoint = torch.load(str(ckpt_path), map_location=device, weights_only=False)
+    logger.log_info("checkpoint", f"Loaded: {ckpt_path}")
+    logger.log_info("checkpoint", f"  Epoch: {checkpoint.get('epoch', '?')}, "
+                    f"mIoU: {checkpoint.get('miou', checkpoint.get('best_miou', '?'))}")
 
-        logger.log_info("fewshot/config",
-                       f"Base classes: {[CATEGORIES[c] for c in base_ids if c in CATEGORIES]}")
-        logger.log_info("fewshot/config",
-                       f"Novel classes: {[CATEGORIES[c] for c in novel_ids if c in CATEGORIES]}")
-
+    # ── 类别配置 | Class Config ──
+    fold_path = Path(args.data_root) / "folds" / f"fold_{args.fold}.json"
+    if fold_path.exists():
+        with open(fold_path) as f:
+            fold_data = json.load(f)
+        base_ids = fold_data["base"]
+        novel_ids = fold_data["novel"]
     else:
-        # ═══ AdaTile-FastSAM 协议 (896px tiles) | AdaTile-FastSAM Protocol ═══
-        # .. warning::
-        #    此路径使用 ISAID_CATEGORIES ID 体系 + ISAID_FEWSHOT_FOLDS,
-        #    Train on Novel + Test on Novel — 非标准 FSS!
-        #    仅用于内部快速验证 (debug), 论文正式实验请用 --dataset isaid5i.
-        CATEGORIES = ISAID_CATEGORIES
-        novel_ids = get_novel_classes(args.fold)
-        logger.log_warn("fewshot/config",
-                       "⚠ 非标准 FSS 协议: Train-on-Novel + Test-on-Novel. "
-                       "论文正式实验请使用 --dataset isaid5i.")
-        logger.log_info("fewshot/config",
-                       f"Protocol: AdaTile-FastSAM | Fold {args.fold}, Shot={args.shot}")
+        from adatile.datasets.isaid_instance_fewshot import DEFAULT_FOLDS
+        fd = DEFAULT_FOLDS[args.fold]
+        base_ids = fd["base"]
+        novel_ids = fd["novel"]
 
-        if args.tile_root:
-            # 快速路径: 预切 tiles → 秒级初始化 | Fast path: pre-cut tiles
-            logger.log_info("fewshot/data",
-                           f"Using pre-cut tiles: {args.tile_root}")
-            train_tiles = PreCutTileAdapter(args.tile_root, "train")
-            val_tiles = PreCutTileAdapter(args.tile_root, "val")
-            args.tile_size = getattr(train_tiles, '_tile_size', 896)
-        else:
-            # 原始路径: 全图 → 动态 tile grid (慢) | Original: full-image → dynamic
-            logger.log_info("fewshot/data",
-                           f"Using dynamic tile wrapper (tile={args.tile_size}, "
-                           f"stride={args.tile_stride})")
-            train_ds = ISAIDInstanceDataset(args.src_root, split="train")
-            val_ds = ISAIDInstanceDataset(args.src_root, split="val")
-            train_tiles = ISAIDTileWrapper(train_ds, tile_size=args.tile_size,
-                                            stride=args.tile_stride)
-            val_tiles = ISAIDTileWrapper(val_ds, tile_size=args.tile_size,
-                                          stride=args.tile_stride)
-
-    novel_classes = {cid: CATEGORIES[cid] for cid in novel_ids if cid in CATEGORIES}
-    logger.log_info("fewshot/config",
-                   f"Novel classes: {list(novel_classes.values())}")
-
-    # ── Episode Datasets ──
-    if args.dataset == "isaid5i":
-        # iSAID-5i 协议: train_ds 仅含 Base 类 tiles
-        # Meta-training: Base 类 episodes (学会 "如何从 Support 学习")
-        # Meta-testing:  Novel 类 episodes (评估泛化)
-        base_classes = {cid: CATEGORIES[cid] for cid in base_ids if cid in CATEGORIES}
-        logger.log_info("fewshot/config",
-                       f"Meta-training on Base classes: {list(base_classes.values())}")
-
-        train_ep = FewShotEpisodeDataset(
-            train_tiles, fold=args.fold, shot=args.shot, split="train",
-            episodes_per_epoch=args.episodes_per_epoch, seed=args.seed,
-            crop_support=bool(args.crop_support),
-            novel_classes=base_ids,  # ← 训练时采样 Base 类
-            category_names=CATEGORIES,
-        )
-        val_ep = FewShotEpisodeDataset(
-            val_tiles, fold=args.fold, shot=args.shot, split="val",
-            episodes_per_epoch=args.eval_episodes, seed=args.seed + 1,
-            crop_support=False,
-            novel_classes=novel_ids,  # ← 验证时采样 Novel 类
-            category_names=CATEGORIES,
-        )
-        # 训练目标: Base 类 | Training target: Base classes
-        train_target = base_classes
-        eval_target = novel_classes
+    if args.classes == "novel":
+        train_class_ids = novel_ids
     else:
-        # AdaTile-FastSAM 协议: episodic training on Novel classes
-        train_ep = FewShotEpisodeDataset(
-            train_tiles, fold=args.fold, shot=args.shot, split="train",
-            episodes_per_epoch=args.episodes_per_epoch, seed=args.seed,
-            crop_support=bool(args.crop_support),
-            novel_classes=novel_ids,
-            category_names=CATEGORIES,
-        )
-        val_ep = FewShotEpisodeDataset(
-            val_tiles, fold=args.fold, shot=args.shot, split="val",
-            episodes_per_epoch=args.eval_episodes, seed=args.seed + 1,
-            crop_support=False,
-            novel_classes=novel_ids,
-            category_names=CATEGORIES,
-        )
-        train_target = novel_classes
-        eval_target = novel_classes
+        train_class_ids = [int(c.strip()) for c in args.classes.split(",")]
 
-    logger.log_info("fewshot/data",
-                   f"Train tiles: {len(train_tiles)}, Val tiles: {len(val_tiles)}")
+    novel_names = [ISAID_CAT_NAMES.get(c, f"cls{c}") for c in train_class_ids]
+    logger.log_info("config", f"Fold {args.fold}: Fine-tuning on {len(train_class_ids)} Novel classes: {novel_names}")
+    logger.log_info("config", f"K={args.k_shot}, epochs={args.epochs}, lr={args.lr}, "
+                    f"freeze_coeff={args.freeze_coeff}, overfit={args.overfit}")
 
-    # ── Backbone ──
-    backbone = FastSAMBackbone(freeze_backbone=args.freeze_encoder).to(device).eval()
+    # ── 数据集 | Datasets ──
+    train_ds = ISAIDInstanceFewShotDataset(
+        root=args.data_root, split="train", fold=args.fold, mode="novel",
+    )
+    val_ds = ISAIDInstanceFewShotDataset(
+        root=args.data_root, split="val", fold=args.fold, mode="novel",
+    )
+    logger.log_info("data", f"Train (novel): {train_ds.tile_count} tiles, "
+                    f"Val (novel): {val_ds.tile_count} tiles")
 
-    # ── Partial Fine-tune | 部分解冻 ──
-    if args.partial_finetune != 0:
-        n_unfrozen = backbone.unfreeze_last_n_layers(args.partial_finetune)
-        logger.log_info("fewshot/model",
-                       f"Partial fine-tune: unfroze last {args.partial_finetune} layers "
-                       f"({n_unfrozen:,} trainable params)")
-        if args.partial_finetune > 0:
-            # 部分解冻时需要 backbone 参与训练但保持 eval mode
-            # Partial unfreeze: backbone participates in training but stays in eval mode
-            backbone._freeze_backbone = False
+    # ── 模型 | Models ──
+    backbone = FastSAMBackbone(freeze_backbone=args.freeze_backbone).to(device)
+    backbone.eval()
 
-    # ── Feature Adapter | 特征适配器 ──
-    if args.adapter:
-        from adatile.backbone.feature_adapter import MultiScaleAdapter
-        adapter = MultiScaleAdapter(
-            feat_dim_p3=feat_dim_p3 if args.feature_level == "p3p4" else 960,
-            feat_dim_p4=feat_dim_p4 if args.feature_level == "p3p4" else 1280,
-            hidden_dim=args.adapter_hidden_dim,
+    if args.decoder_type == "proto_only":
+        decoder = ProtoOnlyDecoder(proto_dim=32, feat_dim=1280).to(device)
+    else:
+        decoder = AdaptiveSparseDecoder(
+            in_channels=1280, proto_dim=32, use_fdr=args.use_spm,
         ).to(device)
-        backbone.set_adapters(adapter)
-        logger.log_info("fewshot/model",
-                       f"MultiScaleAdapter enabled: hidden={args.adapter_hidden_dim}, "
-                       f"+{adapter.num_params:,} trainable params")
 
-    # ── LoRA | 低秩适配 ──
-    if args.lora_rank > 0:
-        n_lora = backbone.apply_lora(rank=args.lora_rank)
-        logger.log_info("fewshot/model",
-                       f"FastSAM backbone (frozen={args.freeze_encoder}, "
-                       f"LoRA rank={args.lora_rank}, +{n_lora:,} params) on {device}")
-    elif not args.adapter:
-        # 无 adapter 无 LoRA: 记录 standard backbone
-        logger.log_info("fewshot/model",
-                       f"FastSAM backbone (frozen={args.freeze_encoder}) on {device}")
+    # 加载预训练权重 | Load pre-trained weights
+    decoder_state = checkpoint.get("decoder_state_dict", checkpoint.get("model_state_dict", {}))
+    if decoder_state:
+        missing, unexpected = decoder.load_state_dict(decoder_state, strict=False)
+        if missing:
+            logger.log_info("checkpoint", f"  Missing keys ({len(missing)}): {missing[:5]}...")
+        if unexpected:
+            logger.log_info("checkpoint", f"  Unexpected keys ({len(unexpected)}): {unexpected[:5]}...")
+        logger.log_info("checkpoint", "Decoder weights loaded ✓")
+    else:
+        logger.log_info("error", "No decoder_state_dict found in checkpoint!")
+        sys.exit(1)
 
-    # ── Feature dims ──
-    with torch.no_grad():
-        probe = backbone(torch.randn(1, 3, 896, 896).to(device))
-        if args.feature_level == "p3p4":
-            feat_dim_p3 = probe["p3"].shape[1]
-            feat_dim_p4 = probe["p4"].shape[1]
-            feat_dim = feat_dim_p3
-        else:
-            feat_dim = probe[args.feature_level].shape[1]
+    # ── 可选: 冻结 Coefficient Predictor | Optional: Freeze Coeff ──
+    if args.freeze_coeff and hasattr(decoder, 'coeff_predictor'):
+        for p in decoder.coeff_predictor.parameters():
+            p.requires_grad = False
+        n_trainable = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
+        logger.log_info("model", f"Coefficient predictor frozen → {n_trainable:,} trainable params")
+    else:
+        n_trainable = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
+        logger.log_info("model", f"All decoder params trainable: {n_trainable:,}")
 
-    # ── Decoder ──
-    decoder_type = args.decoder
-    if args.feature_level == "p3p4" and args.decoder == "film":
-        decoder_type = "p3p4film"
-    elif args.feature_level == "p3p4" and args.decoder == "crossattn":
-        decoder_type = "p3p4crossattn"
-    elif args.decoder == "sparsesupport":
-        # sparsesupport requires p3p4 features, force it
-        args.feature_level = "p3p4"
-    elif args.decoder == "costvolume":
-        # costvolume requires p3p4 features, force it
-        args.feature_level = "p3p4"
-    elif args.decoder == "catsama":
-        # catsama requires p3p4 features, force it
-        args.feature_level = "p3p4"
-    decoder_kwargs = {"feat_dim": feat_dim, "num_prototypes": args.num_prototypes}
-    if args.feature_level == "p3p4":
-        decoder_kwargs["feat_dim_p3"] = feat_dim_p3
-        decoder_kwargs["feat_dim_p4"] = feat_dim_p4
-    decoder = build_decoder(decoder_type, **decoder_kwargs).to(device)
-    n_params = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
-    logger.log_info("fewshot/model", f"Decoder: {n_params:,} trainable params")
+    spm = None
+    if args.use_spm:
+        spm = SparsePerceptionModule(in_channels=1280).to(device)
+        spm.eval()
 
-    # ── Train (reuse C-04 core loop) ──
-    decoder, result, best_val = train_and_evaluate(
-        decoder, backbone, train_ep, val_ep, device,
-        args.shot, train_target, args, logger, out_dir,
-        decoder_type=decoder_type, feature_level=args.feature_level,
+    # ── 构建 Support Cache | Build Support Cache ──
+    support_cache = build_support_cache(
+        train_ds, train_class_ids, args.k_shot, backbone, device, seed=args.seed,
     )
 
-    # ── Final eval on Novel classes ──
-    if args.dataset == "isaid5i":
-        logger.log_info("fewshot/eval", "Final evaluation on Novel classes (iSAID-5i protocol)...")
-        # iSAID-5i: train_ds 不含 Novel 类，评估时 support 和 query 都从 val_ds
-        # evaluate_full 内部会从 val_ds 采样 support+query (train_ds 用于获取 class_to_images)
-        final_result = evaluate_full(
-            decoder, backbone, val_ep, val_ep, device,
-            args.shot, args.eval_episodes, eval_target,
-            logger, "fewshot/final", feature_level=args.feature_level,
-        )
-    else:
-        logger.log_info("fewshot/eval", "Final evaluation on Novel classes...")
-        final_result = evaluate_full(
-            decoder, backbone, train_ep, val_ep, device,
-            args.shot, args.eval_episodes, eval_target,
-            logger, "fewshot/final", feature_level=args.feature_level,
-        )
+    # ── 优化器 | Optimizer ──
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, decoder.parameters()),
+        lr=args.lr, weight_decay=args.weight_decay,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs * args.steps_per_epoch,
+    )
 
-    # ── Save results ──
-    summary = {
-        "experiment": "Few-Shot Instance Segmentation on iSAID",
-        "fold": args.fold, "shot": args.shot,
-        "novel_classes": {str(k): v for k, v in novel_classes.items()},
+    # ── Overfit 模式 | Overfit Mode ──
+    overfit_sample = None
+    if args.overfit:
+        for cls_id in train_class_ids:
+            tiles = train_ds.class_to_tiles(cls_id)
+            if tiles:
+                overfit_sample = train_ds[tiles[0]]
+                break
+        if overfit_sample and overfit_sample["instances"]:
+            oc = overfit_sample["instances"][0]["category_id"]
+            logger.log_info("overfit", f"Fixed query tile (class={oc}, "
+                            f"{len(overfit_sample['instances'])} instances)")
+
+    # ── 训练循环 | Training Loop ──
+    logger.log_info("train", f"{'='*60}")
+    logger.log_info("train", f"Starting K={args.k_shot} Few-Shot Fine-Tuning")
+    logger.log_info("train", f"{'='*60}")
+
+    best_ap = 0.0
+    global_step = 0
+    nan_skip_count = 0
+
+    for epoch in range(1, args.epochs + 1):
+        epoch_losses, epoch_dice_vals = [], []
+
+        pbar = tqdm(range(args.steps_per_epoch), desc=f"Epoch {epoch:3d}/{args.epochs}", unit="step")
+        for _ in pbar:
+            cls_id = random.choice(train_class_ids)
+            if cls_id not in support_cache:
+                continue
+
+            if overfit_sample is not None:
+                q_sample = overfit_sample
+                if not any(i["category_id"] == cls_id for i in q_sample["instances"]):
+                    continue
+            else:
+                tile_indices = train_ds.class_to_tiles(cls_id)
+                if not tile_indices:
+                    continue
+                q_sample = train_ds[random.choice(tile_indices)]
+
+            query_img = q_sample["image"].unsqueeze(0)
+            H, W = q_sample["image"].shape[1:]
+            q_mask = torch.zeros(H, W, dtype=torch.float32)
+            for inst in q_sample["instances"]:
+                if inst["category_id"] == cls_id:
+                    q_mask = torch.logical_or(q_mask, inst["mask"]).float()
+
+            if q_mask.sum() == 0:
+                continue
+
+            loss_val, metrics = train_step_fewshot(
+                decoder, backbone, spm, support_cache,
+                query_img, q_mask, cls_id,
+                optimizer, device, use_spm=args.use_spm,
+            )
+
+            if loss_val >= 999.0:
+                nan_skip_count += 1
+                continue
+
+            scheduler.step()
+            global_step += 1
+            epoch_losses.append(loss_val)
+            epoch_dice_vals.append(metrics["dice"])
+
+            if epoch_losses:
+                pbar.set_postfix({
+                    "loss": f"{np.mean(epoch_losses[-50:]):.4f}",
+                    "dice": f"{np.mean(epoch_dice_vals[-50:]):.4f}",
+                })
+
+        # ── Epoch 汇总 | Epoch Summary ──
+        avg_loss = np.mean(epoch_losses) if epoch_losses else 0.0
+        avg_dice = np.mean(epoch_dice_vals) if epoch_dice_vals else 0.0
+        logger.log_info("epoch",
+            f"Epoch {epoch:3d}/{args.epochs} | loss={avg_loss:.4f} dice={avg_dice:.4f} | "
+            f"lr={scheduler.get_last_lr()[0]:.2e} | NaN={nan_skip_count}")
+        logger.log_metric("loss", avg_loss, step=epoch, tags=["fewshot_train"])
+        logger.log_metric("dice", avg_dice, step=epoch, tags=["fewshot_train"])
+
+        # ── COCO AP 评估 | COCO AP Evaluation ──
+        if epoch % args.eval_every == 0 or epoch == args.epochs:
+            logger.log_info("eval", f"--- COCO AP Evaluation @ Epoch {epoch} ---")
+            gt_path = Path(args.data_root) / "annotations" / "instances_val.json"
+            if gt_path.exists():
+                eval_result = evaluate_coco_ap(
+                    decoder, backbone, spm, support_cache,
+                    val_ds, train_class_ids, device,
+                    gt_anno_path=str(gt_path),
+                    use_spm=args.use_spm,
+                    max_samples_per_class=args.eval_max_samples,
+                )
+                ap = eval_result.get("AP", 0.0)
+                ap50 = eval_result.get("AP50", 0.0)
+                logger.log_info("eval",
+                    f"Epoch {epoch:3d}: AP={ap:.4f} AP50={ap50:.4f} "
+                    f"n_preds={eval_result.get('n_predictions', 0)} | best_AP={best_ap:.4f}")
+                logger.log_metric("AP", ap, step=epoch, tags=["fewshot_eval"])
+                logger.log_metric("AP50", ap50, step=epoch, tags=["fewshot_eval"])
+
+                if ap > best_ap:
+                    best_ap = ap
+                    torch.save({
+                        "epoch": epoch, "global_step": global_step,
+                        "decoder_state_dict": {k: v.clone() for k, v in decoder.state_dict().items()},
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "support_cache": {k: v.clone() for k, v in support_cache.items()},
+                        "AP": ap, "AP50": ap50,
+                        "k_shot": args.k_shot, "novel_ids": train_class_ids,
+                        "args": vars(args),
+                    }, str(out_dir / "best_model.pt"))
+                    logger.log_info("eval", f"  ✓ New best: AP={best_ap:.4f}")
+            else:
+                logger.log_info("eval", f"  ⚠ GT not found: {gt_path}")
+
+    # ── 最终保存 | Final Save ──
+    torch.save({
+        "epoch": args.epochs, "global_step": global_step,
+        "decoder_state_dict": {k: v.clone() for k, v in decoder.state_dict().items()},
+        "support_cache": {k: v.clone() for k, v in support_cache.items()},
+        "best_ap": best_ap, "k_shot": args.k_shot,
+        "novel_ids": train_class_ids, "args": vars(args),
+    }, str(out_dir / "last_model.pt"))
+
+    results = {
+        "experiment": "V3-06 Few-Shot Fine-Tuning",
+        "fold": args.fold, "k_shot": args.k_shot,
+        "decoder_type": args.decoder_type,
+        "freeze_coeff": args.freeze_coeff,
+        "epochs": args.epochs,
+        "best_AP": round(best_ap, 6),
+        "nan_skip_count": nan_skip_count,
+        "novel_classes": {c: ISAID_CAT_NAMES.get(c, str(c)) for c in train_class_ids},
+        "base_checkpoint": str(ckpt_path),
         "timestamp": datetime.now().isoformat(),
-        "environment": get_env_info(),
-        "results": {
-            "novel": {
-                "miou_mean": final_result["miou_mean"],
-                "miou_std": final_result["miou_std"],
-                "per_class_iou": final_result["per_class_iou"],
-            },
-            "best_val_miou": best_val,
-        },
     }
     with open(out_dir / "results.json", "w") as f:
-        json.dump(summary, f, indent=2)
-    logger.log_info("fewshot/done",
-                   f"Novel mIoU={final_result['miou_mean']*100:.2f}%  "
-                   f"Saved → {out_dir}/results.json")
+        json.dump(results, f, indent=2, ensure_ascii=False)
+
+    print(f"\n{'='*60}")
+    print(f"  V3-06 K-Shot Fine-Tuning — Complete")
+    print(f"  Fold: {args.fold}, K={args.k_shot}, Decoder: {args.decoder_type}")
+    print(f"  Best AP: {best_ap:.4f}")
+    print(f"  NaN skips: {nan_skip_count}")
+    print(f"  Output: {out_dir}")
+    print(f"{'='*60}")
+
+    logger.log_info("done", f"Output: {out_dir}")
+    logger.log_info("done", f"Best AP: {best_ap:.4f}")
 
 
 if __name__ == "__main__":
