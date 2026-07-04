@@ -405,89 +405,146 @@ class BaseClassSampler:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 评估 | Evaluation
+# Support Cache 构建 | Build Fixed Support Cache
+# ═══════════════════════════════════════════════════════════════════
+
+def build_support_cache(
+    dataset: ISAIDInstanceFewShotDataset,
+    class_ids: list[int],
+    k_shot: int,
+    backbone: FastSAMBackbone,
+    device: torch.device,
+    seed: int = 42,
+) -> dict[int, torch.Tensor]:
+    """
+    为每个类预计算固定 support prototype | Pre-compute fixed support prototype per class.
+
+    模拟真实 few-shot: support 固定不变，评测泛化能力。
+    Simulates real few-shot: support fixed, measures generalization.
+
+    :param dataset: train split dataset.
+    :param class_ids: 类 ID 列表 | Class ID list.
+    :param k_shot: 每类 support tile 数 | Support tiles per class.
+    :param backbone: FastSAM backbone.
+    :param device: 设备 | Device.
+    :param seed: 随机种子 | Random seed.
+    :return: {class_id: prototype [1280]}.
+    """
+    k_indices = sample_k_shot(dataset, k=k_shot, seed=seed, per_class=True)
+
+    class_to_support: dict[int, list[int]] = defaultdict(list)
+    for idx in k_indices:
+        sample = dataset[idx]
+        for inst in sample["instances"]:
+            cls_id = inst["category_id"]
+            if cls_id in class_ids and idx not in class_to_support[cls_id]:
+                class_to_support[cls_id].append(idx)
+
+    cache: dict[int, torch.Tensor] = {}
+    print(f"\n[SupportCache] Building K={k_shot} prototypes for {len(class_ids)} classes:")
+
+    for cls_id in sorted(class_ids):
+        indices = class_to_support.get(cls_id, [])
+        if len(indices) == 0:
+            print(f"  ⚠ Class {cls_id} ({ISAID_CAT_NAMES.get(cls_id, '?')}): 0 support tiles!")
+            continue
+
+        support_imgs, support_masks = [], []
+        for idx in indices[:k_shot]:
+            sample = dataset[idx]
+            support_imgs.append(sample["image"])
+            H, W = sample["image"].shape[1:]
+            s_mask = torch.zeros(H, W, dtype=torch.float32)
+            for inst in sample["instances"]:
+                if inst["category_id"] == cls_id:
+                    s_mask = torch.logical_or(s_mask, inst["mask"]).float()
+            support_masks.append(s_mask)
+
+        support_imgs = torch.stack(support_imgs)
+        support_masks = torch.stack(support_masks)
+        proto = compute_support_prototype(backbone, support_imgs, support_masks, device)
+        cache[cls_id] = proto
+        print(f"  ✓ Class {cls_id:2d} ({ISAID_CAT_NAMES.get(cls_id, '?'):20s}): "
+              f"{len(indices[:k_shot])} tiles → |p|={proto.norm().item():.3f}")
+
+    print(f"  Total: {len(cache)}/{len(class_ids)} cached\n")
+    return cache
+
+
+# ═══════════════════════════════════════════════════════════════════
+# COCO AP 评估 (v3 主指标) | COCO AP Evaluation (v3 Primary Metric)
 # ═══════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def evaluate(
+def evaluate_coco_ap(
     decoder: nn.Module,
     backbone: FastSAMBackbone,
     spm: SparsePerceptionModule | None,
+    support_cache: dict[int, torch.Tensor],
     dataset: ISAIDInstanceFewShotDataset,
     class_ids: list[int],
     device: torch.device,
+    gt_anno_path: str,
     use_spm: bool = False,
-    max_samples_per_class: int = 20,
+    max_samples_per_class: int = 0,
+    conf_threshold: float = 0.5,
 ) -> dict:
     """
-    快速评估: per-class IoU + 可选 COCO AP | Quick eval: per-class IoU + optional COCO AP.
+    COCO AP 评估 — v3 论文主指标.
+    COCO AP Evaluation — v3 paper primary metric.
+
+    流程 | Flow:
+        Fixed support prototype → val tiles → per-class mask
+        → connected components → per-instance masks → COCOeval
+        → AP / AP50 / AP75 / APS / APM / APL / AR / per-class AP
 
     :param dataset: val split dataset.
-    :param class_ids: 要评估的类别 | Classes to evaluate.
-    :param max_samples_per_class: 每类最多评估 tile 数 | Max tiles per class (0 = all).
-    :return: {"miou": float, "per_class_iou": dict, "n_eval": int}.
+    :param class_ids: 评估的类别 | Classes to evaluate.
+    :param gt_anno_path: COCO GT JSON 路径。
+    :param max_samples_per_class: 每类最多 tile 数 (0=全部).
+    :param conf_threshold: mask 二值化阈值 | Mask binarization threshold.
+    :return: {
+        "AP": float, "AP50": float, "AP75": float,
+        "APS": float, "APM": float, "APL": float,
+        "AR1": float, "AR10": float, "AR100": float,
+        "per_class_AP": dict, "n_predictions": int,
+    }
     """
+    import cv2
+
     decoder.eval()
+    evaluator = COCOInstanceEvaluator(gt_anno_path, iouType="segm")
+    total_preds = 0
 
-    per_class_iou: dict[int, list[float]] = defaultdict(list)
-    n_eval = 0
-
-    for cls_id in tqdm(class_ids, desc="Eval", leave=False):
-        tile_indices = dataset.class_to_tiles(cls_id)
-        if not tile_indices:
+    for cls_id in tqdm(class_ids, desc="Eval COCO AP", leave=False):
+        if cls_id not in support_cache:
             continue
+        support_proto = support_cache[cls_id].to(device)
+        tile_indices = dataset.class_to_tiles(cls_id)
+
         if max_samples_per_class > 0 and len(tile_indices) > max_samples_per_class:
-            tile_indices = random.Random(42).sample(tile_indices, max_samples_per_class)
+            tile_indices = random.Random(42).sample(tile_indices, min(max_samples_per_class, len(tile_indices)))
 
-        for idx in tile_indices:
+        for idx in tqdm(tile_indices, desc=f"  cls{cls_id}", leave=False):
             sample = dataset[idx]
-            instances = sample["instances"]
-
-            # 过滤目标类实例 | Filter target class instances
-            cls_instances = [i for i in instances if i["category_id"] == cls_id]
-            if not cls_instances:
-                continue
-
-            # GT union mask (合并同类实例) | GT union mask (merge same-class instances)
+            tile_id = sample["tile_id"]
             H, W = sample["image"].shape[1:]
-            gt_union = torch.zeros(H, W, dtype=torch.bool)
-            for inst in cls_instances:
-                gt_union = torch.logical_or(gt_union, inst["mask"])
 
             query_img = sample["image"].unsqueeze(0).to(device)
-
-            # ── Backbone ──
             feats = backbone(query_img, extract_proto=True)
             p4 = feats["p4"]
             proto_masks = feats.get("proto")
-
-            # ── Support prototype (self-support: use query's own FG for eval) ──
-            mask_ds = F.interpolate(
-                gt_union.float().unsqueeze(0).unsqueeze(0),
-                size=p4.shape[2:], mode="nearest",
-            ).squeeze(1)  # [1, H/16, W/16]
-
-            fg = mask_ds > 0.5
-            if fg.sum() < 16:
+            if proto_masks is None:
                 continue
 
-            proto = p4[:, :, fg.squeeze(0)].mean(dim=-1).squeeze(0)
-            proto = F.normalize(proto, dim=0)
-
-            # ── SPM ──
             spm_map = None
             if use_spm and spm is not None:
                 spm_map = spm(feats["p8"])
 
-            # ── Decoder ──
             if isinstance(decoder, ProtoOnlyDecoder):
-                if proto_masks is None:
-                    continue
-                pred_prob = decoder(proto_masks, proto)
+                pred_prob = decoder(proto_masks, support_proto)
             else:
-                if proto_masks is None:
-                    continue
-                pred_prob = decoder(p4, proto_masks, proto, spm_map)
+                pred_prob = decoder(p4, proto_masks, support_proto, spm_map)
             if pred_prob.dim() == 3:
                 pred_prob = pred_prob.squeeze(0)
 
@@ -496,25 +553,84 @@ def evaluate(
                 size=(H, W), mode="bilinear", align_corners=False,
             ).squeeze(0).squeeze(0)
 
-            # Binary IoU
-            pred_bin = (pred_full > 0.5).float()
-            inter = (pred_bin * gt_union.float().to(device)).sum()
-            union = (pred_bin + gt_union.float().to(device)).clamp(0, 1).sum()
-            if union > 0:
-                per_class_iou[cls_id].append((inter / union).item())
-            n_eval += 1
+            # 连通分量 → per-instance masks | Connected components → instances
+            pred_np = pred_full.cpu().numpy()
+            pred_bin = (pred_np > conf_threshold).astype(np.uint8)
+            num_labels, labels = cv2.connectedComponents(pred_bin, connectivity=8)
 
-    # ── 汇总 | Aggregate ──
-    cls_means = {}
-    for cls_id, ious in per_class_iou.items():
-        cls_means[cls_id] = np.mean(ious) if ious else 0.0
-    miou = np.mean(list(cls_means.values())) if cls_means else 0.0
+            for label_id in range(1, num_labels):
+                inst_mask = (labels == label_id)
+                area = inst_mask.sum()
+                if area < 16:
+                    continue
+                # Score: mean probability within mask
+                score = float(pred_np[inst_mask].mean())
+                evaluator.add_prediction(
+                    image_id=tile_id, category_id=cls_id,
+                    mask=inst_mask, score=score,
+                )
+                total_preds += 1
 
+    if total_preds == 0:
+        return {
+            "AP": 0.0, "AP50": 0.0, "AP75": 0.0,
+            "APS": 0.0, "APM": 0.0, "APL": 0.0,
+            "AR1": 0.0, "AR10": 0.0, "AR100": 0.0,
+            "per_class_AP": {}, "n_predictions": 0,
+        }
+
+    coco_result = evaluator.evaluate()
     return {
-        "miou": round(float(miou), 6),
-        "per_class_iou": {k: round(float(v), 6) for k, v in cls_means.items()},
-        "n_eval": n_eval,
+        "AP": round(float(coco_result.get("AP", 0.0)), 6),
+        "AP50": round(float(coco_result.get("AP50", 0.0)), 6),
+        "AP75": round(float(coco_result.get("AP75", 0.0)), 6),
+        "APS": round(float(coco_result.get("AP_small", 0.0)), 6),
+        "APM": round(float(coco_result.get("AP_medium", 0.0)), 6),
+        "APL": round(float(coco_result.get("AP_large", 0.0)), 6),
+        "AR1": round(float(coco_result.get("AR_max1", 0.0)), 6),
+        "AR10": round(float(coco_result.get("AR_max10", 0.0)), 6),
+        "AR100": round(float(coco_result.get("AR_max100", 0.0)), 6),
+        "per_class_AP": {},
+        "n_predictions": total_preds,
     }
+
+
+@torch.no_grad()
+def evaluate_per_class_ap(
+    decoder: nn.Module,
+    backbone: FastSAMBackbone,
+    spm: SparsePerceptionModule | None,
+    support_cache: dict[int, torch.Tensor],
+    dataset: ISAIDInstanceFewShotDataset,
+    class_ids: list[int],
+    device: torch.device,
+    gt_anno_path: str,
+    use_spm: bool = False,
+    max_samples_per_class: int = 50,
+) -> dict[int, dict]:
+    """
+    Per-Class COCO AP | 每个类别的独立 AP.
+
+    对每个类别单独跑 COCOeval，用于发现哪些类是瓶颈。
+    Per-class COCOeval to identify bottleneck classes.
+
+    :return: {class_id: {"AP": float, "AP50": float, "n_preds": int}}.
+    """
+    per_class = {}
+    for cls_id in tqdm(class_ids, desc="Per-Class AP", leave=False):
+        if cls_id not in support_cache:
+            continue
+        eval_result = evaluate_coco_ap(
+            decoder, backbone, spm, support_cache,
+            dataset, [cls_id], device, gt_anno_path,
+            use_spm=use_spm, max_samples_per_class=max_samples_per_class,
+        )
+        per_class[cls_id] = {
+            "AP": eval_result["AP"],
+            "AP50": eval_result["AP50"],
+            "n_preds": eval_result["n_predictions"],
+        }
+    return per_class
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -675,14 +791,19 @@ def main():
     active_base_ids = sampler.active_classes
     logger.log_info("data", f"Active Base classes: {active_base_ids}")
 
+    # ── COCO GT 路径 | COCO GT Path (for evaluation) ──
+    gt_path = Path(args.data_root) / "annotations" / "instances_val.json"
+
     # ── 训练循环 | Training Loop ──
     logger.log_info("train", f"{'='*60}")
     logger.log_info("train", f"Starting Base pre-training: {args.epochs} epochs × {args.steps_per_epoch} steps")
     logger.log_info("train", f"{'='*60}")
 
-    best_miou = 0.0
+    best_ap = 0.0
+    best_epoch = 0
     global_step = 0
     nan_skip_count = 0
+    epoch_history: list[dict] = []
 
     for epoch in range(1, args.epochs + 1):
         epoch_losses = []
@@ -702,7 +823,6 @@ def main():
             for s_idx in episode["support_indices"]:
                 s_sample = train_ds[s_idx]
                 support_imgs.append(s_sample["image"])
-                # 构建 per-class binary mask | Build per-class binary mask
                 H_s, W_s = s_sample["image"].shape[1:]
                 s_mask = torch.zeros(H_s, W_s, dtype=torch.float32)
                 for inst in s_sample["instances"]:
@@ -723,7 +843,7 @@ def main():
                     q_mask = torch.logical_or(q_mask, inst["mask"]).float()
 
             if q_mask.sum() == 0:
-                continue  # 跳过无 FG 的 query | Skip empty query
+                continue
 
             # ── 训练一步 | Train step ──
             loss_val, metrics = train_step(
@@ -746,7 +866,6 @@ def main():
             epoch_dice.append(metrics["dice"])
             epoch_pred_mean.append(metrics["pred_mean"])
 
-            # 更新进度条 | Update progress bar
             if len(epoch_losses) > 0:
                 pbar.set_postfix({
                     "loss": f"{np.mean(epoch_losses[-50:]):.4f}",
@@ -764,41 +883,96 @@ def main():
             f"Epoch {epoch:3d}/{args.epochs} | "
             f"loss={avg_loss:.4f} focal={avg_focal:.4f} dice={avg_dice:.4f} "
             f"pred_mean={avg_pred:.4f} | lr={scheduler.get_last_lr()[0]:.2e} | "
-            f"NaN_skip={nan_skip_count}"
+            f"NaN={nan_skip_count}"
         )
         logger.log_metric("loss", avg_loss, step=epoch, tags=["base_train"])
+        logger.log_metric("focal", avg_focal, step=epoch, tags=["base_train"])
         logger.log_metric("dice", avg_dice, step=epoch, tags=["base_train"])
-        logger.log_metric("pred_mean", avg_pred, step=epoch, tags=["base_train"])
 
-        # ── 定期评估 | Periodic Evaluation ──
+        # ── COCO AP 评估 (定期) | COCO AP Evaluation (periodic) ──
         if epoch % args.eval_every == 0 or epoch == args.epochs:
-            logger.log_info("eval", f"--- Evaluation @ Epoch {epoch} ---")
-            eval_result = evaluate(
-                decoder, backbone, spm, val_ds, active_base_ids, device,
-                use_spm=args.use_spm, max_samples_per_class=args.eval_max_samples,
-            )
-            miou = eval_result["miou"]
-            logger.log_info("eval",
-                f"Epoch {epoch:3d}: mIoU={miou:.4f} (eval on {eval_result['n_eval']} tiles) "
-                f"best={best_miou:.4f}")
-            logger.log_metric("miou", miou, step=epoch, tags=["base_eval"])
+            logger.log_info("eval", f"{'─'*50}")
+            logger.log_info("eval", f"COCO AP Evaluation @ Epoch {epoch}")
 
-            # 保存最佳模型 | Save best model
-            if miou > best_miou:
-                best_miou = miou
-                checkpoint = {
+            # 构建固定 support cache (模拟真实 few-shot) | Build fixed support cache
+            support_cache = build_support_cache(
+                train_ds, active_base_ids, args.k_support,
+                backbone, device, seed=args.seed + epoch,  # 每轮不同 shuffle
+            )
+
+            if gt_path.exists():
+                # ── 主 COCO AP | Primary COCO AP ──
+                eval_result = evaluate_coco_ap(
+                    decoder, backbone, spm, support_cache,
+                    val_ds, active_base_ids, device,
+                    gt_anno_path=str(gt_path),
+                    use_spm=args.use_spm,
+                    max_samples_per_class=args.eval_max_samples,
+                )
+
+                ap = eval_result["AP"]
+                ap50 = eval_result["AP50"]
+                ap75 = eval_result["AP75"]
+                aps = eval_result["APS"]
+                apm = eval_result["APM"]
+                apl = eval_result["APL"]
+                ar100 = eval_result["AR100"]
+
+                # 日志 — 全部 COCO 指标 | Log — all COCO metrics
+                logger.log_info("eval",
+                    f"  AP={ap:.4f}  AP50={ap50:.4f}  AP75={ap75:.4f}  "
+                    f"APS={aps:.4f}  APM={apm:.4f}  APL={apl:.4f}  "
+                    f"AR100={ar100:.4f}  n_preds={eval_result['n_predictions']}  "
+                    f"best_AP={best_ap:.4f} (epoch {best_epoch})"
+                )
+                for key in ["AP", "AP50", "AP75", "APS", "APM", "APL", "AR100"]:
+                    logger.log_metric(key, eval_result[key], step=epoch, tags=["base_eval"])
+
+                # ── Per-Class AP (详细诊断) | Per-Class AP (detailed diagnostic) ──
+                per_class = evaluate_per_class_ap(
+                    decoder, backbone, spm, support_cache,
+                    val_ds, active_base_ids, device,
+                    gt_anno_path=str(gt_path),
+                    use_spm=args.use_spm,
+                    max_samples_per_class=args.eval_max_samples,
+                )
+                cls_ap_str = "  ".join(
+                    f"{ISAID_CAT_NAMES.get(c, str(c))}={per_class[c]['AP']:.3f}"
+                    for c in sorted(per_class.keys()) if c in per_class
+                )
+                logger.log_info("eval", f"  Per-Class AP: {cls_ap_str}")
+
+                # ── 记录 epoch history | Record epoch history ──
+                epoch_history.append({
                     "epoch": epoch,
-                    "global_step": global_step,
-                    "decoder_state_dict": {k: v.clone() for k, v in decoder.state_dict().items()},
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "miou": miou,
-                    "per_class_iou": eval_result["per_class_iou"],
-                    "args": vars(args),
-                    "base_ids": base_ids,
-                    "novel_ids": novel_ids,
-                }
-                torch.save(checkpoint, str(out_dir / "best_model.pt"))
-                logger.log_info("eval", f"  ✓ New best: mIoU={best_miou:.4f}")
+                    "AP": ap, "AP50": ap50, "AP75": ap75,
+                    "APS": aps, "APM": apm, "APL": apl,
+                    "AR100": ar100,
+                    "loss": avg_loss, "dice": avg_dice,
+                    "per_class_AP": per_class,
+                })
+
+                # ── 按 Val AP 保存最佳 | Save best by Val AP ──
+                if ap > best_ap:
+                    best_ap = ap
+                    best_epoch = epoch
+                    checkpoint = {
+                        "epoch": epoch,
+                        "global_step": global_step,
+                        "decoder_state_dict": {k: v.clone() for k, v in decoder.state_dict().items()},
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "AP": ap, "AP50": ap50, "AP75": ap75,
+                        "APS": aps, "APM": apm, "APL": apl,
+                        "per_class_AP": per_class,
+                        "support_cache": {k: v.clone() for k, v in support_cache.items()},
+                        "args": vars(args),
+                        "base_ids": base_ids,
+                        "novel_ids": novel_ids,
+                    }
+                    torch.save(checkpoint, str(out_dir / "best_model.pt"))
+                    logger.log_info("eval", f"  ✓ New best: AP={best_ap:.4f} @ epoch {best_epoch}")
+            else:
+                logger.log_info("eval", f"  ⚠ GT not found: {gt_path}, skipping COCO AP eval")
 
     # ── 最终保存 | Final Save ──
     final_checkpoint = {
@@ -806,11 +980,13 @@ def main():
         "global_step": global_step,
         "decoder_state_dict": {k: v.clone() for k, v in decoder.state_dict().items()},
         "optimizer_state_dict": optimizer.state_dict(),
-        "best_miou": best_miou,
+        "best_AP": best_ap,
+        "best_epoch": best_epoch,
         "args": vars(args),
         "base_ids": base_ids,
         "novel_ids": novel_ids,
         "nan_skip_count": nan_skip_count,
+        "epoch_history": epoch_history,
     }
     torch.save(final_checkpoint, str(out_dir / "last_model.pt"))
 
@@ -823,11 +999,13 @@ def main():
         "epochs": args.epochs,
         "steps_per_epoch": args.steps_per_epoch,
         "k_support": args.k_support,
-        "best_miou": round(best_miou, 6),
+        "best_AP": round(best_ap, 6),
+        "best_epoch": best_epoch,
         "nan_skip_count": nan_skip_count,
         "base_classes": {c: ISAID_CAT_NAMES.get(c, str(c)) for c in base_ids},
         "novel_classes": {c: ISAID_CAT_NAMES.get(c, str(c)) for c in novel_ids},
         "trainable_params": trainable_params,
+        "epoch_history": epoch_history,
         "timestamp": datetime.now().isoformat(),
     }
     with open(out_dir / "results.json", "w") as f:
@@ -838,13 +1016,13 @@ def main():
     print(f"  V3-05 Base Pre-Training — Complete")
     print(f"  Fold: {args.fold}, Decoder: {args.decoder_type}")
     print(f"  Epochs: {args.epochs}, Steps: {global_step}")
-    print(f"  Best mIoU: {best_miou:.4f}")
+    print(f"  Best AP: {best_ap:.4f} @ epoch {best_epoch}")
     print(f"  NaN skips: {nan_skip_count}")
     print(f"  Output: {out_dir}")
     print(f"{'='*60}")
 
     logger.log_info("done", f"Output: {out_dir}")
-    logger.log_info("done", f"Best mIoU: {best_miou:.4f}")
+    logger.log_info("done", f"Best AP: {best_ap:.4f} @ epoch {best_epoch}")
 
 
 if __name__ == "__main__":

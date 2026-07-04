@@ -380,11 +380,26 @@ def evaluate_coco_ap(
                 total_preds += 1
 
     if total_preds == 0:
-        return {"AP": 0.0, "AP50": 0.0, "AP75": 0.0, "n_predictions": 0}
+        return {
+            "AP": 0.0, "AP50": 0.0, "AP75": 0.0,
+            "APS": 0.0, "APM": 0.0, "APL": 0.0,
+            "AR1": 0.0, "AR10": 0.0, "AR100": 0.0,
+            "n_predictions": 0,
+        }
 
     coco_result = evaluator.evaluate()
-    coco_result["n_predictions"] = total_preds
-    return coco_result
+    return {
+        "AP": round(float(coco_result.get("AP", 0.0)), 6),
+        "AP50": round(float(coco_result.get("AP50", 0.0)), 6),
+        "AP75": round(float(coco_result.get("AP75", 0.0)), 6),
+        "APS": round(float(coco_result.get("AP_small", 0.0)), 6),
+        "APM": round(float(coco_result.get("AP_medium", 0.0)), 6),
+        "APL": round(float(coco_result.get("AP_large", 0.0)), 6),
+        "AR1": round(float(coco_result.get("AR_max1", 0.0)), 6),
+        "AR10": round(float(coco_result.get("AR_max10", 0.0)), 6),
+        "AR100": round(float(coco_result.get("AR_max100", 0.0)), 6),
+        "n_predictions": total_preds,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -634,7 +649,8 @@ def main():
 
         # ── COCO AP 评估 | COCO AP Evaluation ──
         if epoch % args.eval_every == 0 or epoch == args.epochs:
-            logger.log_info("eval", f"--- COCO AP Evaluation @ Epoch {epoch} ---")
+            logger.log_info("eval", f"{'─'*50}")
+            logger.log_info("eval", f"COCO AP Evaluation @ Epoch {epoch}")
             gt_path = Path(args.data_root) / "annotations" / "instances_val.json"
             if gt_path.exists():
                 eval_result = evaluate_coco_ap(
@@ -644,14 +660,44 @@ def main():
                     use_spm=args.use_spm,
                     max_samples_per_class=args.eval_max_samples,
                 )
-                ap = eval_result.get("AP", 0.0)
-                ap50 = eval_result.get("AP50", 0.0)
-                logger.log_info("eval",
-                    f"Epoch {epoch:3d}: AP={ap:.4f} AP50={ap50:.4f} "
-                    f"n_preds={eval_result.get('n_predictions', 0)} | best_AP={best_ap:.4f}")
-                logger.log_metric("AP", ap, step=epoch, tags=["fewshot_eval"])
-                logger.log_metric("AP50", ap50, step=epoch, tags=["fewshot_eval"])
+                ap = eval_result["AP"]
+                ap50 = eval_result["AP50"]
+                ap75 = eval_result["AP75"]
+                aps = eval_result["APS"]
+                apm = eval_result["APM"]
+                apl = eval_result["APL"]
+                ar1 = eval_result["AR1"]
+                ar100 = eval_result["AR100"]
 
+                logger.log_info("eval",
+                    f"  AP={ap:.4f}  AP50={ap50:.4f}  AP75={ap75:.4f}  "
+                    f"APS={aps:.4f}  APM={apm:.4f}  APL={apl:.4f}  "
+                    f"AR1={ar1:.4f}  AR100={ar100:.4f}  "
+                    f"n_preds={eval_result['n_predictions']}  best_AP={best_ap:.4f}"
+                )
+                for key in ["AP", "AP50", "AP75", "APS", "APM", "APL", "AR1", "AR100"]:
+                    logger.log_metric(key, eval_result[key], step=epoch, tags=["fewshot_eval"])
+
+                # ── Per-class AP | Per-Class AP ──
+                per_class = {}
+                for cls_id in train_class_ids:
+                    if cls_id not in support_cache:
+                        continue
+                    cls_result = evaluate_coco_ap(
+                        decoder, backbone, spm, support_cache,
+                        val_ds, [cls_id], device,
+                        gt_anno_path=str(gt_path),
+                        use_spm=args.use_spm,
+                        max_samples_per_class=args.eval_max_samples,
+                    )
+                    per_class[cls_id] = {"AP": cls_result["AP"], "AP50": cls_result["AP50"]}
+                cls_ap_str = "  ".join(
+                    f"{ISAID_CAT_NAMES.get(c, str(c))}={per_class[c]['AP']:.3f}"
+                    for c in sorted(per_class.keys()) if c in per_class
+                )
+                logger.log_info("eval", f"  Per-Class: {cls_ap_str}")
+
+                # ── 保存最佳 | Save best by AP ──
                 if ap > best_ap:
                     best_ap = ap
                     torch.save({
@@ -659,7 +705,9 @@ def main():
                         "decoder_state_dict": {k: v.clone() for k, v in decoder.state_dict().items()},
                         "optimizer_state_dict": optimizer.state_dict(),
                         "support_cache": {k: v.clone() for k, v in support_cache.items()},
-                        "AP": ap, "AP50": ap50,
+                        "AP": ap, "AP50": ap50, "AP75": ap75,
+                        "APS": aps, "APM": apm, "APL": apl,
+                        "per_class_AP": per_class,
                         "k_shot": args.k_shot, "novel_ids": train_class_ids,
                         "args": vars(args),
                     }, str(out_dir / "best_model.pt"))
