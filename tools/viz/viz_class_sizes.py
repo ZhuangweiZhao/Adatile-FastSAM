@@ -3,8 +3,12 @@
 可视化 iSAID 三类 (small_vehicle, storage_tank, ship) 的尺寸差异。
 Visualize size differences across small_vehicle / storage_tank / ship.
 
+支持三种数据格式 | Supports three data formats:
+    isaid_processed / isaid_instance / isaid_tiles
+
 用法 | Usage:
-    python tools/viz/viz_class_sizes.py --src-root data/iSAID_processed
+    python tools/viz/viz_class_sizes.py --data-root data/iSAID_processed
+    python tools/viz/viz_class_sizes.py --data-root data/iSAID-few_tiles --data-format isaid_instance
 """
 
 import argparse, json
@@ -26,11 +30,31 @@ TARGET = {
 }
 
 
-def collect_bbox_stats(src_root: str, split: str = "train"):
+def collect_bbox_stats(data_root: str, split: str = "train", data_format: str = "isaid_processed"):
     """Collect bbox area statistics from COCO JSON per class. | 从 COCO JSON 收集 bbox 面积统计."""
-    ann_path = Path(src_root) / split / "annotations" / f"instances_{split}.json"
-    if not ann_path.exists():
-        raise FileNotFoundError(f"Cannot find annotation file: {ann_path}")
+    root = Path(data_root)
+
+    # 根据格式定位 COCO JSON | Locate COCO JSON by format
+    ann_path = None
+    if data_format == "isaid_processed":
+        ann_path = root / split / "annotations" / f"instances_{split}.json"
+    elif data_format in ("isaid_instance", "isaid_tiles"):
+        ann_path = root / "annotations" / f"instances_{split}.json"
+
+    if ann_path is None or not ann_path.exists():
+        # Fallback search
+        for cand in [
+            root / split / "annotations" / f"instances_{split}.json",
+            root / "annotations" / f"instances_{split}.json",
+            root / "annotations" / "instances_val.json",
+            root / "annotations" / "instances_train.json",
+        ]:
+            if cand.exists():
+                ann_path = cand
+                break
+
+    if ann_path is None or not ann_path.exists():
+        raise FileNotFoundError(f"Cannot find annotation file. Tried in: {data_root}")
 
     with open(ann_path) as f:
         data = json.load(f)
@@ -97,13 +121,17 @@ def plot_class_samples(ax, anns_by_cls, images, cls_id, n_samples=4):
 
 def main():
     parser = argparse.ArgumentParser(description="Visualize class size differences")
-    parser.add_argument("--src-root", type=str, required=True)
+    parser.add_argument("--data-root", type=str, default="data/iSAID_processed",
+                        help="数据根目录 | Data root directory")
+    parser.add_argument("--data-format", type=str, default="isaid_processed",
+                        choices=["isaid_processed", "isaid_instance", "isaid_tiles"],
+                        help="数据格式 | Data format")
     parser.add_argument("--output", type=str, default="runs/viz_class_sizes.png")
     parser.add_argument("--split", type=str, default="train")
     args = parser.parse_args()
 
-    src_root = Path(args.src_root)
-    anns_by_cls, images = collect_bbox_stats(str(src_root), args.split)
+    src_root = Path(args.data_root)
+    anns_by_cls, images = collect_bbox_stats(str(src_root), args.split, args.data_format)
 
     print(f"Collected annotations:")
     for cls_id in sorted(TARGET):

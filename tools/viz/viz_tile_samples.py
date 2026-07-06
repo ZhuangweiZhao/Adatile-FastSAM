@@ -3,8 +3,12 @@
 在 tile 样本上可视化三类 (small_vehicle, storage_tank, ship) 的 mask 叠加。
 Visualize 3-class masks overlaid on tile samples.
 
+支持两种数据格式 | Supports two data formats:
+    isaid_instance / isaid_tiles
+
 用法 | Usage:
-    python tools/viz/viz_tile_samples.py --src-root data/iSAID_processed
+    python tools/viz/viz_tile_samples.py --data-root data/iSAID_instance_fewshot
+    python tools/viz/viz_tile_samples.py --data-root data/iSAID-few_tiles --data-format isaid_instance
 """
 
 import argparse, sys
@@ -19,7 +23,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from adatile.datasets.isaid_tile_wrapper import ISAIDTileWrapper
-from tools.instance.eval_c02a_fastsam_fewshot import ISAIDInstanceDataset
+from tools.instance.eval_c02a_fastsam_fewshot import ISAIDInstanceDataset  # 旧版 API, 仍在用 | Legacy API, still functional
 
 
 TARGET = {
@@ -43,18 +47,27 @@ def overlay_mask(image, mask, color, alpha=0.5):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--src-root", type=str, required=True)
+    parser.add_argument("--data-root", type=str, default="data/iSAID_instance_fewshot",
+                        help="数据根目录 | Data root directory")
+    parser.add_argument("--data-format", type=str, default="isaid_instance",
+                        choices=["isaid_instance", "isaid_tiles"],
+                        help="数据格式 | Data format: isaid_instance or isaid_tiles")
     parser.add_argument("--output", type=str, default="runs/viz_tile_samples.png")
     parser.add_argument("--n-per-class", type=int, default=4,
                        help="每类样本数 | Samples per class")
+    parser.add_argument("--tile-size", type=int, default=896,
+                       help="Tile 尺寸 | Tile size")
+    parser.add_argument("--stride", type=int, default=512,
+                       help="Tile 步长 | Tile stride")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--split", type=str, default="train",
+                       help="数据集划分 | Dataset split (train/val)")
     args = parser.parse_args()
 
     # Load dataset with tile wrapper
-    train_ds = ISAIDInstanceDataset(args.src_root, split="train")
-    val_ds = ISAIDInstanceDataset(args.src_root, split="val")
-    train_tiles = ISAIDTileWrapper(train_ds, tile_size=896, stride=512)
-    val_tiles = ISAIDTileWrapper(val_ds, tile_size=896, stride=512)
+    data_root = Path(args.data_root)
+    train_ds = ISAIDInstanceDataset(str(data_root), split=args.split)
+    train_tiles = ISAIDTileWrapper(train_ds, tile_size=args.tile_size, stride=args.stride)
 
     rng = np.random.RandomState(args.seed)
 
@@ -119,7 +132,8 @@ def main():
                          for i in candidates[:500]],  # sample 500 for speed
         }
         avg_fg = np.mean(cls_stats[cls_id]["fg_pixels"])
-        print(f"  avg fg pixels: {avg_fg:.0f} px per tile (over {min(500, len(candidates))} sampled)")
+        print(f"  avg fg pixels: {avg_fg:.0f} px per tile "
+              f"(over {min(500, len(candidates))} sampled)")
 
     fig.suptitle("iSAID Tile Samples — small_vehicle / storage_tank / ship",
                 fontsize=14, fontweight="bold", y=1.01)
@@ -141,7 +155,8 @@ def main():
                     color=TARGET[cls_id]["color"])
     ax2.set_xlabel("Foreground pixels per tile", fontsize=11)
     ax2.set_ylabel("Tile count", fontsize=11)
-    ax2.set_title("Foreground Pixel Distribution per Tile (896x896)", fontsize=13, fontweight="bold")
+    ax2.set_title(f"Foreground Pixel Distribution per Tile ({args.tile_size}x{args.tile_size})",
+                  fontsize=13, fontweight="bold")
     ax2.legend()
     ax2.grid(True, alpha=0.3)
 

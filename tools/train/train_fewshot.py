@@ -218,55 +218,95 @@ def train_step_fewshot(
     spm: SparsePerceptionModule | None,
     support_cache: dict[int, torch.Tensor],
     query_img: torch.Tensor,             # [1, 3, H, W]
-    query_mask: torch.Tensor,            # [H, W] binary per-class GT
+    query_instances: list[torch.Tensor], # list of [H, W] per-instance binary masks
     class_id: int,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     use_spm: bool = False,
 ) -> tuple[float, dict]:
     """
-    训练一步 (使用固定 support prototype) | Train step (fixed support prototype).
+    训练一步 (per-instance, 固定 support prototype).
+    Train step (per-instance, fixed support prototype).
+
+    v3 修复: per-instance mask 训练替代 union mask 训练。
+    每步对 query tile 中 class_id 类的每个实例独立 forward + loss，
+    loss 平均后 backward。弥合语义→实例分割鸿沟。
+    v3 fix: per-instance mask training replaces union mask training.
+    Each instance in the query tile gets independent forward + loss,
+    averaged then backward. Bridges the semantic→instance gap.
 
     :return: (loss_value, metrics_dict).
     """
     decoder.train()
 
+    # ── 0. 跳过无实例的 tile | Skip tiles with no instances ──
+    if len(query_instances) == 0:
+        return 0.0, {"loss": 0.0, "focal": 0.0, "dice": 0.0,
+                     "pred_mean": 0.0, "class_id": class_id, "n_instances": 0}
+
+    H, W = query_instances[0].shape
+    N = len(query_instances)
+
     # ── 1. 预计算的 support prototype | Pre-computed support prototype ──
     support_proto = support_cache[class_id].to(device)
 
-    # ── 2. Query → Backbone ──
+    # ── 2. Query → Backbone (共享于所有实例) ──
+    #        Query → Backbone (shared across all instances)
     feats = backbone(query_img.to(device), extract_proto=True)
     p4 = feats["p4"]
     proto_masks = feats.get("proto")
     if proto_masks is None:
         return 999.0, {"loss": 999.0, "focal": 999.0, "dice": 999.0,
-                       "pred_mean": 0.0, "class_id": class_id}
+                       "pred_mean": 0.0, "class_id": class_id, "n_instances": N}
 
     # ── 3. SPM ──
     spm_map = None
     if use_spm and spm is not None:
         spm_map = spm(feats["p8"])
 
-    # ── 4. Decoder → Mask ──
-    if isinstance(decoder, ProtoOnlyDecoder):
-        pred_mask = decoder(proto_masks, support_proto)
-    else:
-        pred_mask = decoder(p4, proto_masks, support_proto, spm_map)
-    if pred_mask.dim() == 3:
-        pred_mask = pred_mask.squeeze(0)
+    # ── 4. Per-Instance 训练循环 | Per-Instance Training Loop ──
+    total_loss = 0.0
+    total_focal = 0.0
+    total_dice = 0.0
+    total_pred_mean = 0.0
+    valid_count = 0
 
-    pred_full = F.interpolate(
-        pred_mask.unsqueeze(0).unsqueeze(0),
-        size=query_mask.shape, mode="bilinear", align_corners=False,
-    ).squeeze(0).squeeze(0)
+    for inst_mask in query_instances:
+        # ── Decoder → Mask ──
+        if isinstance(decoder, ProtoOnlyDecoder):
+            pred_mask = decoder(proto_masks, support_proto)
+        else:
+            pred_mask = decoder(p4, proto_masks, support_proto, spm_map)
+        if pred_mask.dim() == 3:
+            pred_mask = pred_mask.squeeze(0)
 
-    # ── 5. Loss ──
-    loss, loss_dict = combined_loss(pred_full, query_mask.float().to(device))
+        pred_full = F.interpolate(
+            pred_mask.unsqueeze(0).unsqueeze(0),
+            size=(H, W), mode="bilinear", align_corners=False,
+        ).squeeze(0).squeeze(0)
 
-    # ── 6. NaN 安全 | NaN Safety ──
+        # ── Per-instance loss ──
+        loss_i, loss_dict = combined_loss(pred_full, inst_mask.float().to(device))
+
+        if torch.isnan(loss_i) or torch.isinf(loss_i):
+            continue
+
+        total_loss += loss_i
+        total_focal += loss_dict["focal"]
+        total_dice += loss_dict["dice"]
+        total_pred_mean += pred_full.mean().item()
+        valid_count += 1
+
+    if valid_count == 0:
+        return 999.0, {"loss": 999.0, "focal": 999.0, "dice": 999.0,
+                       "pred_mean": 0.0, "class_id": class_id, "n_instances": N}
+
+    loss = total_loss / valid_count
+
+    # ── NaN 安全 | NaN Safety ──
     if torch.isnan(loss) or torch.isinf(loss):
         return 999.0, {"loss": 999.0, "focal": 999.0, "dice": 999.0,
-                       "pred_mean": 0.0, "class_id": class_id}
+                       "pred_mean": 0.0, "class_id": class_id, "n_instances": N}
 
     optimizer.zero_grad()
     loss.backward()
@@ -280,12 +320,14 @@ def train_step_fewshot(
     if grad_nan:
         optimizer.zero_grad()
         return 999.0, {"loss": 999.0, "focal": 999.0, "dice": 999.0,
-                       "pred_mean": 0.0, "class_id": class_id}
+                       "pred_mean": 0.0, "class_id": class_id, "n_instances": N}
 
     optimizer.step()
     return loss.item(), {
-        "loss": loss.item(), "focal": loss_dict["focal"], "dice": loss_dict["dice"],
-        "pred_mean": pred_full.mean().item(), "class_id": class_id,
+        "loss": loss.item(), "focal": total_focal / valid_count,
+        "dice": total_dice / valid_count,
+        "pred_mean": total_pred_mean / valid_count,
+        "class_id": class_id, "n_instances": N,
     }
 
 
@@ -608,18 +650,19 @@ def main():
                 q_sample = train_ds[random.choice(tile_indices)]
 
             query_img = q_sample["image"].unsqueeze(0)
-            H, W = q_sample["image"].shape[1:]
-            q_mask = torch.zeros(H, W, dtype=torch.float32)
+            # v3 修复: per-instance mask 替代 union mask
+            # v3 fix: per-instance masks instead of union mask
+            q_instances = []
             for inst in q_sample["instances"]:
                 if inst["category_id"] == cls_id:
-                    q_mask = torch.logical_or(q_mask, inst["mask"]).float()
+                    q_instances.append(inst["mask"].float())
 
-            if q_mask.sum() == 0:
+            if len(q_instances) == 0:
                 continue
 
             loss_val, metrics = train_step_fewshot(
                 decoder, backbone, spm, support_cache,
-                query_img, q_mask, cls_id,
+                query_img, q_instances, cls_id,
                 optimizer, device, use_spm=args.use_spm,
             )
 

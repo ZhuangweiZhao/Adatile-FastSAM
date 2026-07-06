@@ -57,6 +57,7 @@ from collections import Counter  # 统计 Proto 组合频率 | Count Proto combi
 # ═══════════════════════════════════════════════════════════════════
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]  # 上溯两级到项目根目录 | Go up 2 levels to project root
 sys.path.insert(0, str(_PROJECT_ROOT))
+sys.path.insert(0, str(_PROJECT_ROOT / "tools" / "paper_a"))  # E009 脚本路径 | E009 script path
 
 from adatile.datasets import MassachusettsBuildingsDataset
 from adatile.backbone import FastSAMBackbone

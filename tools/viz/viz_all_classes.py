@@ -2,11 +2,16 @@
 """
 全 15 类 iSAID 尺寸 + 前景覆盖率可视化 | All 15-class size + FG coverage visualization.
 
+支持三种数据格式 | Supports three data formats:
+    isaid_processed / isaid_instance / isaid_tiles
+
 用法 | Usage:
-    python tools/viz/viz_all_classes.py --src-root data/iSAID_processed
+    python tools/viz/viz_all_classes.py --data-root data/iSAID_processed
+    python tools/viz/viz_all_classes.py --data-root data/iSAID-few_tiles --data-format isaid_instance
+    python tools/viz/viz_all_classes.py --data-root data/iSAID_tiles --data-format isaid_tiles
 """
 
-import argparse, sys
+import argparse, json, sys
 from pathlib import Path
 from collections import defaultdict
 import numpy as np
@@ -52,11 +57,41 @@ CLASS_COLORS = {
 CLASS_NAMES = {k: v.replace("_", "\n") for k, v in ISAID_CATEGORIES.items()}
 
 
-def collect_stats(src_root: str):
-    """Collect bbox + tile FG stats per class. | 收集每类 bbox + tile FG 统计."""
-    import json
+def collect_stats(data_root: str, data_format: str = "isaid_processed", split: str = "train",
+                  tile_size: int = 896, stride: int = 640):
+    """Collect bbox + tile FG stats per class. | 收集每类 bbox + tile FG 统计.
 
-    ann_path = Path(src_root) / "train" / "annotations" / "instances_train.json"
+    :param data_root:   数据根目录 | Data root directory.
+    :param data_format: 数据格式 | Data format: isaid_processed / isaid_instance / isaid_tiles.
+    :param split:       数据集划分 | Dataset split.
+    :param tile_size:   Tile 尺寸 (仅 isaid_instance/isaid_tiles) | Tile size.
+    :param stride:      Tile 步长 (仅 grid 格式) | Tile stride.
+    """
+    # ── 定位 COCO JSON | Locate COCO JSON ──
+    root = Path(data_root)
+    ann_path = None
+    if data_format == "isaid_processed":
+        ann_path = root / split / "annotations" / f"instances_{split}.json"
+    elif data_format == "isaid_instance":
+        ann_path = root / "annotations" / f"instances_{split}.json"
+    elif data_format == "isaid_tiles":
+        ann_path = root / "annotations" / f"instances_{split}.json"
+
+    if ann_path is None or not ann_path.exists():
+        # Fallback: search for COCO JSON
+        for cand in [
+            root / split / "annotations" / f"instances_{split}.json",
+            root / "annotations" / f"instances_{split}.json",
+            root / "annotations" / "instances_val.json",
+            root / "annotations" / "instances_train.json",
+        ]:
+            if cand.exists():
+                ann_path = cand
+                break
+
+    if ann_path is None or not ann_path.exists():
+        raise FileNotFoundError(f"Cannot find COCO annotations in {data_root}")
+
     print(f"Loading: {ann_path}")
     with open(ann_path) as f:
         data = json.load(f)
@@ -72,33 +107,65 @@ def collect_stats(src_root: str):
             bbox_areas[cid].append(w * h)
             bbox_sizes[cid].append((w, h))
 
-    # Tile FG stats — estimate from bbox areas | 从 bbox 面积估算 FG 覆盖率
-    # 每张 tile 896x896=802816px, 假设每个实例完全独立占据一个 tile
-    # Per tile 896x896=802816px, assume each instance fully occupies its tile
-    tile_px = 896 * 896  # 802816
+    # ── Tile FG stats: 根据格式估算 | Estimate tile FG by format ──
+    tile_px = tile_size * tile_size
     tile_fg = defaultdict(list)
     tile_fg_ratio = defaultdict(list)
 
-    for cid in sorted(ISAID_CATEGORIES):
-        areas = bbox_areas.get(cid, [])
-        # Sample up to 2000 instances for FG stats
-        sample_areas = areas[:2000] if len(areas) > 2000 else areas
-        for area in sample_areas:
-            fg_px = min(area, tile_px)
-            tile_fg[cid].append(fg_px)
-            tile_fg_ratio[cid].append(fg_px / tile_px)
+    if data_format in ("isaid_instance", "isaid_tiles"):
+        # 真实 tile: 每张图像对应一个 tile，直接用 bbox area 估算 FG
+        # Real tiles: each image is a tile, estimate FG from bbox area directly
+        img_id_to_anns = defaultdict(list)
+        for ann in data["annotations"]:
+            if ann["category_id"] in ISAID_CATEGORIES:
+                img_id_to_anns[ann["image_id"]].append(ann)
 
-    n_tiles = 23621  # known value from previous runs
+        img_id_to_info = {img["id"]: img for img in data["images"]}
+        for img_id, anns in img_id_to_anns.items():
+            img_info = img_id_to_info.get(img_id, {})
+            tw = img_info.get("width", tile_size)
+            th = img_info.get("height", tile_size)
+            for ann in anns:
+                cid = ann["category_id"]
+                w, h = ann["bbox"][2], ann["bbox"][3]
+                fg_px = min(w * h, tw * th)
+                tile_fg[cid].append(fg_px)
+                tile_fg_ratio[cid].append(fg_px / (tw * th))
+
+        n_tiles = len(data["images"])
+    else:
+        # isaid_processed: 全图格式，用 bbox 面积估算 | Full-image format, estimate from bbox
+        for cid in sorted(ISAID_CATEGORIES):
+            areas = bbox_areas.get(cid, [])
+            sample_areas = areas[:2000] if len(areas) > 2000 else areas
+            for area in sample_areas:
+                fg_px = min(area, tile_px)
+                tile_fg[cid].append(fg_px)
+                tile_fg_ratio[cid].append(fg_px / tile_px)
+        n_tiles = 23621  # known value for isaid_processed 896² tiles
+
     return bbox_areas, bbox_sizes, tile_fg, tile_fg_ratio, n_tiles
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--src-root", type=str, required=True)
+    parser.add_argument("--data-root", type=str, default="data/iSAID_processed",
+                        help="数据根目录 | Data root directory")
+    parser.add_argument("--data-format", type=str, default="isaid_processed",
+                        choices=["isaid_processed", "isaid_instance", "isaid_tiles"],
+                        help="数据格式 | Data format")
+    parser.add_argument("--split", type=str, default="train",
+                        help="数据集划分 | Dataset split")
+    parser.add_argument("--tile-size", type=int, default=896,
+                        help="Tile 尺寸 | Tile size (for isaid_instance/isaid_tiles formats)")
+    parser.add_argument("--stride", type=int, default=640,
+                        help="Tile 步长 | Tile stride (for isaid_instance format)")
     parser.add_argument("--output", type=str, default="runs/viz_all_classes.png")
     args = parser.parse_args()
 
-    bbox_areas, bbox_sizes, tile_fg, tile_fg_ratio, n_tiles = collect_stats(args.src_root)
+    bbox_areas, bbox_sizes, tile_fg, tile_fg_ratio, n_tiles = collect_stats(
+        args.data_root, args.data_format, args.split, args.tile_size, args.stride
+    )
 
     cls_ids = sorted(ISAID_CATEGORIES.keys())
     n_cls = len(cls_ids)

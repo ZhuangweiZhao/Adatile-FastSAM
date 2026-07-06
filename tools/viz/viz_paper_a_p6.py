@@ -545,9 +545,24 @@ def main():
         [2/3] 快速训练 ProtoModule (20 epochs, Adam+CosineLR) | Quick-train ProtoModule
         [3/3] 运行 P6 分析与可视化 | Run P6 analysis & visualization
     """
+    import argparse
+    parser = argparse.ArgumentParser(description="E007.5 P6 Proto Activation Analysis")
+    parser.add_argument("--data-root", type=str, default="data/Massachusetts_Buildings",
+                        help="Massachusetts Buildings 数据集根目录 | Dataset root")
+    parser.add_argument("--output-dir", type=str, default="runs/p6_analysis",
+                        help="输出目录 | Output directory")
+    parser.add_argument("--device", type=str,
+                        default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--embed-dim", type=int, default=128)
+    parser.add_argument("--n-protos", type=int, default=12)
+    arg = parser.parse_args()
+
     # ── 设备选择 | Device selection ──
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    output_dir = "runs/p6_analysis"
+    device = arg.device
+    output_dir = arg.output_dir
+    data_root = arg.data_root
 
     print("=" * 60)
     print("  P6 Activation Map Analysis")
@@ -566,38 +581,37 @@ def main():
     # Stage [2/3]: 快速训练 ProtoModule | Quick-Train ProtoModule
     # ═══════════════════════════════════════════════════════════════════════════
     print("\n[2/3] Train Proto Module (quick)")
-    # 导入 ProtoModule (来自 E007 实验) | Import ProtoModule (from E007 experiment)
-    sys.path.insert(0, str(_PROJECT_ROOT / "tools"))
-    from eval_e007_proto_module import ProtoModule
+    # 导入 ProtoModule (已迁移至 adatile.decoder) | Import ProtoModule (migrated to adatile.decoder)
+    from adatile.decoder.proto_module import ProtoModule
 
     # ProtoModule 架构 | Architecture:
     #   in_channels=1280 (FastSAM P4 层通道数 | FastSAM P4 layer channels)
     #   embed_dim=128   (嵌入空间维度 | Embedding space dimension)
     #   n_protos=12     (原型数量 | Number of prototypes)
-    proto_module = ProtoModule(in_channels=1280, embed_dim=128, n_protos=12).to(device)
+    proto_module = ProtoModule(in_channels=1280, embed_dim=arg.embed_dim, n_protos=arg.n_protos).to(device)
 
     # ── 数据集加载 | Dataset loading ──
-    train_ds = MassachusettsBuildingsDataset(root_dir="data/Massachusetts_Buildings", split="train")
-    val_ds = MassachusettsBuildingsDataset(root_dir="data/Massachusetts_Buildings", split="val")
+    train_ds = MassachusettsBuildingsDataset(root_dir=data_root, split="train")
+    val_ds = MassachusettsBuildingsDataset(root_dir=data_root, split="val")
 
     # ── 优化器与调度器 | Optimizer & Scheduler ──
     # Adam: 适合小模块快速收敛 | Good for fast convergence of small modules
     # CosineAnnealingLR: 从 lr=1e-3 余弦衰减至 eta_min=1e-6, 周期=20 epoch
     # CosineAnnealingLR: cosine decay from lr=1e-3 to eta_min=1e-6, period=20 epochs
     proto_module.train()
-    optimizer = torch.optim.Adam(proto_module.parameters(), lr=1e-3)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20, eta_min=1e-6)
+    optimizer = torch.optim.Adam(proto_module.parameters(), lr=arg.lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=arg.epochs, eta_min=1e-6)
     best_dice = 0.0  # 跟踪最佳模型 (用于模型选择, 此处未保存) | Track best model (for selection, not saved here)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 训练循环 (20 Epochs) | Training Loop (20 Epochs)
     # ═══════════════════════════════════════════════════════════════════════════
-    print("  Training 20 epochs (lr=1e-3, CosineLR)...")
-    for epoch in range(1, 21):
+    print(f"  Training {arg.epochs} epochs (lr={arg.lr}, CosineLR)...")
+    for epoch in range(1, arg.epochs + 1):
         # ── 训练阶段 | Train Phase ──
         proto_module.train()
         total_loss = 0.0
-        pbar = tqdm(range(len(train_ds)), desc=f"  Epoch {epoch}/20 [train]", leave=False)
+        pbar = tqdm(range(len(train_ds)), desc=f"  Epoch {epoch}/{arg.epochs} [train]", leave=False)
         for idx in pbar:
             # 加载单张图像 (batch_size=1, 逐样本训练) | Load single image (batch_size=1, per-sample training)
             sample = train_ds[idx]
@@ -667,7 +681,7 @@ def main():
         if is_best:
             best_dice = dice_mean
         marker = " *" if is_best else ""  # * 标记最佳 epoch | * marks best epoch
-        print(f"    Epoch {epoch:2d}/20  loss={total_loss/len(train_ds):.4f}  "
+        print(f"    Epoch {epoch:2d}/{arg.epochs}  loss={total_loss/len(train_ds):.4f}  "
               f"Dice(val)={dice_mean:.4f}{marker}")
 
     # ═══════════════════════════════════════════════════════════════════════════

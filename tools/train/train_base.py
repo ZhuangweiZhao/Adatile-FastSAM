@@ -211,14 +211,20 @@ def train_step(
     support_imgs: torch.Tensor,          # [K, 3, H, W]
     support_masks: torch.Tensor,         # [K, H, W]
     query_img: torch.Tensor,             # [1, 3, H, W]
-    query_mask: torch.Tensor,            # [H, W] binary per-class GT
+    query_instances: list[torch.Tensor], # list of [H, W] per-instance binary masks
     class_id: int,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     use_spm: bool = False,
 ) -> tuple[float, dict]:
     """
-    训练一步 | Train one step.
+    训练一步 (per-instance) | Train one step (per-instance).
+
+    对 query tile 中的每个 GT 实例独立计算 loss，解决 v2 中
+    "union mask 训练 → 语义分割，COCO AP 评估 → 实例分割" 的语义/实例鸿沟。
+    Per-instance loss bridges the semantic/instance gap:
+    union mask training → semantic segmentation,
+    COCO AP evaluation → instance segmentation.
 
     梯度 NaN 时自动跳过 (zero_grad + return 999.0)。
     Auto-skips gradient NaN (zero_grad + return 999.0).
@@ -227,12 +233,21 @@ def train_step(
     """
     decoder.train()
 
+    # ── 0. 跳过无实例的 tile | Skip tiles with no instances ──
+    if len(query_instances) == 0:
+        return 0.0, {"loss": 0.0, "focal": 0.0, "dice": 0.0,
+                     "pred_mean": 0.0, "class_id": class_id, "n_instances": 0}
+
+    H, W = query_instances[0].shape
+    N = len(query_instances)
+
     # ── 1. Support → Prototype | Support → Prototype ──
     support_proto = compute_support_prototype(
         backbone, support_imgs, support_masks, device
     )
 
-    # ── 2. Query → Backbone Features + Proto | Query → Backbone + Proto ──
+    # ── 2. Query → Backbone Features + Proto (共享于所有实例) ──
+    #        Query → Backbone Features + Proto (shared across all instances)
     feats = backbone(query_img, extract_proto=True)
     p4 = feats["p4"]          # [1, 1280, H/16, W/16]
     proto_masks = feats.get("proto")  # [1, 32, H/4, W/4] or None
@@ -243,39 +258,72 @@ def train_step(
         spm_out = spm(feats["p8"])  # [1, 1, H/32, W/32]
         spm_map = spm_out
 
-    # ── 4. Decoder → Mask | Decoder → Mask ──
-    if isinstance(decoder, ProtoOnlyDecoder):
-        if proto_masks is None:
-            raise RuntimeError("ProtoOnlyDecoder requires proto_masks but backbone returned None. "
-                               "Ensure extract_proto=True.")
-        pred_mask = decoder(proto_masks, support_proto)
-    else:
-        if proto_masks is None:
-            raise RuntimeError("AdaptiveSparseDecoder requires proto_masks but backbone returned None. "
-                               "Ensure extract_proto=True.")
-        pred_mask = decoder(p4, proto_masks, support_proto, spm_map)
+    # ── 4. Per-Instance 训练循环 | Per-Instance Training Loop ──
+    # 每个实例独立 forward + loss，loss 平均后 backward。
+    # 解码器对同一类所有实例输出相同的预测图（因为 support_proto/p4/proto 相同），
+    # 但 per-instance Dice 归一化不同，使小实例获得更高权重。
+    # Each instance: independent forward + loss, average → backward.
+    # Decoder produces the same prediction for all instances of a class
+    # (same support_proto/p4/proto), but per-instance Dice normalization
+    # gives higher weight to small instances.
+    total_loss = 0.0
+    total_focal = 0.0
+    total_dice = 0.0
+    total_pred_mean = 0.0
+    valid_count = 0
+    first_nan_logged = False
 
-    # ── 去 batch 维度 + 上采样到 GT 分辨率 | Remove batch dim + upsample to GT resolution ──
-    if pred_mask.dim() == 3:
-        pred_mask = pred_mask.squeeze(0)  # [H/4, W/4]
-    pred_full = F.interpolate(
-        pred_mask.unsqueeze(0).unsqueeze(0),
-        size=query_mask.shape,
-        mode="bilinear", align_corners=False,
-    ).squeeze(0).squeeze(0)  # [H, W]
+    for i, inst_mask in enumerate(query_instances):
+        # ── Decoder → Mask ──
+        if isinstance(decoder, ProtoOnlyDecoder):
+            if proto_masks is None:
+                raise RuntimeError("ProtoOnlyDecoder requires proto_masks but backbone returned None. "
+                                   "Ensure extract_proto=True.")
+            pred_mask = decoder(proto_masks, support_proto)
+        else:
+            if proto_masks is None:
+                raise RuntimeError("AdaptiveSparseDecoder requires proto_masks but backbone returned None. "
+                                   "Ensure extract_proto=True.")
+            pred_mask = decoder(p4, proto_masks, support_proto, spm_map)
 
-    # ── 5. 损失 | Loss ──
-    loss, loss_dict = combined_loss(pred_full, query_mask.float().to(device))
+        if pred_mask.dim() == 3:
+            pred_mask = pred_mask.squeeze(0)  # [H/4, W/4]
 
-    # ── 6. NaN 诊断 + 安全跳过 | NaN Diagnostic + Safe Skip ──
+        pred_full = F.interpolate(
+            pred_mask.unsqueeze(0).unsqueeze(0),
+            size=(H, W), mode="bilinear", align_corners=False,
+        ).squeeze(0).squeeze(0)  # [H, W]
+
+        # ── Per-instance loss ──
+        loss_i, loss_dict = combined_loss(pred_full, inst_mask.float().to(device))
+
+        if torch.isnan(loss_i) or torch.isinf(loss_i):
+            if not first_nan_logged:
+                logger = get_logger("train_base")
+                logger.log_info("nan_diag", f"NaN/Inf in instance {i}/{N} at class_id={class_id}")
+                first_nan_logged = True
+            continue
+
+        total_loss += loss_i
+        total_focal += loss_dict["focal"]
+        total_dice += loss_dict["dice"]
+        total_pred_mean += pred_full.mean().item()
+        valid_count += 1
+
+    if valid_count == 0:
+        logger = get_logger("train_base")
+        logger.log_info("nan_diag", f"All {N} instances NaN at class_id={class_id}!")
+        return 999.0, {"loss": 999.0, "focal": 999.0, "dice": 999.0,
+                       "pred_mean": 0.0, "class_id": class_id, "n_instances": N}
+
+    loss = total_loss / valid_count
+
+    # ── NaN 诊断 + 安全跳过 | NaN Diagnostic + Safe Skip ──
     if torch.isnan(loss) or torch.isinf(loss):
         logger = get_logger("train_base")
-        logger.log_info("nan_diag", f"NaN/Inf loss at class_id={class_id}!")
-        logger.log_info("nan_diag", f"  pred_full: nan={pred_full.isnan().any().item()}, "
-                        f"range=[{pred_full.min().item():.4f}, {pred_full.max().item():.4f}]")
-        logger.log_info("nan_diag", f"  query_mask sum={query_mask.sum().item()}")
+        logger.log_info("nan_diag", f"NaN/Inf avg loss at class_id={class_id}!")
         return 999.0, {"loss": 999.0, "focal": 999.0, "dice": 999.0,
-                       "pred_mean": 0.0, "class_id": class_id}
+                       "pred_mean": 0.0, "class_id": class_id, "n_instances": N}
 
     optimizer.zero_grad()
     loss.backward()
@@ -295,16 +343,17 @@ def train_step(
     if grad_nan:
         optimizer.zero_grad()
         return 999.0, {"loss": 999.0, "focal": 999.0, "dice": 999.0,
-                       "pred_mean": 0.0, "class_id": class_id}
+                       "pred_mean": 0.0, "class_id": class_id, "n_instances": N}
 
     optimizer.step()
 
     return loss.item(), {
         "loss": loss.item(),
-        "focal": loss_dict["focal"],
-        "dice": loss_dict["dice"],
-        "pred_mean": pred_full.mean().item(),
+        "focal": total_focal / valid_count,
+        "dice": total_dice / valid_count,
+        "pred_mean": total_pred_mean / valid_count,
         "class_id": class_id,
+        "n_instances": N,
     }
 
 
@@ -810,6 +859,7 @@ def main():
         epoch_focal = []
         epoch_dice = []
         epoch_pred_mean = []
+        epoch_n_inst = []
 
         pbar = tqdm(range(args.steps_per_epoch), desc=f"Epoch {epoch:3d}/{args.epochs}", unit="step")
         for _ in pbar:
@@ -833,23 +883,25 @@ def main():
             support_imgs = torch.stack(support_imgs)   # [K, 3, H, W]
             support_masks = torch.stack(support_masks)  # [K, H, W]
 
-            # ── 加载 query tile | Load query tile ──
+            # ── 加载 query tile + Per-Instance Masks ──
+            #      Load query tile + extract per-instance masks (not union mask)
+            # v3 修复: per-instance mask 训练，弥合语义→实例分割鸿沟
+            # v3 fix: per-instance mask training bridges semantic→instance gap
             q_sample = train_ds[episode["query_index"]]
             query_img = q_sample["image"].unsqueeze(0)  # [1, 3, H, W]
-            H_q, W_q = q_sample["image"].shape[1:]
-            q_mask = torch.zeros(H_q, W_q, dtype=torch.float32)
+            q_instances = []
             for inst in q_sample["instances"]:
                 if inst["category_id"] == cls_id:
-                    q_mask = torch.logical_or(q_mask, inst["mask"]).float()
+                    q_instances.append(inst["mask"].float())
 
-            if q_mask.sum() == 0:
+            if len(q_instances) == 0:
                 continue
 
             # ── 训练一步 | Train step ──
             loss_val, metrics = train_step(
                 decoder, backbone, spm,
                 support_imgs, support_masks,
-                query_img, q_mask,
+                query_img, q_instances,
                 cls_id, optimizer, device,
                 use_spm=args.use_spm,
             )
@@ -865,12 +917,14 @@ def main():
             epoch_focal.append(metrics["focal"])
             epoch_dice.append(metrics["dice"])
             epoch_pred_mean.append(metrics["pred_mean"])
+            epoch_n_inst.append(metrics.get("n_instances", 0))
 
             if len(epoch_losses) > 0:
                 pbar.set_postfix({
                     "loss": f"{np.mean(epoch_losses[-50:]):.4f}",
                     "dice": f"{np.mean(epoch_dice[-50:]):.4f}",
                     "pred": f"{np.mean(epoch_pred_mean[-50:]):.4f}",
+                    "N": f"{metrics.get('n_instances', 0)}",
                 })
 
         # ── Epoch 汇总 | Epoch Summary ──
@@ -878,11 +932,12 @@ def main():
         avg_focal = np.mean(epoch_focal) if epoch_focal else 0.0
         avg_dice = np.mean(epoch_dice) if epoch_dice else 0.0
         avg_pred = np.mean(epoch_pred_mean) if epoch_pred_mean else 0.0
+        avg_n = np.mean(epoch_n_inst) if epoch_n_inst else 0.0
 
         logger.log_info("epoch",
             f"Epoch {epoch:3d}/{args.epochs} | "
             f"loss={avg_loss:.4f} focal={avg_focal:.4f} dice={avg_dice:.4f} "
-            f"pred_mean={avg_pred:.4f} | lr={scheduler.get_last_lr()[0]:.2e} | "
+            f"pred_mean={avg_pred:.4f} n_inst={avg_n:.1f} | lr={scheduler.get_last_lr()[0]:.2e} | "
             f"NaN={nan_skip_count}"
         )
         logger.log_metric("loss", avg_loss, step=epoch, tags=["base_train"])

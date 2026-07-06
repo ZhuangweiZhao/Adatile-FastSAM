@@ -46,7 +46,8 @@ from iSAID COCO full images.
     python tools/data/prep_isaid_instance.py                          # 全量
     python tools/data/prep_isaid_instance.py --max-images 20          # 快速测试
     python tools/data/prep_isaid_instance.py --steps 2,3              # 只切 tile + metadata
-    python tools/data/prep_isaid_instance.py --tile-size 896 --stride 512  # 默认配置
+    python tools/data/prep_isaid_instance.py --tile-size 896 --stride 640           # 默认配置
+    python tools/data/prep_isaid_instance.py --src-root data/iSAID-few --no-folds     # 处理采样子集，跳过 fold
 """
 
 import sys, argparse, json, os, io
@@ -155,7 +156,7 @@ def parse_args():
                    help="输出目录 | Output directory")
     p.add_argument("--tile-size", type=int, default=896,
                    help="Tile 尺寸 (像素) | Tile size in pixels")
-    p.add_argument("--stride", type=int, default=512,
+    p.add_argument("--stride", type=int, default=640,
                    help="滑动窗口步长 (像素) | Sliding window stride in pixels")
     p.add_argument("--max-images", type=int, default=0,
                    help="最大处理图像数 (0=全部, 调试用) | Max images (0=all)")
@@ -165,6 +166,8 @@ def parse_args():
                    help="执行步骤 | Steps: 2=tile, 3=metadata")
     p.add_argument("--workers", type=int, default=NUM_WORKERS,
                    help="并行进程数 | Number of parallel workers")
+    p.add_argument("--no-folds", action="store_true",
+                   help="跳过 Fold 定义生成，仅生成统计 | Skip fold generation, only generate stats")
     p.add_argument("--dry-run", action="store_true",
                    help="只检查不执行 | Only check, don't execute")
     return p.parse_args()
@@ -579,36 +582,40 @@ def step2_cut_tiles(args) -> dict:
 
 def step3_metadata(args) -> dict:
     """
-    Step 3: 生成 Fold 定义 JSON + per-class 统计 | Generate Fold JSON + per-class stats.
+    Step 3: 生成 per-class 统计 (+ 可选 Fold 定义) | Generate per-class stats (+ optional Fold definitions).
 
     :return: {"status": "ok"}
     """
     dst_root = Path(args.dst_root)
     splits = [s.strip() for s in args.splits.split(",")]
+    skip_folds = getattr(args, "no_folds", False)
 
     print(f"\n{'='*60}")
-    print(f"  Step 3: Generate Fold Definitions + Statistics")
+    print(f"  Step 3: Generate Statistics" + (" (no folds)" if skip_folds else " + Fold Definitions"))
     print(f"{'='*60}")
 
-    # ── 生成 Fold 定义 | Generate Fold Definitions ──
-    folds_dir = dst_root / "folds"
-    folds_dir.mkdir(parents=True, exist_ok=True)
+    # ── 生成 Fold 定义 (可选) | Generate Fold Definitions (optional) ──
+    if not skip_folds:
+        folds_dir = dst_root / "folds"
+        folds_dir.mkdir(parents=True, exist_ok=True)
 
-    for fold_id, fold_data in ISAID_INSTANCE_FOLDS.items():
-        fold_path = folds_dir / f"fold_{fold_id}.json"
-        fold_output = {
-            "fold": fold_id,
-            "base": sorted(fold_data["base"]),
-            "novel": sorted(fold_data["novel"]),
-            "base_names": {str(cid): ISAID_CATEGORIES[cid] for cid in fold_data["base"]},
-            "novel_names": {str(cid): ISAID_CATEGORIES[cid] for cid in fold_data["novel"]},
-            "n_base": len(fold_data["base"]),
-            "n_novel": len(fold_data["novel"]),
-        }
-        with open(fold_path, "w") as f:
-            json.dump(fold_output, f, indent=2, ensure_ascii=False)
-        print(f"  ✅ Fold {fold_id}: Base={fold_output['n_base']}, "
-              f"Novel={fold_output['n_novel']} → {fold_path}")
+        for fold_id, fold_data in ISAID_INSTANCE_FOLDS.items():
+            fold_path = folds_dir / f"fold_{fold_id}.json"
+            fold_output = {
+                "fold": fold_id,
+                "base": sorted(fold_data["base"]),
+                "novel": sorted(fold_data["novel"]),
+                "base_names": {str(cid): ISAID_CATEGORIES[cid] for cid in fold_data["base"]},
+                "novel_names": {str(cid): ISAID_CATEGORIES[cid] for cid in fold_data["novel"]},
+                "n_base": len(fold_data["base"]),
+                "n_novel": len(fold_data["novel"]),
+            }
+            with open(fold_path, "w") as f:
+                json.dump(fold_output, f, indent=2, ensure_ascii=False)
+            print(f"  [OK] Fold {fold_id}: Base={fold_output['n_base']}, "
+                  f"Novel={fold_output['n_novel']} -> {fold_path}")
+    else:
+        print(f"  [SKIP] Fold generation disabled (--no-folds)")
 
     # ── 统计 per-class instance/tile 分布 | Per-class instance/tile distribution ──
     stats_dir = dst_root / "stats"
@@ -673,16 +680,17 @@ def step3_metadata(args) -> dict:
             "tile_size": args.tile_size,
             "stride": args.stride,
         },
-        "folds": {
+        "categories": ISAID_CATEGORIES,
+        "splits": class_stats,
+    }
+    if not skip_folds:
+        stats_output["folds"] = {
             str(fold_id): {
                 "base": sorted(fold_data["base"]),
                 "novel": sorted(fold_data["novel"]),
             }
             for fold_id, fold_data in ISAID_INSTANCE_FOLDS.items()
-        },
-        "categories": ISAID_CATEGORIES,
-        "splits": class_stats,
-    }
+        }
     with open(stats_path, "w") as f:
         json.dump(stats_output, f, indent=2, ensure_ascii=False)
     print(f"\n  ✅ Statistics: {stats_path}")
