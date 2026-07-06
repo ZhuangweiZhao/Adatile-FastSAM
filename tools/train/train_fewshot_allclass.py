@@ -763,9 +763,6 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--episodes-per-epoch", type=int, default=200)
     parser.add_argument("--val-episodes", type=int, default=50)
-    parser.add_argument("--max-support-tiles-per-source", type=int, default=15,
-                        help="每个 support 源图最多采样的 tile 数 (提速优化, 不影响 scene diversity) | "
-                             "Max tiles sampled per support source (speed optimization)")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default=None)
@@ -1000,10 +997,7 @@ def main():
             sampled_sources = random.sample(sources, args.k_shot + 1)
             support_stems = []
             for s in sampled_sources[:args.k_shot]:
-                tiles = src_to_tiles[s]
-                if len(tiles) > args.max_support_tiles_per_source:
-                    tiles = random.sample(tiles, args.max_support_tiles_per_source)
-                support_stems.extend(tiles)  # ALL tiles per source (capped for speed)
+                support_stems.extend(src_to_tiles[s])  # ALL tiles per source
             query_stem = random.choice(src_to_tiles[sampled_sources[args.k_shot]])
 
             # ── 诊断: 前 3 个 episode 打印采样详情 | Diagnose: print first 3 episodes ──
@@ -1052,10 +1046,7 @@ def main():
                 support_srcs = ep["support_sources"][:args.k_shot]
                 val_support_stems = []
                 for s in support_srcs:
-                    tiles = src_to_tiles[s]
-                    if len(tiles) > args.max_support_tiles_per_source:
-                        tiles = random.sample(tiles, args.max_support_tiles_per_source)
-                    val_support_stems.extend(tiles)
+                    val_support_stems.extend(src_to_tiles[s])  # ALL tiles per source
                 try:
                     # ── Support: 所有 tile → prototype ──
                     support_imgs = []; support_bmasks_v = []
