@@ -207,6 +207,7 @@ def main():
     #   - Query selection is K-independent. Support from different source images.
     test_episodes = {}  # cls_id → [(support_stems, query_stem), ...]
     max_k = 10  # 预分配足够多的 support source | Reserve enough support sources for max K
+    test_eps_for_json = {}  # 用于保存到 JSON | For JSON export
     for cls_id, src_to_tiles in list(class_index.items()):
         # src_to_tiles = {source_img: [tile_stems]}
         sources = list(src_to_tiles.keys())
@@ -227,19 +228,51 @@ def main():
         # Step 2: 用主 RNG 为每个 query 采样 K 个 support (来自不同源图)
         # Sample K supports from different source images per query with main RNG
         episodes = []
+        eps_json_list = []
         for qi, (q_tile, q_src) in enumerate(zip(query_tiles, query_sources)):
             support_sources = [s for s in sources if s != q_src]
             if len(support_sources) < args.k_shot:
                 continue
-            sampled_srcs = rng.sample(support_sources, args.k_shot)
+            sampled_srcs = rng.sample(support_sources, max_k)  # Reserve max_k supports
             supports = []
-            for s in sampled_srcs:
+            for s in sampled_srcs[:args.k_shot]:
                 supports.extend(src_to_tiles[s])  # ALL tiles per source image
             episodes.append((supports, q_tile))
+            eps_json_list.append({
+                "query_source": q_src,
+                "query_tile": q_tile,
+                "support_sources": sampled_srcs,  # All max_k supports (use first K)
+            })
         test_episodes[cls_id] = episodes
+        test_eps_for_json[str(cls_id)] = eps_json_list
         name = CATEGORY_NAMES.get(cls_id, f"cls{cls_id}")
         print(f"  Class {cls_id:>2d} ({name:<18s}): {len(episodes)} test episodes "
               f"(from {len(sources)} source images)")
+
+    # ── 保存固定测试集到 JSON (Priority 5: reproducibility) ──
+    test_eps_json_path = out_dir / "fixed_test_episodes.json"
+    test_eps_config = {
+        "description": "Fixed test episodes for reproducible evaluation",
+        "seed": args.seed,
+        "k_shot": args.k_shot,
+        "max_k": max_k,
+        "checkpoint": args.checkpoint,
+        "data_root": str(data_root),
+        "data_format": data_format,
+        "eval_split": eval_split,
+        "protocol": {
+            "shot_definition": "K = number of source images (not tiles)",
+            "support": "all tiles from K source images",
+            "query": "full source image → all tiles → merge → full-image IoU",
+            "scene_overlap": "0% (support ∩ query sources = ∅)",
+            "query_independence": "Query tiles fixed by independent RNG (seed+99999) — cross-K fair",
+        },
+        "episodes": test_eps_for_json,
+    }
+    with open(test_eps_json_path, "w", encoding="utf-8") as f:
+        json.dump(test_eps_config, f, indent=2, ensure_ascii=False)
+    print(f"  [SAVED] Fixed test episodes → {test_eps_json_path}")
+    print(f"  [NOTE]  Same query tiles for all K values — cross-K comparison is fair.")
 
     # Evaluate
     print(f"\n[3/3] Evaluating (fine-tuned + zero-shot on same data)...")
@@ -390,7 +423,7 @@ def main():
         "delta_overall": round(delta_overall, 4),
         "per_class": per_class_out,
     }
-    with open(out_dir / "comparison.json", "w") as f:
+    with open(out_dir / "comparison.json", "w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2, ensure_ascii=False)
     print(f"\n  [OK] comparison.json → {out_dir}")
     print(f"{'=' * 60}")

@@ -763,6 +763,9 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--episodes-per-epoch", type=int, default=200)
     parser.add_argument("--val-episodes", type=int, default=50)
+    parser.add_argument("--max-support-tiles-per-source", type=int, default=15,
+                        help="每个 support 源图最多采样的 tile 数 (提速优化, 不影响 scene diversity) | "
+                             "Max tiles sampled per support source (speed optimization)")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default=None)
@@ -792,7 +795,7 @@ def main():
     if args.output_dir is None:
         ts = datetime.now().strftime("%m%d_%H%M")
         args.output_dir = f"runs/train_fewshot_allcls_K{args.k_shot}_{ts}"
-    out_dir = Path(args.output_dir)
+    out_dir = Path(args.output_dir).resolve()  # 绝对路径 (ultralytics torch_save wrapper 需要)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"{'=' * 60}")
@@ -860,25 +863,120 @@ def main():
     # ── 4. Training loop | 训练循环 ──
     print(f"\n[4/4] Training...")
 
-    # ── 数据统计 (论文 Experimental Setup) | Dataset statistics ──
+    # ── 数据统计 (论文 Experimental Setup / Table 1) | Dataset statistics ──
     total_sources = sum(len(v) for v in train_index.values())
     total_tiles_all = sum(sum(len(tiles) for tiles in v.values()) for v in train_index.values())
-    print(f"  Dataset stats (train):")
-    print(f"    Classes:              {len(train_index)}")
-    print(f"    Source images:        {total_sources}  (avg {total_sources/len(train_index):.0f}/class)")
-    print(f"    Tiles:                {total_tiles_all}  (avg {total_tiles_all/max(total_sources,1):.1f}/source)")
+    print(f"  ╔══════════════════════════════════════════════════════════════════════════════╗")
+    print(f"  ║  Dataset Statistics (Table 1 — paper-ready)                                 ║")
+    print(f"  ╠══════════════════════════════════════════════════════════════════════════════╣")
+    print(f"  ║  Classes:              {len(train_index):>2d}                                                ║")
+    print(f"  ║  Source images:        {total_sources:>4d}  (avg {total_sources/len(train_index):.0f}/class)                                  ║")
+    print(f"  ║  Tiles:                {total_tiles_all:>5d}  (avg {total_tiles_all/max(total_sources,1):.1f}/source)                               ║")
+    print(f"  ╠══════════════════════════════════════════════════════════════════════════════╣")
+    print(f"  ║  {'Class':<20s} {'Src':>4s} {'Tiles':>6s} {'Avg':>5s} {'Med':>5s} {'Min':>5s} {'Max':>5s} {'Kmax':>5s} ║")
+    print(f"  ╠══════════════════════════════════════════════════════════════════════════════╣")
     for cls_id in sorted(train_index.keys()):
         src_to_tiles = train_index[cls_id]
         n_src = len(src_to_tiles)
-        n_tiles = sum(len(t) for t in src_to_tiles.values())
+        tile_counts = [len(t) for t in src_to_tiles.values()]
+        n_tiles = sum(tile_counts)
         name = CATEGORY_NAMES.get(cls_id, '?')
-        k_max = n_src - 1  # max K for this class
-        print(f"      {name:<20s}: {n_src:>3d} sources, {n_tiles:>4d} tiles, max K={k_max}")
-    print(f"    Shot definition:     K = number of source images (not tiles)")
-    print(f"    Support per episode: all tiles from K source images")
-    print(f"    Query (train):       1 random tile from a different source image")
-    print(f"    Query (val):         full source image → all tiles → merge → full-image IoU")
-    print(f"    Scene overlap:       0% (support ∩ query sources = ∅)")
+        k_max = n_src - 1
+        avg_t = n_tiles / max(n_src, 1)
+        med_t = int(np.median(tile_counts))
+        min_t = min(tile_counts)
+        max_t = max(tile_counts)
+        print(f"  ║  {name:<20s} {n_src:>4d} {n_tiles:>6d} {avg_t:>5.1f} {med_t:>5d} {min_t:>5d} {max_t:>5d} {k_max:>5d} ║")
+    print(f"  ╠══════════════════════════════════════════════════════════════════════════════╣")
+    print(f"  ║  Shot definition:     K = number of source images (not tiles)               ║")
+    print(f"  ║  Support per episode: all tiles from K source images                        ║")
+    print(f"  ║  Query (train):       1 random tile from a different source image           ║")
+    print(f"  ║  Query (val):         full source image → all tiles → merge → full-image IoU║")
+    print(f"  ║  Scene overlap:       0% (support ∩ query sources = ∅)                      ║")
+    print(f"  ╚══════════════════════════════════════════════════════════════════════════════╝")
+    # ── 预采样固定验证集 (Priority 5: reproducibility) | Pre-sample fixed validation episodes ──
+    # 用独立 RNG 生成固定的 query sources，所有 K 值共享
+    # Use independent RNG for fixed query sources, shared across all K values
+    val_rng = random.Random(args.seed + 77777)  # 独立 RNG | Independent RNG
+    val_query_rng = random.Random(args.seed + 88888)  # Query 独立于 support | Query independent of support
+
+    fixed_val_episodes = {}  # cls_id → [{support_sources, query_source, query_tiles}, ...]
+    max_val_k = max(args.k_shot, 10)  # 预留足够 K | Reserve enough for max K
+    for cls_id, src_to_tiles in sorted(val_index.items()):
+        sources = list(src_to_tiles.keys())
+        if len(sources) < 2:
+            continue
+        # 每类最多预采样 per_class 个 query source | Pre-sample at most per_class query sources
+        n_val_eps = min(args.val_episodes, len(sources) - 1)
+
+        # Step 1: 固定 query source (独立 RNG) | Fix query sources with independent RNG
+        query_sources_fixed = val_query_rng.sample(sources, min(n_val_eps, len(sources)))
+
+        # Step 2: 为每个 query 采样 K 个 support (主 RNG) | Sample K supports per query (main RNG)
+        eps_for_class = []
+        for q_src in query_sources_fixed:
+            support_candidates = [s for s in sources if s != q_src]
+            if len(support_candidates) < max_val_k:
+                continue
+            sampled_supports = val_rng.sample(support_candidates, max_val_k)
+            eps_for_class.append({
+                "query_source": q_src,
+                "support_sources": sampled_supports,  # 前 K 个用于当前 K-shot | First K used for current K
+                "query_tiles": sorted(src_to_tiles[q_src]),
+            })
+        if eps_for_class:
+            fixed_val_episodes[cls_id] = eps_for_class
+            name = CATEGORY_NAMES.get(cls_id, f"cls{cls_id}")
+            print(f"  [VAL-FIXED] Class {cls_id:>2d} ({name:<18s}): "
+                  f"{len(eps_for_class)} fixed val episodes")
+
+    # 构建扁平列表用于快速采样 | Build flat list for fast sampling
+    _flat_val_eps = [
+        (cls_id, ep)
+        for cls_id, eps_list in fixed_val_episodes.items()
+        for ep in eps_list
+    ]
+    # 使用独立 RNG shuffle 确保跨 epoch 一致性 | Shuffle with dedicated RNG for consistency
+    val_sample_rng = random.Random(args.seed + 99999)
+    val_sample_rng.shuffle(_flat_val_eps)
+    print(f"  [VAL-FIXED] Total fixed val pool: {len(_flat_val_eps)} episodes across "
+          f"{len(fixed_val_episodes)} classes")
+
+    # 保存固定验证集到 JSON | Save fixed validation episodes to JSON
+    val_eps_json = {
+        "description": "Fixed validation episodes for reproducibility",
+        "seed": args.seed,
+        "k_shot": args.k_shot,
+        "max_val_k": max_val_k,
+        "data_root": str(data_root),
+        "data_format": data_format,
+        "train_split": train_split,
+        "val_split": val_split,
+        "protocol": {
+            "shot_definition": "K = number of source images (not tiles)",
+            "support": "all tiles from K source images",
+            "query": "full source image → all tiles → merge → full-image IoU",
+            "scene_overlap": "0% (support ∩ query sources = ∅)",
+        },
+        "episodes": {
+            str(cls_id): [
+                {
+                    "query_source": ep["query_source"],
+                    "support_sources": ep["support_sources"],
+                    "query_tiles": ep["query_tiles"],
+                    "n_query_tiles": len(ep["query_tiles"]),
+                }
+                for ep in eps_list
+            ]
+            for cls_id, eps_list in fixed_val_episodes.items()
+        },
+    }
+    val_eps_path = out_dir / "fixed_val_episodes.json"
+    with open(val_eps_path, "w", encoding="utf-8") as f:
+        json.dump(val_eps_json, f, indent=2, ensure_ascii=False)
+    print(f"  [SAVED] Fixed validation episodes → {val_eps_path}")
+    print(f"  [NOTE]  Same query sources for all K values — cross-K comparison is fair.")
+
     best_val_iou = 0.0
     log_entries = []
 
@@ -897,12 +995,15 @@ def main():
                 continue  # 该类的源图像不够 | Not enough source images for this class
 
             # Sample K+1 different source images
-            # Support = K 张源图的所有 tile | Support = all tiles from K source images
+            # Support = K 张源图的所有 tile (最多 max_support_tiles_per_source 个) | Support = tiles from K source images
             # Query   = 1 张 tile (来自第 K+1 张源图) | Query = 1 tile from (K+1)th source
             sampled_sources = random.sample(sources, args.k_shot + 1)
             support_stems = []
             for s in sampled_sources[:args.k_shot]:
-                support_stems.extend(src_to_tiles[s])  # ALL tiles per source
+                tiles = src_to_tiles[s]
+                if len(tiles) > args.max_support_tiles_per_source:
+                    tiles = random.sample(tiles, args.max_support_tiles_per_source)
+                support_stems.extend(tiles)  # ALL tiles per source (capped for speed)
             query_stem = random.choice(src_to_tiles[sampled_sources[args.k_shot]])
 
             # ── 诊断: 前 3 个 episode 打印采样详情 | Diagnose: print first 3 episodes ──
@@ -936,21 +1037,25 @@ def main():
 
         scheduler.step()
 
-        # 简单验证 (少量 episode) | Quick validation
+        # ── 验证: 使用固定预采样 episodes (可复现) | Validation: fixed pre-sampled episodes ──
         decoder.eval()
         val_ious = []
+        # 从固定池中取前 N 个 (循环偏移) | Take first N from fixed pool (cyclic offset)
+        val_offset = (epoch * args.val_episodes) % max(len(_flat_val_eps), 1)
+        val_batch = (_flat_val_eps[val_offset:val_offset + args.val_episodes] +
+                     _flat_val_eps[:max(0, val_offset + args.val_episodes - len(_flat_val_eps))])
         with torch.no_grad():
-            for _ in range(args.val_episodes):
-                cls_id = random.choice(list(val_index.keys()))
+            for cls_id, ep in val_batch[:args.val_episodes]:
                 src_to_tiles = val_index[cls_id]  # {source_img: [tile_stems]}
-                sources = list(src_to_tiles.keys())
-                if len(sources) < args.k_shot + 1:
-                    continue
-                sampled_sources = random.sample(sources, args.k_shot + 1)
+                q_src = ep["query_source"]
+                # 取前 K 个 support source (最多 max_support_tiles_per_source 个 tile) | Use first K support sources
+                support_srcs = ep["support_sources"][:args.k_shot]
                 val_support_stems = []
-                for s in sampled_sources[:args.k_shot]:
-                    val_support_stems.extend(src_to_tiles[s])  # ALL tiles per source
-                val_query_src = sampled_sources[args.k_shot]  # 整张源图作为 query
+                for s in support_srcs:
+                    tiles = src_to_tiles[s]
+                    if len(tiles) > args.max_support_tiles_per_source:
+                        tiles = random.sample(tiles, args.max_support_tiles_per_source)
+                    val_support_stems.extend(tiles)
                 try:
                     # ── Support: 所有 tile → prototype ──
                     support_imgs = []; support_bmasks_v = []
@@ -968,9 +1073,9 @@ def main():
                     support_tmpl = compute_support_mask_template(support_bmasks_v).to(device)
 
                     # ── Query: 整张源图 → 所有 tile → 预测 → 合并 → 全图 IoU ──
-                    if is_instance_tile:
+                    if is_instance_tile and q_src in src_to_tiles:
                         full_gt, H_full, W_full, tile_data = build_full_image_gt(
-                            val_query_src, src_to_tiles[val_query_src], val_split, data_root)
+                            q_src, src_to_tiles[q_src], val_split, data_root)
                         if H_full <= 1 and W_full <= 1:
                             continue
 
@@ -994,7 +1099,7 @@ def main():
                         val_ious.append(float(inter / max(union, 1)))
                     else:
                         # 非 instance 格式 — 降级为单 tile query | Non-instance: fallback to single tile
-                        val_query_stem = random.choice(src_to_tiles[val_query_src])
+                        val_query_stem = random.choice(src_to_tiles[q_src])
                         q_img, q_mask = load_tile_and_mask(val_query_stem, val_split, data_root) if is_tile \
                             else load_image_and_mask(val_query_stem, val_split, data_root)
                         q_feats = extract_features(model, [q_img], device)[0]
@@ -1012,7 +1117,8 @@ def main():
                     continue
 
         avg_val_iou = np.mean(val_ious) if val_ious else 0
-        print(f"  Val IoU: {avg_val_iou:.4f} (best={best_val_iou:.4f})")
+        n_val_eps_used = len(val_ious)
+        print(f"  Val IoU: {avg_val_iou:.4f} (best={best_val_iou:.4f}, n={n_val_eps_used})")
 
         log_entries.append({
             "epoch": epoch + 1, "train_loss": float(avg_loss),
@@ -1033,7 +1139,7 @@ def main():
             print(f"  [SAVED] best_model.pt (val_iou={best_val_iou:.4f})")
 
     # ── Save log | 保存日志 ──
-    with open(out_dir / "train_log.json", "w") as f:
+    with open(out_dir / "train_log.json", "w", encoding="utf-8") as f:
         json.dump({"k_shot": args.k_shot, "best_val_iou": best_val_iou,
                    "entries": log_entries}, f, indent=2, ensure_ascii=False)
 
