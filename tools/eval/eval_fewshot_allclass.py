@@ -233,7 +233,7 @@ def main():
             support_sources = [s for s in sources if s != q_src]
             if len(support_sources) < args.k_shot:
                 continue
-            sampled_srcs = rng.sample(support_sources, max_k)  # Reserve max_k supports
+            sampled_srcs = rng.sample(support_sources, min(max_k, len(support_sources)))  # Reserve max_k supports
             supports = []
             for s in sampled_srcs[:args.k_shot]:
                 supports.extend(src_to_tiles[s])  # ALL tiles per source image
