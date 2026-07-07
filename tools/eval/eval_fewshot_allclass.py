@@ -361,7 +361,7 @@ def main():
                                 q_feats = extract_features(model, [td["img"]], device)[0]
                                 p8 = q_feats.get("p8")
                                 if p8 is not None:
-                                    imp = torch.sigmoid(spm.importance_head(p8.to(device))).mean().item()
+                                    imp = torch.sigmoid(spm.importance_head(p8.to(device))).max().item()
                                 else:
                                     imp = 1.0  # fallback: keep all
                                 tile_importances.append(imp)

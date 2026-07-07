@@ -807,8 +807,8 @@ def train_episode(model, decoder, optimizer, class_id: int,
             imp_mean = torch.sigmoid(importance).mean()
             budget_target = 0.4
             budget = (imp_mean - budget_target) ** 2
-            spm_loss = bce_spm + 0.5 * budget
-            loss = loss + 0.1 * spm_loss  # λ_spm = 0.1
+            spm_loss = bce_spm + 0.1 * budget  # budget weight reduced
+            loss = loss + 0.05 * spm_loss  # λ_spm = 0.05
             loss_dict["spm_bce"] = bce_spm.item()
             loss_dict["spm_budget"] = budget.item()
             loss_dict["spm_mean"] = imp_mean.item()
