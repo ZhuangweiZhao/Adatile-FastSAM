@@ -56,6 +56,7 @@ from tools.train.train_fewshot_allclass import (
     FewShotDecoder, CATEGORY_NAMES, _resolve_paths, _normalize_mask_to_4d,
 )
 from adatile.decoder.adaptive_sparse_decoder import AdaptiveSparseDecoder
+from adatile.sparse.spm import SparsePerceptionModule
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -148,6 +149,10 @@ def main():
     parser.add_argument("--decoder", type=str, default="baseline",
                         choices=["baseline", "adaptive"],
                         help="Decoder 类型 (需与训练时一致) | Decoder type (must match training)")
+    parser.add_argument("--use-spm", action="store_true",
+                        help="启用 SPM tile routing (需与训练时一致)")
+    parser.add_argument("--spm-topk", type=float, default=0.4,
+                        help="SPM 保留的 tile 比例 | Fraction of tiles kept by SPM")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -199,7 +204,20 @@ def main():
     ckpt = torch.load(args.checkpoint, map_location=device)
     decoder.load_state_dict(ckpt["decoder"])
     decoder.eval()
-    print(f"  FastSAM frozen + {args.decoder} Decoder loaded (epoch {ckpt.get('epoch', '?')})")
+
+    # SPM (可选) | Optional SPM
+    spm = None
+    if args.use_spm:
+        spm = SparsePerceptionModule(in_channels=_p4_channels, mid_channels=256).to(device)
+        if "spm" in ckpt:
+            spm.load_state_dict(ckpt["spm"])
+            spm.eval()
+        else:
+            print("  [WARN] --use-spm set but checkpoint has no SPM weights")
+            spm = None
+
+    spm_label = " + SPM" if spm is not None else ""
+    print(f"  FastSAM frozen + {args.decoder} Decoder{spm_label} loaded (epoch {ckpt.get('epoch', '?')})")
 
     # Build test index (fixed by seed)
     print(f"\n[2/3] Building test index ({fmt_label}, seed={args.seed})...")
@@ -334,21 +352,48 @@ def main():
                     if H_full > 1 and W_full > 1:
                         predictions = []
                         zs_tile_ious = []
-                        for td in tile_data:
-                            q_feats = extract_features(model, [td["img"]], device)[0]
-                            with torch.no_grad():
-                                if args.decoder == "adaptive":
-                                    mask_s4 = decoder(q_feats["p4"], q_feats["proto"], support_proto)
-                                    mask_s4 = _normalize_mask_to_4d(mask_s4)
-                                    pred = F.interpolate(mask_s4, size=(td["h"], td["w"]),
-                                                         mode="bilinear", align_corners=False)
-                                    pred_bin_np = (pred > 0.5).float().squeeze().cpu().numpy()
+                        n_skipped = 0
+
+                        # SPM pre-scan: 预测所有 tile 的重要性 | Pre-scan tile importance
+                        tile_importances = []
+                        if spm is not None:
+                            for td in tile_data:
+                                q_feats = extract_features(model, [td["img"]], device)[0]
+                                p8 = q_feats.get("p8")
+                                if p8 is not None:
+                                    imp = torch.sigmoid(spm.importance_head(p8.to(device))).mean().item()
                                 else:
-                                    pred = decoder(q_feats["p4"], q_feats["proto"],
-                                                  support_proto, support_tmpl)
-                                    pred = F.interpolate(pred, size=(td["h"], td["w"]),
-                                                         mode="bilinear", align_corners=False)
-                                    pred_bin_np = (torch.sigmoid(pred) > 0.5).float().squeeze().cpu().numpy()
+                                    imp = 1.0  # fallback: keep all
+                                tile_importances.append(imp)
+                            # Top-K 选择 | Top-K selection
+                            n_total = len(tile_importances)
+                            n_select = max(1, int(n_total * args.spm_topk))
+                            topk_idx = set(
+                                sorted(range(n_total), key=lambda i: tile_importances[i], reverse=True)[:n_select]
+                            )
+                        else:
+                            topk_idx = set(range(len(tile_data)))  # all tiles
+
+                        for i, td in enumerate(tile_data):
+                            if spm is not None and i not in topk_idx:
+                                # 跳过低重要性 tile → 预测为零 | Skip low-importance → predict all zero
+                                pred_bin_np = np.zeros((td["h"], td["w"]), dtype=np.float32)
+                                n_skipped += 1
+                            else:
+                                q_feats = extract_features(model, [td["img"]], device)[0]
+                                with torch.no_grad():
+                                    if args.decoder == "adaptive":
+                                        mask_s4 = decoder(q_feats["p4"], q_feats["proto"], support_proto)
+                                        mask_s4 = _normalize_mask_to_4d(mask_s4)
+                                        pred = F.interpolate(mask_s4, size=(td["h"], td["w"]),
+                                                             mode="bilinear", align_corners=False)
+                                        pred_bin_np = (pred > 0.5).float().squeeze().cpu().numpy()
+                                    else:
+                                        pred = decoder(q_feats["p4"], q_feats["proto"],
+                                                      support_proto, support_tmpl)
+                                        pred = F.interpolate(pred, size=(td["h"], td["w"]),
+                                                             mode="bilinear", align_corners=False)
+                                        pred_bin_np = (torch.sigmoid(pred) > 0.5).float().squeeze().cpu().numpy()
                             predictions.append({
                                 "orig_x": td["orig_x"], "orig_y": td["orig_y"],
                                 "h": td["h"], "w": td["w"], "pred_bin": pred_bin_np,
@@ -435,6 +480,9 @@ def main():
           f"{ft_overall:>8.4f} {zs_overall:>8.4f} "
           f"{delta_overall:>+8.4f}  "
           f"{'FT wins' if delta_overall > 0 else 'ZS wins'}")
+    if spm is not None:
+        spm_keep_pct = 100 * args.spm_topk
+        print(f"  SPM: kept top {spm_keep_pct:.0f}% tiles (~{100-spm_keep_pct:.0f}% skipped)")
 
     # Save
     per_class_out = {}
