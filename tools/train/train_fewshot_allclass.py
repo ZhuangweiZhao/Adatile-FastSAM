@@ -689,6 +689,18 @@ def compute_support_prototype(support_feats: list[dict]) -> torch.Tensor:
     return F.normalize(proto, p=2, dim=-1)
 
 
+def _normalize_mask_to_4d(mask: torch.Tensor) -> torch.Tensor:
+    """将 decoder 输出统一为 [B, 1, H, W] 4D 格式 | Normalize decoder output to [B, 1, H, W]."""
+    if mask.dim() == 2:
+        return mask.unsqueeze(0).unsqueeze(0)   # [H,W] → [1,1,H,W]
+    elif mask.dim() == 3:
+        return mask.unsqueeze(1)                 # [B,H,W] → [B,1,H,W]
+    elif mask.dim() == 4:
+        return mask                              # already [B,1,H,W]
+    else:
+        raise ValueError(f"Unexpected mask dim: {mask.dim()}")
+
+
 def train_episode(model, decoder, optimizer, class_id: int,
                   support_stems: list[str], query_stem: str,
                   split: str, device: str, data_format: str = "isaid5i",
@@ -725,16 +737,16 @@ def train_episode(model, decoder, optimizer, class_id: int,
 
     if decoder_type == "adaptive":
         # ── AdaptiveSparseDecoder: proto mask 线性组合 + P4 精炼 ──
-        # No spatial template. Forward returns sigmoid mask at stride 4.
+        # No spatial template. Forward returns sigmoid mask (may be [H,W] or [1,H,W]).
         p4 = query_feats["p4"].to(device)            # [1, C, H/16, W/16]
         proto_masks = query_feats["proto"].to(device)  # [1, 32, H/4, W/4]
-        mask_s4 = decoder(p4, proto_masks, support_proto)  # [H/4, W/4] sigmoid
+        mask_s4 = decoder(p4, proto_masks, support_proto)
+        mask_s4 = _normalize_mask_to_4d(mask_s4)  # → [1, 1, H/4, W/4]
 
         # Upsample to GT resolution
         H_gt, W_gt = query_gt.shape
         mask_pred = F.interpolate(
-            mask_s4.unsqueeze(0).unsqueeze(0),  # [1, 1, H/4, W/4]
-            size=(H_gt, W_gt), mode="bilinear", align_corners=False
+            mask_s4, size=(H_gt, W_gt), mode="bilinear", align_corners=False
         ).squeeze(0).squeeze(0)  # [H_gt, W_gt]
 
         # Loss: BCE on sigmoid mask (use clamp for stability)
@@ -1130,10 +1142,10 @@ def main():
                             q_feats = extract_features(model, [td["img"]], device)[0]
                             if decoder_type == "adaptive":
                                 mask_s4 = decoder(q_feats["p4"], q_feats["proto"], support_proto)
-                                # Upsample sigmoid mask to tile resolution
+                                mask_s4 = _normalize_mask_to_4d(mask_s4)
                                 mask_tile = F.interpolate(
-                                    mask_s4.unsqueeze(0).unsqueeze(0),
-                                    size=(td["h"], td["w"]), mode="bilinear", align_corners=False
+                                    mask_s4, size=(td["h"], td["w"]),
+                                    mode="bilinear", align_corners=False
                                 ).squeeze()
                                 pred_bin_np = (mask_tile > 0.5).float().cpu().numpy()
                             else:
@@ -1161,10 +1173,11 @@ def main():
                         q_gt = semantic_mask_to_binary(q_mask, is_tile=is_tile)
                         if decoder_type == "adaptive":
                             mask_s4 = decoder(q_feats["p4"], q_feats["proto"], support_proto)
+                            mask_s4 = _normalize_mask_to_4d(mask_s4)
                             H_gt, W_gt = q_gt.shape
                             mask_tile = F.interpolate(
-                                mask_s4.unsqueeze(0).unsqueeze(0),
-                                size=(H_gt, W_gt), mode="bilinear", align_corners=False
+                                mask_s4, size=(H_gt, W_gt),
+                                mode="bilinear", align_corners=False
                             ).squeeze()
                             gt_t = torch.from_numpy(q_gt).float().to(device)
                             pred_bin = (mask_tile > 0.5).float()
