@@ -194,6 +194,24 @@ def main():
     for p in model.model.parameters():
         p.requires_grad = False
 
+    # ── 加载 checkpoint | Load checkpoint ──
+    ckpt = torch.load(args.checkpoint, map_location=device)
+
+    # ── 恢复 backbone 权重 (如果 checkpoint 包含) | Restore backbone weights ──
+    _unfreeze_layers = ckpt.get("unfreeze_layers", 0)
+    if _unfreeze_layers > 0 and "backbone" in ckpt:
+        seq = model.model.model  # Sequential[23]
+        n_total = len(seq)
+        start = max(0, n_total - _unfreeze_layers)
+        for i_str, state in ckpt["backbone"].items():
+            i = int(i_str)
+            seq[i].load_state_dict(state)
+        print(f"  Backbone: loaded {_unfreeze_layers} layers "
+              f"(indices {start}-{n_total-1}) from checkpoint")
+        # 不需要 requires_grad (eval only) | No requires_grad needed (eval only)
+    elif _unfreeze_layers > 0:
+        print(f"  [WARN] Checkpoint has unfreeze_layers={_unfreeze_layers} but no backbone weights")
+
     # Auto-detect P4 channels | 自动检测 P4 通道数
     _test_img = np.zeros((896, 896, 3), dtype=np.uint8)
     _test_feats = extract_features(model, [_test_img], device)
@@ -203,7 +221,6 @@ def main():
         decoder = AdaptiveSparseDecoder(in_channels=_p4_channels, use_fdr=False).to(device)
     else:
         decoder = FewShotDecoder(feat_dim=_p4_channels).to(device)
-    ckpt = torch.load(args.checkpoint, map_location=device)
     decoder.load_state_dict(ckpt["decoder"])
     decoder.eval()
 
@@ -218,8 +235,10 @@ def main():
             print("  [WARN] --use-spm set but checkpoint has no SPM weights")
             spm = None
 
+    bb_label = f" + BB(uf{_unfreeze_layers})" if _unfreeze_layers > 0 else ""
     spm_label = " + SPM" if spm is not None else ""
-    print(f"  FastSAM frozen + {args.decoder} Decoder{spm_label} loaded (epoch {ckpt.get('epoch', '?')})")
+    print(f"  FastSAM{bb_label} + {args.decoder} Decoder{spm_label} loaded "
+          f"(epoch {ckpt.get('epoch', '?')})")
 
     # Build test index (fixed by seed)
     print(f"\n[2/3] Building test index ({fmt_label}, seed={args.seed})...")

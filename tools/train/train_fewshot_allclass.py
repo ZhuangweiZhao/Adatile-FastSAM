@@ -559,7 +559,7 @@ def combined_loss(pred: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tenso
 # ═══════════════════════════════════════════════════════════════════
 
 def extract_features(model, images: list[np.ndarray],
-                     device: str = "cuda") -> list[dict]:
+                     device: str = "cuda", no_grad: bool = True) -> list[dict]:
     """
     提取 FastSAM backbone 特征 (hook + 正确 forward).
     Extract FastSAM backbone features via hooks + proper forward.
@@ -567,7 +567,12 @@ def extract_features(model, images: list[np.ndarray],
     Uses SegmentationModel's save list [4,6,9,12,15,18,21] for Concat.
     Hooks capture P3@15 and P4@18, then proto from P3.
 
-    :return: [{p4: [1, 1280, H/16, W/16], proto: [1, 32, H/4, W/4]}, ...]
+    :param model: FastSAM model (ultralytics).
+    :param images: List of uint8 numpy arrays [H, W, 3].
+    :param device: "cuda" or "cpu".
+    :param no_grad: If True (default), use torch.no_grad() for frozen inference.
+                    If False, allows gradients through unfrozen backbone layers.
+    :return: [{p4: [1, C, H/16, W/16], proto: [1, 32, H/4, W/4], p8: [1, C, H/32, W/32]}, ...]
     """
     feats_list = []
     seg = model.model          # SegmentationModel (handles save/Concat)
@@ -582,12 +587,12 @@ def extract_features(model, images: list[np.ndarray],
             tensor = img
         tensor = tensor.to(device)
 
-        # Register hooks
+        # Register hooks — don't detach when training through backbone
         hooked = {}
 
-        def _hook(name):
+        def _hook(name, _no_grad=no_grad):
             def _fn(m, inp, outp):
-                hooked[name] = outp.detach()
+                hooked[name] = outp.detach() if _no_grad else outp
             return _fn
 
         handles = [
@@ -597,7 +602,8 @@ def extract_features(model, images: list[np.ndarray],
         ]
 
         # Forward with correct Concat handling (matching YOLO's _predict_once)
-        with torch.no_grad():
+        ctx = torch.no_grad() if no_grad else torch.enable_grad()
+        with ctx:
             x = tensor
             y = []
             for i, m in enumerate(seq):
@@ -619,12 +625,15 @@ def extract_features(model, images: list[np.ndarray],
         if p3 is None or p4 is None:
             raise RuntimeError(f"Hook failed: p3={p3 is not None}, p4={p4 is not None}")
 
-        proto = segment.proto(p3)  # [1, 32, H/4, W/4]
+        # Proto masks: inside grad context if backbone is trainable (Segment layer 22)
+        # Proto masks need gradients if Segment head is unfrozen
+        with ctx:
+            proto = segment.proto(p3)  # [1, 32, H/4, W/4]
 
         feats_list.append({
-            "p4": p4,       # [1, 640, H/16, W/16]
+            "p4": p4,       # [1, C, H/16, W/16]
             "proto": proto,  # [1, 32, H/4, W/4]
-            "p8": p8,       # [1, 640, H/32, W/32] — SPM input
+            "p8": p8,       # [1, C, H/32, W/32] — SPM input
         })
     return feats_list
 
@@ -721,7 +730,7 @@ def train_episode(model, decoder, optimizer, class_id: int,
                   support_stems: list[str], query_stem: str,
                   split: str, device: str, data_format: str = "isaid5i",
                   data_root: Path = None, decoder_type: str = "baseline",
-                  spm=None) -> dict:
+                  spm=None, backbone_trainable: bool = False) -> dict:
     """单次 episodic 训练步 | Single episodic training step."""
     is_tile = data_format in ("isaid_tiles", "isaid_instance")
     is_instance = (data_format == "isaid_instance")
@@ -746,8 +755,10 @@ def train_episode(model, decoder, optimizer, class_id: int,
     query_gt = semantic_mask_to_binary(query_mask, is_tile=is_tile)  # [H, W] float32
 
     # Extract features
-    support_feats = extract_features(model, support_imgs, device)
-    query_feats = extract_features(model, [query_img], device)[0]
+    # Support: always frozen (no_grad=True) — support features are "inputs"
+    # Query: allow gradients if backbone is trainable
+    support_feats = extract_features(model, support_imgs, device, no_grad=True)
+    query_feats = extract_features(model, [query_img], device, no_grad=not backbone_trainable)[0]
 
     # Support prototype
     support_proto = compute_support_prototype(support_feats)  # [1, feat_dim]
@@ -864,6 +875,10 @@ def main():
                              "or adaptive (AdaptiveSparseDecoder w/o FDR)")
     parser.add_argument("--use-spm", action="store_true",
                         help="启用 SPM tile routing (P8 → Importance → Top-K)")
+    parser.add_argument("--unfreeze-layers", type=int, default=0,
+                        help="解冻 backbone 最后 N 层 (0=全冻结, 5=P4+P8+Segment, 8=完整FPN)")
+    parser.add_argument("--lr-backbone", type=float, default=None,
+                        help="Backbone 学习率 (默认 lr/10) | Backbone learning rate")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -882,7 +897,12 @@ def main():
     # ── 输出目录 | Output Dir ──
     if args.output_dir is None:
         ts = datetime.now().strftime("%m%d_%H%M")
-        args.output_dir = f"runs/train_fewshot_allcls_K{args.k_shot}_{ts}"
+        tag = args.decoder
+        if args.unfreeze_layers > 0:
+            tag += f"_uf{args.unfreeze_layers}"
+        if args.use_spm:
+            tag += "_spm"
+        args.output_dir = f"runs/train_fewshot_allcls_K{args.k_shot}_{tag}_{ts}"
     out_dir = Path(args.output_dir).resolve()  # 绝对路径 (ultralytics torch_save wrapper 需要)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -931,6 +951,31 @@ def main():
         p.requires_grad = False
     print(f"  Model frozen on {device}")
 
+    # ── 部分解冻 Backbone | Partial Backbone Unfreezing ──
+    backbone_trainable = False
+    if args.unfreeze_layers > 0:
+        backbone_trainable = True
+        seq = model.model.model  # Sequential[23]
+        n_total = len(seq)
+        start_layer = max(0, n_total - args.unfreeze_layers)
+        unfrozen_layers = []
+        unfrozen_params = 0
+        for i in range(start_layer, n_total):
+            layer = seq[i]
+            for p in layer.parameters():
+                p.requires_grad = True
+                unfrozen_params += p.numel()
+            unfrozen_layers.append(f"[{i}] {type(layer).__name__}")
+        n_frozen_params = sum(p.numel() for p in model.model.parameters() if not p.requires_grad)
+        print(f"  Backbone unfrozen: last {args.unfreeze_layers} layers "
+              f"(indices {start_layer}-{n_total-1})")
+        for l in unfrozen_layers:
+            print(f"    {l}")
+        print(f"  Trainable: {unfrozen_params/1e6:.2f}M params / "
+              f"Frozen: {n_frozen_params/1e6:.2f}M params")
+        # 保持 eval mode (YOLOv8 需要), 但 requires_grad=True 的层可训练
+        # Keep eval mode (required by YOLOv8), but layers with requires_grad=True are trainable
+
     # ── 3. Build decoder | 构建解码器 ──
     print(f"\n[3/4] Building Decoder (type={args.decoder})...")
     # 自动检测 P4 特征维度 | Auto-detect P4 feature dimension
@@ -957,11 +1002,16 @@ def main():
         spm_params = sum(p.numel() for p in spm.parameters())
         print(f"  SPM: enabled, params: {spm_params:,} ({spm_params/1e6:.3f}M)")
 
-    # ── Optimizer (decoder + optional SPM) ──
-    trainable_params = list(decoder.parameters())
+    # ── Optimizer (decoder + optional SPM + optional backbone) ──
+    lr_backbone = args.lr_backbone if args.lr_backbone is not None else args.lr * 0.1
+    param_groups = [{'params': decoder.parameters(), 'lr': args.lr}]
     if spm is not None:
-        trainable_params += list(spm.parameters())
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=1e-4)
+        param_groups.append({'params': spm.parameters(), 'lr': args.lr})
+    if backbone_trainable:
+        backbone_params = [p for p in model.model.parameters() if p.requires_grad]
+        param_groups.append({'params': backbone_params, 'lr': lr_backbone})
+        print(f"  Backbone LR: {lr_backbone} (×0.1 of decoder LR)")
+    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     # Resume
@@ -970,6 +1020,11 @@ def main():
         ckpt = torch.load(args.resume, map_location=device)
         decoder.load_state_dict(ckpt["decoder"])
         optimizer.load_state_dict(ckpt["optimizer"])
+        if backbone_trainable and "backbone" in ckpt:
+            # 恢复 backbone 权重 | Restore backbone weights
+            seq = model.model.model
+            for i, state in ckpt["backbone"].items():
+                seq[int(i)].load_state_dict(state)
         start_epoch = ckpt.get("epoch", 0)
         print(f"  Resumed from epoch {start_epoch}")
 
@@ -1132,7 +1187,8 @@ def main():
                 result = train_episode(model, decoder, optimizer, cls_id,
                                        support_stems, query_stem,
                                        train_split, device, data_format, data_root,
-                                       decoder_type=decoder_type, spm=spm)
+                                       decoder_type=decoder_type, spm=spm,
+                                       backbone_trainable=backbone_trainable)
                 for k in epoch_losses:
                     epoch_losses[k].append(result[k])
                 pbar.set_postfix(loss=f"{result['loss']:.4f}", iou=f"{result['iou']:.4f}")
@@ -1268,7 +1324,14 @@ def main():
             "epoch": epoch + 1, "decoder": decoder.state_dict(),
             "optimizer": optimizer.state_dict(), "val_iou": float(avg_val_iou),
             "k_shot": args.k_shot, "decoder_type": decoder_type,
+            "unfreeze_layers": args.unfreeze_layers,
         }
+        if backbone_trainable:
+            # 保存解冻的 backbone 层权重 | Save unfrozen backbone layer weights
+            seq = model.model.model
+            n_total = len(seq)
+            start = max(0, n_total - args.unfreeze_layers)
+            ckpt["backbone"] = {str(i): seq[i].state_dict() for i in range(start, n_total)}
         if spm is not None:
             ckpt["spm"] = spm.state_dict()
         torch.save(ckpt, out_dir / "last_model.pt")
