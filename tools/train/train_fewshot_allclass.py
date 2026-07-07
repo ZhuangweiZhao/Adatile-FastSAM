@@ -54,6 +54,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from adatile.utils.seed import set_seed
 from adatile.decoder.adaptive_sparse_decoder import AdaptiveSparseDecoder
+from adatile.sparse.spm import SparsePerceptionModule
 
 # ═══════════════════════════════════════════════════════════════════
 # ═══════════════════════════════════════════════════════════════════
@@ -592,6 +593,7 @@ def extract_features(model, images: list[np.ndarray],
         handles = [
             seq[15].register_forward_hook(_hook("p3")),
             seq[18].register_forward_hook(_hook("p4")),
+            seq[21].register_forward_hook(_hook("p8")),
         ]
 
         # Forward with correct Concat handling (matching YOLO's _predict_once)
@@ -613,14 +615,16 @@ def extract_features(model, images: list[np.ndarray],
 
         p3 = hooked.get("p3")
         p4 = hooked.get("p4")
+        p8 = hooked.get("p8")
         if p3 is None or p4 is None:
             raise RuntimeError(f"Hook failed: p3={p3 is not None}, p4={p4 is not None}")
 
         proto = segment.proto(p3)  # [1, 32, H/4, W/4]
 
         feats_list.append({
-            "p4": p4,       # [1, 1280, H/16, W/16]
+            "p4": p4,       # [1, 640, H/16, W/16]
             "proto": proto,  # [1, 32, H/4, W/4]
+            "p8": p8,       # [1, 640, H/32, W/32] — SPM input
         })
     return feats_list
 
@@ -689,6 +693,18 @@ def compute_support_prototype(support_feats: list[dict]) -> torch.Tensor:
     return F.normalize(proto, p=2, dim=-1)
 
 
+def _compute_gt_density(mask: np.ndarray, p8_h: int, p8_w: int) -> torch.Tensor:
+    """将 GT mask 池化到 P8 分辨率作为 SPM 监督信号 | Pool GT mask to P8 resolution for SPM supervision.
+
+    :param mask: [H, W] binary FG mask.
+    :param p8_h, p8_w: P8 feature map spatial size.
+    :return: [1, 1, p8_h, p8_w] FG density per cell ∈ [0, 1].
+    """
+    mask_t = torch.from_numpy(mask).float().unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+    density = F.adaptive_avg_pool2d(mask_t, (p8_h, p8_w))  # [1, 1, p8_h, p8_w]
+    return density
+
+
 def _normalize_mask_to_4d(mask: torch.Tensor) -> torch.Tensor:
     """将 decoder 输出统一为 [B, 1, H, W] 4D 格式 | Normalize decoder output to [B, 1, H, W]."""
     if mask.dim() == 2:
@@ -704,7 +720,8 @@ def _normalize_mask_to_4d(mask: torch.Tensor) -> torch.Tensor:
 def train_episode(model, decoder, optimizer, class_id: int,
                   support_stems: list[str], query_stem: str,
                   split: str, device: str, data_format: str = "isaid5i",
-                  data_root: Path = None, decoder_type: str = "baseline") -> dict:
+                  data_root: Path = None, decoder_type: str = "baseline",
+                  spm=None) -> dict:
     """单次 episodic 训练步 | Single episodic training step."""
     is_tile = data_format in ("isaid_tiles", "isaid_instance")
     is_instance = (data_format == "isaid_instance")
@@ -775,10 +792,34 @@ def train_episode(model, decoder, optimizer, class_id: int,
         gt_tensor = torch.from_numpy(query_gt).unsqueeze(0).unsqueeze(0).float().to(device)
         loss, loss_dict = combined_loss(pred, gt_tensor)
 
+    # ── SPM loss (可选) | Optional SPM loss ──
+    spm_loss = None
+    if spm is not None:
+        p8 = query_feats.get("p8")
+        if p8 is not None:
+            p8 = p8.to(device)  # [1, C, H/32, W/32]
+            importance = spm.importance_head(p8)  # [1, 1, H/32, W/32] raw logits
+            # GT density: pool query mask to P8 resolution
+            gt_density = _compute_gt_density(query_gt, importance.shape[2], importance.shape[3]).to(device)
+            # BCE loss
+            bce_spm = F.binary_cross_entropy_with_logits(importance, gt_density)
+            # Budget loss: encourage ~40% tile selection
+            imp_mean = torch.sigmoid(importance).mean()
+            budget_target = 0.4
+            budget = (imp_mean - budget_target) ** 2
+            spm_loss = bce_spm + 0.5 * budget
+            loss = loss + 0.1 * spm_loss  # λ_spm = 0.1
+            loss_dict["spm_bce"] = bce_spm.item()
+            loss_dict["spm_budget"] = budget.item()
+            loss_dict["spm_mean"] = imp_mean.item()
+
     # Backward
     optimizer.zero_grad()
     loss.backward()
-    torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
+    all_params = list(decoder.parameters())
+    if spm is not None:
+        all_params += list(spm.parameters())
+    torch.nn.utils.clip_grad_norm_(all_params, 1.0)
     optimizer.step()
 
     # IoU
@@ -821,6 +862,8 @@ def main():
                         choices=["baseline", "adaptive"],
                         help="Decoder 类型 | Decoder type: baseline (FewShotDecoder + template) "
                              "or adaptive (AdaptiveSparseDecoder w/o FDR)")
+    parser.add_argument("--use-spm", action="store_true",
+                        help="启用 SPM tile routing (P8 → Importance → Top-K)")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -906,7 +949,19 @@ def main():
     decoder = decoder.to(device)
     n_params = sum(p.numel() for p in decoder.parameters())
     print(f"  Decoder: {decoder_type}, params: {n_params:,} ({n_params/1e6:.2f}M)")
-    optimizer = torch.optim.AdamW(decoder.parameters(), lr=args.lr, weight_decay=1e-4)
+
+    # ── SPM (可选) | Optional SPM ──
+    spm = None
+    if args.use_spm:
+        spm = SparsePerceptionModule(in_channels=_p4_channels, mid_channels=256).to(device)
+        spm_params = sum(p.numel() for p in spm.parameters())
+        print(f"  SPM: enabled, params: {spm_params:,} ({spm_params/1e6:.3f}M)")
+
+    # ── Optimizer (decoder + optional SPM) ──
+    trainable_params = list(decoder.parameters())
+    if spm is not None:
+        trainable_params += list(spm.parameters())
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     # Resume
@@ -1040,7 +1095,7 @@ def main():
 
     for epoch in range(start_epoch, args.epochs):
         decoder.train()
-        epoch_losses = {"loss": [], "iou": [], "dice": [], "bce": []}
+        epoch_losses = {"loss": [], "iou": [], "dice": [], "bce": [], "spm_mean": []}
 
         pbar = tqdm(range(args.episodes_per_epoch), desc=f"Epoch {epoch + 1}/{args.epochs}",
                     unit="ep")
@@ -1077,7 +1132,7 @@ def main():
                 result = train_episode(model, decoder, optimizer, cls_id,
                                        support_stems, query_stem,
                                        train_split, device, data_format, data_root,
-                                       decoder_type=decoder_type)
+                                       decoder_type=decoder_type, spm=spm)
                 for k in epoch_losses:
                     epoch_losses[k].append(result[k])
                 pbar.set_postfix(loss=f"{result['loss']:.4f}", iou=f"{result['iou']:.4f}")
@@ -1088,8 +1143,10 @@ def main():
         # Epoch summary
         avg_loss = np.mean(epoch_losses["loss"]) if epoch_losses["loss"] else 0
         avg_iou = np.mean(epoch_losses["iou"]) if epoch_losses["iou"] else 0
+        avg_spm_mean = np.mean(epoch_losses["spm_mean"]) if epoch_losses["spm_mean"] else 0
+        spm_str = f", spm_mean={avg_spm_mean:.3f}" if spm is not None else ""
         print(f"  Epoch {epoch + 1}: loss={avg_loss:.4f}, iou={avg_iou:.4f}, "
-              f"lr={scheduler.get_last_lr()[0]:.2e}")
+              f"lr={scheduler.get_last_lr()[0]:.2e}{spm_str}")
 
         scheduler.step()
 
@@ -1210,8 +1267,10 @@ def main():
         ckpt = {
             "epoch": epoch + 1, "decoder": decoder.state_dict(),
             "optimizer": optimizer.state_dict(), "val_iou": float(avg_val_iou),
-            "k_shot": args.k_shot,
+            "k_shot": args.k_shot, "decoder_type": decoder_type,
         }
+        if spm is not None:
+            ckpt["spm"] = spm.state_dict()
         torch.save(ckpt, out_dir / "last_model.pt")
 
         if avg_val_iou > best_val_iou:
