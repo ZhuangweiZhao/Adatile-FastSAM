@@ -53,8 +53,9 @@ from tools.train.train_fewshot_allclass import (
     semantic_mask_to_binary,
     extract_features, compute_support_prototype, compute_support_mask_template,
     build_full_image_gt, merge_tile_predictions,
-    FewShotDecoder, CATEGORY_NAMES, _resolve_paths,
+    FewShotDecoder, CATEGORY_NAMES, _resolve_paths, _normalize_mask_to_4d,
 )
+from adatile.decoder.adaptive_sparse_decoder import AdaptiveSparseDecoder
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -144,6 +145,9 @@ def main():
                         help="数据格式 / Data format")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument("--decoder", type=str, default="baseline",
+                        choices=["baseline", "adaptive"],
+                        help="Decoder 类型 (需与训练时一致) | Decoder type (must match training)")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -183,11 +187,19 @@ def main():
     for p in model.model.parameters():
         p.requires_grad = False
 
-    decoder = FewShotDecoder().to(device)
+    # Auto-detect P4 channels | 自动检测 P4 通道数
+    _test_img = np.zeros((896, 896, 3), dtype=np.uint8)
+    _test_feats = extract_features(model, [_test_img], device)
+    _p4_channels = _test_feats[0]["p4"].shape[1]
+
+    if args.decoder == "adaptive":
+        decoder = AdaptiveSparseDecoder(in_channels=_p4_channels, use_fdr=False).to(device)
+    else:
+        decoder = FewShotDecoder(feat_dim=_p4_channels).to(device)
     ckpt = torch.load(args.checkpoint, map_location=device)
     decoder.load_state_dict(ckpt["decoder"])
     decoder.eval()
-    print(f"  FastSAM frozen + Decoder loaded (epoch {ckpt.get('epoch', '?')})")
+    print(f"  FastSAM frozen + {args.decoder} Decoder loaded (epoch {ckpt.get('epoch', '?')})")
 
     # Build test index (fixed by seed)
     print(f"\n[2/3] Building test index ({fmt_label}, seed={args.seed})...")
@@ -310,7 +322,10 @@ def main():
                     support_bmasks_v.append(semantic_mask_to_binary(smask, is_tile=is_tile))
                 support_feats = extract_features(model, support_imgs, device)
                 support_proto = compute_support_prototype(support_feats)
-                support_tmpl = compute_support_mask_template(support_bmasks_v).to(device)
+                if args.decoder == "adaptive":
+                    support_tmpl = None
+                else:
+                    support_tmpl = compute_support_mask_template(support_bmasks_v).to(device)
 
                 # ── FT Query: 整张源图 → 所有 tile → 预测 → 合并 → 全图 IoU ──
                 if is_instance_tile and query_src in src_to_tiles:
@@ -322,11 +337,18 @@ def main():
                         for td in tile_data:
                             q_feats = extract_features(model, [td["img"]], device)[0]
                             with torch.no_grad():
-                                pred = decoder(q_feats["p4"], q_feats["proto"],
-                                              support_proto, support_tmpl)
-                                pred = F.interpolate(pred, size=(td["h"], td["w"]),
-                                                     mode="bilinear", align_corners=False)
-                                pred_bin_np = (torch.sigmoid(pred) > 0.5).float().squeeze().cpu().numpy()
+                                if args.decoder == "adaptive":
+                                    mask_s4 = decoder(q_feats["p4"], q_feats["proto"], support_proto)
+                                    mask_s4 = _normalize_mask_to_4d(mask_s4)
+                                    pred = F.interpolate(mask_s4, size=(td["h"], td["w"]),
+                                                         mode="bilinear", align_corners=False)
+                                    pred_bin_np = (pred > 0.5).float().squeeze().cpu().numpy()
+                                else:
+                                    pred = decoder(q_feats["p4"], q_feats["proto"],
+                                                  support_proto, support_tmpl)
+                                    pred = F.interpolate(pred, size=(td["h"], td["w"]),
+                                                         mode="bilinear", align_corners=False)
+                                    pred_bin_np = (torch.sigmoid(pred) > 0.5).float().squeeze().cpu().numpy()
                             predictions.append({
                                 "orig_x": td["orig_x"], "orig_y": td["orig_y"],
                                 "h": td["h"], "w": td["w"], "pred_bin": pred_bin_np,
@@ -350,11 +372,19 @@ def main():
                     q_feats = extract_features(model, [q_img], device)[0]
                     q_gt = semantic_mask_to_binary(q_mask, is_tile=is_tile)
                     with torch.no_grad():
-                        pred = decoder(q_feats["p4"], q_feats["proto"], support_proto, support_tmpl)
-                        H_gt, W_gt = q_gt.shape
-                        pred = F.interpolate(pred, size=(H_gt, W_gt),
-                                             mode="bilinear", align_corners=False)
-                        pred_bin = (torch.sigmoid(pred) > 0.5).float()
+                        if args.decoder == "adaptive":
+                            mask_s4 = decoder(q_feats["p4"], q_feats["proto"], support_proto)
+                            mask_s4 = _normalize_mask_to_4d(mask_s4)
+                            H_gt, W_gt = q_gt.shape
+                            pred = F.interpolate(mask_s4, size=(H_gt, W_gt),
+                                                 mode="bilinear", align_corners=False)
+                            pred_bin = (pred > 0.5).float()
+                        else:
+                            pred = decoder(q_feats["p4"], q_feats["proto"], support_proto, support_tmpl)
+                            H_gt, W_gt = q_gt.shape
+                            pred = F.interpolate(pred, size=(H_gt, W_gt),
+                                                 mode="bilinear", align_corners=False)
+                            pred_bin = (torch.sigmoid(pred) > 0.5).float()
                         gt_t = torch.from_numpy(q_gt).unsqueeze(0).unsqueeze(0).float().to(device)
                         inter = (pred_bin * gt_t).sum()
                         union = (pred_bin + gt_t).clamp(0, 1).sum()
