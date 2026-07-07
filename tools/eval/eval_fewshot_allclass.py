@@ -153,6 +153,8 @@ def main():
                         help="启用 SPM tile routing (需与训练时一致)")
     parser.add_argument("--spm-topk", type=float, default=0.4,
                         help="SPM 保留的 tile 比例 | Fraction of tiles kept by SPM")
+    parser.add_argument("--spm-oracle", action="store_true",
+                        help="Oracle mode: 用 GT FG ratio 代替 SPM (验证 Top-K 效率上限)")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -354,9 +356,16 @@ def main():
                         zs_tile_ious = []
                         n_skipped = 0
 
-                        # SPM pre-scan: 预测所有 tile 的重要性 | Pre-scan tile importance
+                        # SPM / Oracle 预扫描: 计算所有 tile 的重要性 | Pre-scan tile importance
                         tile_importances = []
-                        if spm is not None:
+                        if args.spm_oracle:
+                            # Oracle: 用 GT FG ratio 排序 → 证明 Top-K 效率上限
+                            # Uses GT FG ratio → proves upper bound of Top-K efficiency
+                            for td in tile_data:
+                                fg_ratio = td["mask"].mean()  # GT FG ratio
+                                tile_importances.append(float(fg_ratio))
+                            oracle_label = "Oracle"
+                        elif spm is not None:
                             for td in tile_data:
                                 q_feats = extract_features(model, [td["img"]], device)[0]
                                 p8 = q_feats.get("p8")
@@ -365,6 +374,10 @@ def main():
                                 else:
                                     imp = 1.0  # fallback: keep all
                                 tile_importances.append(imp)
+                            oracle_label = "SPM"
+                        else:
+                            oracle_label = None
+                        if oracle_label is not None:
                             # Top-K 选择 | Top-K selection
                             n_total = len(tile_importances)
                             n_select = max(1, int(n_total * args.spm_topk))
@@ -375,7 +388,7 @@ def main():
                             topk_idx = set(range(len(tile_data)))  # all tiles
 
                         for i, td in enumerate(tile_data):
-                            if spm is not None and i not in topk_idx:
+                            if oracle_label is not None and i not in topk_idx:
                                 # 跳过低重要性 tile → 预测为零 | Skip low-importance → predict all zero
                                 pred_bin_np = np.zeros((td["h"], td["w"]), dtype=np.float32)
                                 n_skipped += 1
@@ -480,9 +493,10 @@ def main():
           f"{ft_overall:>8.4f} {zs_overall:>8.4f} "
           f"{delta_overall:>+8.4f}  "
           f"{'FT wins' if delta_overall > 0 else 'ZS wins'}")
-    if spm is not None:
+    if spm is not None or args.spm_oracle:
         spm_keep_pct = 100 * args.spm_topk
-        print(f"  SPM: kept top {spm_keep_pct:.0f}% tiles (~{100-spm_keep_pct:.0f}% skipped)")
+        mode = "Oracle (GT FG ratio)" if args.spm_oracle else "SPM"
+        print(f"  {mode}: kept top {spm_keep_pct:.0f}% tiles (~{100-spm_keep_pct:.0f}% skipped)")
 
     # Save
     per_class_out = {}
