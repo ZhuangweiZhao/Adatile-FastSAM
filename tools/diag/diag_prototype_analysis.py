@@ -594,13 +594,17 @@ def plot_proto_stability(stability_stats: dict, out_dir: Path):
     fig, ax = plt.subplots(figsize=(12, 5))
 
     cls_ids = sorted([int(k) for k in stability_stats.get("p4", {}).keys()])
-    names = [stability_stats["p4"][str(c)]["name"] for c in cls_ids]
+    # Normalize key access (can be int or str)
+    def _get(d, key):
+        return d.get(key, d.get(str(key), d.get(int(key) if isinstance(key, str) else key, {})))
+
+    names = [_get(stability_stats["p4"], c)["name"] for c in cls_ids]
 
     x = np.arange(len(cls_ids))
     width = 0.35
 
-    p4_dists = [stability_stats["p4"].get(str(c), {}).get("intra_dist", 0) for c in cls_ids]
-    p8_dists = [stability_stats["p8"].get(str(c), {}).get("intra_dist", 0) for c in cls_ids]
+    p4_dists = [_get(stability_stats["p4"], c).get("intra_dist", 0) for c in cls_ids]
+    p8_dists = [_get(stability_stats["p8"], c).get("intra_dist", 0) for c in cls_ids]
 
     bars1 = ax.bar(x - width / 2, p4_dists, width, label="P4 Prototype", color="#1f77b4", alpha=0.85)
     bars2 = ax.bar(x + width / 2, p8_dists, width, label="P8 Prototype", color="#2ca02c", alpha=0.85)
