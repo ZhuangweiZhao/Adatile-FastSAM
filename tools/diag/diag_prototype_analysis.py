@@ -92,45 +92,34 @@ def load_coeff_predictor(checkpoint: str, device: str) -> ProtoCoeffPredictor | 
     ckpt = torch.load(checkpoint, map_location=device)
     decoder_state = ckpt.get("decoder", {})
 
-    # 检测 predictor 的架构参数 | Detect predictor architecture
-    # Key path may be: coeff_predictor.0.weight (FewShotDecoder)
-    #              or: coeff_predictor.predictor.0.weight (AdaptiveSparseDecoder/AdaptiveDecoderP3P4)
-    coeff_keys = [k for k in decoder_state if "coeff_predictor" in k]
+    # ProtoCoeffPredictor uses self.mlp internally, stored as:
+    #   coeff_predictor.mlp.0.weight, coeff_predictor.mlp.2.weight, ...
+    prefix = "coeff_predictor."
+    coeff_keys = [k for k in decoder_state if k.startswith(prefix)]
     if not coeff_keys:
-        print("  [WARN] No coeff_predictor in checkpoint")
+        print("  [WARN] No coeff_predictor.* in checkpoint")
+        print(f"  Available decoder keys (first 10): {list(decoder_state.keys())[:10]}")
         return None
 
-    # Determine prefix
-    prefix = "coeff_predictor."
-    if any(k.startswith("coeff_predictor.predictor.") for k in coeff_keys):
-        prefix = "coeff_predictor.predictor."
-        print("  Detected nested predictor (AdaptiveSparseDecoder/P3P4)")
-
-    # Extract predictor sub-state
-    pred_state = {}
-    for k, v in decoder_state.items():
-        if k.startswith(prefix):
-            pred_state[k[len(prefix):]] = v
+    # Strip prefix → ProtoCoeffPredictor state dict keys
+    pred_state = {k[len(prefix):]: v for k, v in decoder_state.items()
+                  if k.startswith(prefix)}
 
     if not pred_state:
         print("  [WARN] Could not extract predictor weights")
         return None
 
-    # Infer dimensions from first linear layer
-    w0 = pred_state.get("0.weight")  # Sequential[0] Linear: [hidden, feat]
+    # Infer dimensions from mlp.0.weight [hidden, feat]
+    w0 = pred_state.get("mlp.0.weight")
     if w0 is None:
-        print("  [WARN] No 0.weight in predictor state")
+        print(f"  [WARN] No mlp.0.weight, keys: {list(pred_state.keys())[:5]}")
         return None
 
     hidden_dim, feat_dim = w0.shape
-    # Infer proto_dim from last layer
+    # Infer proto_dim from mlp.4.weight [proto_dim, hidden]
     proto_dim = 32
-    for k in pred_state:
-        if k.endswith(".weight"):
-            candidate = pred_state[k].shape[0]
-            if candidate not in (hidden_dim, feat_dim):
-                proto_dim = candidate
-                break
+    if "mlp.4.weight" in pred_state:
+        proto_dim = pred_state["mlp.4.weight"].shape[0]
 
     print(f"  CoeffPredictor: feat={feat_dim}, hidden={hidden_dim}, proto={proto_dim}")
 
