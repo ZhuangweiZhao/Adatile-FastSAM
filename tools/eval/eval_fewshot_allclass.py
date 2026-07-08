@@ -156,6 +156,9 @@ def main():
                         help="SPM 保留的 tile 比例 | Fraction of tiles kept by SPM")
     parser.add_argument("--spm-oracle", action="store_true",
                         help="Oracle mode: 用 GT FG ratio 代替 SPM (验证 Top-K 效率上限)")
+    parser.add_argument("--prototype-source", type=str, default="p4",
+                        choices=["p4", "p8"],
+                        help="Prototype 特征来源 (需与训练时一致) | Prototype source (must match training)")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -365,7 +368,8 @@ def main():
                     support_imgs.append(simg)
                     support_bmasks_v.append(semantic_mask_to_binary(smask, is_tile=is_tile))
                 support_feats = extract_features(model, support_imgs, device)
-                support_proto = compute_support_prototype(support_feats)
+                support_proto = compute_support_prototype(support_feats,
+                                                          source=args.prototype_source)
                 if args.decoder in ("adaptive", "adaptive-p3p4"):
                     support_tmpl = None
                 else:

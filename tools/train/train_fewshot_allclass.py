@@ -688,21 +688,23 @@ def compute_support_bbox(support_masks: list[np.ndarray]) -> torch.Tensor:
     return torch.tensor(avg_bbox, dtype=torch.float32).unsqueeze(0)  # [1, 4]
 
 
-def compute_support_prototype(support_feats: list[dict]) -> torch.Tensor:
+def compute_support_prototype(support_feats: list[dict],
+                              source: str = "p4") -> torch.Tensor:
     """
-    从 K 个 support 特征计算 prototype (P8 → 全局语义).
-    Compute prototype from K support features (P8 → global semantics).
+    从 K 个 support 特征计算 prototype.
+    Compute prototype from K support features.
 
-    对 P8 做 spatial average → K 个 [1280] → L2 normalize → mean → L2 normalize.
-    P8 (stride-32) 语义最强, 适合全局类别表征.
-    P8 (stride-32) has best semantics, suitable for global class identity.
+    :param support_feats: K 个 support 特征字典 | K support feature dicts.
+    :param source: 特征来源 | Feature source — "p4" (stride-16, 语义-空间平衡)
+                   or "p8" (stride-32, 全局语义).
+    :return: [1, feat_dim] L2-normalized prototype.
     """
     vectors = []
     for sf in support_feats:
-        v = sf["p8"].mean(dim=(2, 3))  # [1, 1280] — P8 global semantics
+        v = sf[source].mean(dim=(2, 3))  # spatial avg → [1, feat_dim]
         v = F.normalize(v, p=2, dim=-1)
         vectors.append(v)
-    proto = torch.stack(vectors).mean(dim=0)  # [1, 1280]
+    proto = torch.stack(vectors).mean(dim=0)  # [1, feat_dim]
     return F.normalize(proto, p=2, dim=-1)
 
 
@@ -734,7 +736,8 @@ def train_episode(model, decoder, optimizer, class_id: int,
                   support_stems: list[str], query_stem: str,
                   split: str, device: str, data_format: str = "isaid5i",
                   data_root: Path = None, decoder_type: str = "baseline",
-                  spm=None, backbone_trainable: bool = False) -> dict:
+                  spm=None, backbone_trainable: bool = False,
+                  proto_source: str = "p4") -> dict:
     """单次 episodic 训练步 | Single episodic training step."""
     is_tile = data_format in ("isaid_tiles", "isaid_instance")
     is_instance = (data_format == "isaid_instance")
@@ -764,8 +767,8 @@ def train_episode(model, decoder, optimizer, class_id: int,
     support_feats = extract_features(model, support_imgs, device, no_grad=True)
     query_feats = extract_features(model, [query_img], device, no_grad=not backbone_trainable)[0]
 
-    # Support prototype
-    support_proto = compute_support_prototype(support_feats)  # [1, feat_dim]
+    # Support prototype (source: p4 or p8)
+    support_proto = compute_support_prototype(support_feats, source=proto_source)  # [1, feat_dim]
 
     if decoder_type == "adaptive":
         # ── AdaptiveSparseDecoder: proto mask 线性组合 + P4 精炼 ──
@@ -908,6 +911,11 @@ def main():
                         help="解冻 backbone 最后 N 层 (0=全冻结, 5=P4+P8+Segment, 8=完整FPN)")
     parser.add_argument("--lr-backbone", type=float, default=None,
                         help="Backbone 学习率 (默认 lr/10) | Backbone learning rate")
+    parser.add_argument("--prototype-source", type=str, default="p4",
+                        choices=["p4", "p8"],
+                        help="Prototype 特征来源 | Prototype feature source: "
+                             "p4 (stride-16, semantic-spatial balance) / "
+                             "p8 (stride-32, global semantics)")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -931,6 +939,8 @@ def main():
             tag += f"_uf{args.unfreeze_layers}"
         if args.use_spm:
             tag += "_spm"
+        if args.prototype_source != "p4":
+            tag += f"_proto{args.prototype_source}"
         args.output_dir = f"runs/train_fewshot_allcls_K{args.k_shot}_{tag}_{ts}"
     out_dir = Path(args.output_dir).resolve()  # 绝对路径 (ultralytics torch_save wrapper 需要)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1225,7 +1235,8 @@ def main():
                                        support_stems, query_stem,
                                        train_split, device, data_format, data_root,
                                        decoder_type=decoder_type, spm=spm,
-                                       backbone_trainable=backbone_trainable)
+                                       backbone_trainable=backbone_trainable,
+                                       proto_source=args.prototype_source)
                 for k in epoch_losses:
                     epoch_losses[k].append(result[k])
                 pbar.set_postfix(loss=f"{result['loss']:.4f}", iou=f"{result['iou']:.4f}")
@@ -1275,7 +1286,8 @@ def main():
                         support_imgs.append(simg)
                         support_bmasks_v.append(semantic_mask_to_binary(smask, is_tile=is_tile))
                     support_feats = extract_features(model, support_imgs, device)
-                    support_proto = compute_support_prototype(support_feats)
+                    support_proto = compute_support_prototype(support_feats,
+                                                              source=args.prototype_source)
 
                     if decoder_type in ("adaptive", "adaptive-p3p4"):
                         # Adaptive / P3P4: no template needed
