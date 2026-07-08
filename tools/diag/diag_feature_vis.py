@@ -257,7 +257,7 @@ def plot_tsne(feats: dict[str, np.ndarray], labels: np.ndarray,
         # t-SNE
         perplexity = min(30, X.shape[0] // 4)
         tsne = TSNE(n_components=2, perplexity=perplexity, random_state=42,
-                    n_iter=1000, metric='euclidean')
+                    max_iter=1000, metric='euclidean')
         X_2d = tsne.fit_transform(X_norm)
         tsne_results[level] = X_2d
 
@@ -316,7 +316,7 @@ def plot_tsne_single_class(feats: dict[str, np.ndarray], labels: np.ndarray,
 
         perplexity = min(30, X.shape[0] // 4)
         tsne = TSNE(n_components=2, perplexity=perplexity, random_state=42,
-                    n_iter=1000, metric='euclidean')
+                    max_iter=1000, metric='euclidean')
         X_2d = tsne.fit_transform(X_norm)
 
         for target in target_classes:
