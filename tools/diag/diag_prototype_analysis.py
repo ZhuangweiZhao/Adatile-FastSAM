@@ -93,28 +93,44 @@ def load_coeff_predictor(checkpoint: str, device: str) -> ProtoCoeffPredictor | 
     decoder_state = ckpt.get("decoder", {})
 
     # 检测 predictor 的架构参数 | Detect predictor architecture
-    # coeff_predictor.0.weight shape: [hidden, feat, 1] or [hidden, feat]
-    coeff_keys = [k for k in decoder_state if k.startswith("coeff_predictor.")]
+    # Key path may be: coeff_predictor.0.weight (FewShotDecoder)
+    #              or: coeff_predictor.predictor.0.weight (AdaptiveSparseDecoder/AdaptiveDecoderP3P4)
+    coeff_keys = [k for k in decoder_state if "coeff_predictor" in k]
     if not coeff_keys:
-        # Try alternate keys for P3P4 decoder
-        print("  [WARN] No coeff_predictor in checkpoint, trying alternate keys")
+        print("  [WARN] No coeff_predictor in checkpoint")
         return None
 
-    # Infer dimensions
-    w0 = decoder_state.get("coeff_predictor.0.weight")  # Linear: [hidden, feat]
+    # Determine prefix
+    prefix = "coeff_predictor."
+    if any(k.startswith("coeff_predictor.predictor.") for k in coeff_keys):
+        prefix = "coeff_predictor.predictor."
+        print("  Detected nested predictor (AdaptiveSparseDecoder/P3P4)")
+
+    # Extract predictor sub-state
+    pred_state = {}
+    for k, v in decoder_state.items():
+        if k.startswith(prefix):
+            pred_state[k[len(prefix):]] = v
+
+    if not pred_state:
+        print("  [WARN] Could not extract predictor weights")
+        return None
+
+    # Infer dimensions from first linear layer
+    w0 = pred_state.get("0.weight")  # Sequential[0] Linear: [hidden, feat]
     if w0 is None:
+        print("  [WARN] No 0.weight in predictor state")
         return None
 
     hidden_dim, feat_dim = w0.shape
     # Infer proto_dim from last layer
-    w_last = None
-    for k in coeff_keys:
-        if k.endswith(".weight") and "predictor" not in k:
-            w_last = decoder_state[k]
-    if w_last is not None:
-        proto_dim = w_last.shape[0]
-    else:
-        proto_dim = 32
+    proto_dim = 32
+    for k in pred_state:
+        if k.endswith(".weight"):
+            candidate = pred_state[k].shape[0]
+            if candidate not in (hidden_dim, feat_dim):
+                proto_dim = candidate
+                break
 
     print(f"  CoeffPredictor: feat={feat_dim}, hidden={hidden_dim}, proto={proto_dim}")
 
@@ -122,10 +138,6 @@ def load_coeff_predictor(checkpoint: str, device: str) -> ProtoCoeffPredictor | 
         proto_dim=proto_dim, feat_dim=feat_dim, hidden_dim=hidden_dim
     ).to(device)
 
-    # Load predictor weights only
-    pred_state = {k.replace("coeff_predictor.", ""): v
-                  for k, v in decoder_state.items()
-                  if k.startswith("coeff_predictor.")}
     predictor.load_state_dict(pred_state)
     predictor.eval()
     return predictor
