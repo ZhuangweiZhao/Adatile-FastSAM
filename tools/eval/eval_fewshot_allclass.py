@@ -159,6 +159,10 @@ def main():
     parser.add_argument("--prototype-source", type=str, default="p4",
                         choices=["p4", "p8"],
                         help="Prototype 特征来源 (需与训练时一致) | Prototype source (must match training)")
+    parser.add_argument("--proto-ablation", type=str, default="none",
+                        choices=["none", "zero", "random", "shuffle"],
+                        help="Prototype 消融实验 | Prototype ablation: "
+                             "none (正常) / zero (全零) / random (随机) / shuffle (跨类交换)")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -186,6 +190,8 @@ def main():
     print(f"  Checkpoint: {args.checkpoint}")
     print(f"  Data: {data_root} (format: {fmt_label})")
     print(f"  Mode: {fmt_label} | K-shot: {args.k_shot} | Per-class: {args.per_class} | Seed: {args.seed}")
+    if args.proto_ablation != "none":
+        print(f"  Proto Ablation: {args.proto_ablation.upper()}")
     print(f"  Device: {device}")
     print(f"{'=' * 60}")
 
@@ -245,8 +251,9 @@ def main():
 
     bb_label = f" + BB(uf{_unfreeze_layers})" if _unfreeze_layers > 0 else ""
     spm_label = " + SPM" if spm is not None else ""
+    abl_label = f" [proto={args.proto_ablation}]" if args.proto_ablation != "none" else ""
     print(f"  FastSAM{bb_label} + {args.decoder} Decoder{spm_label} loaded "
-          f"(epoch {ckpt.get('epoch', '?')})")
+          f"(epoch {ckpt.get('epoch', '?')}){abl_label}")
 
     # Build test index (fixed by seed)
     print(f"\n[2/3] Building test index ({fmt_label}, seed={args.seed})...")
@@ -370,6 +377,19 @@ def main():
                 support_feats = extract_features(model, support_imgs, device)
                 support_proto = compute_support_prototype(support_feats,
                                                           source=args.prototype_source)
+
+                # ── Prototype Ablation (消融实验) ──
+                if args.proto_ablation == "zero":
+                    support_proto = torch.zeros_like(support_proto)
+                elif args.proto_ablation == "random":
+                    support_proto = F.normalize(
+                        torch.randn_like(support_proto), p=2, dim=-1)
+                elif args.proto_ablation == "shuffle":
+                    # 随机归一化向量模拟"另一个类" | Random normalized vector = "other class"
+                    shuffled = F.normalize(
+                        torch.randn_like(support_proto), p=2, dim=-1)
+                    support_proto = shuffled
+
                 if args.decoder in ("adaptive", "adaptive-p3p4"):
                     support_tmpl = None
                 else:
