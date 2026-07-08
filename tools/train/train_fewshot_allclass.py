@@ -54,6 +54,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from adatile.utils.seed import set_seed
 from adatile.decoder.adaptive_sparse_decoder import AdaptiveSparseDecoder
+from adatile.decoder.adaptive_decoder_p3p4 import AdaptiveDecoderP3P4
 from adatile.sparse.spm import SparsePerceptionModule
 
 # ═══════════════════════════════════════════════════════════════════
@@ -631,6 +632,7 @@ def extract_features(model, images: list[np.ndarray],
             proto = segment.proto(p3)  # [1, 32, H/4, W/4]
 
         feats_list.append({
+            "p3": p3,       # [1, C, H/8, W/8] — 高分辨率细节 | High-res detail
             "p4": p4,       # [1, C, H/16, W/16]
             "proto": proto,  # [1, 32, H/4, W/4]
             "p8": p8,       # [1, C, H/32, W/32] — SPM input
@@ -688,14 +690,16 @@ def compute_support_bbox(support_masks: list[np.ndarray]) -> torch.Tensor:
 
 def compute_support_prototype(support_feats: list[dict]) -> torch.Tensor:
     """
-    从 K 个 support 特征计算 prototype.
-    Compute prototype from K support features.
+    从 K 个 support 特征计算 prototype (P8 → 全局语义).
+    Compute prototype from K support features (P8 → global semantics).
 
-    对 P4 做 spatial average → K 个 [1280] → L2 normalize → mean → L2 normalize.
+    对 P8 做 spatial average → K 个 [1280] → L2 normalize → mean → L2 normalize.
+    P8 (stride-32) 语义最强, 适合全局类别表征.
+    P8 (stride-32) has best semantics, suitable for global class identity.
     """
     vectors = []
     for sf in support_feats:
-        v = sf["p4"].mean(dim=(2, 3))  # [1, 1280]
+        v = sf["p8"].mean(dim=(2, 3))  # [1, 1280] — P8 global semantics
         v = F.normalize(v, p=2, dim=-1)
         vectors.append(v)
     proto = torch.stack(vectors).mean(dim=0)  # [1, 1280]
@@ -787,6 +791,30 @@ def train_episode(model, decoder, optimizer, class_id: int,
         d_loss = 1.0 - dice
         loss = bce + d_loss
         loss_dict = {"dice": d_loss.item(), "bce": bce.item(), "total": loss.item()}
+    elif decoder_type == "adaptive-p3p4":
+        # ── AdaptiveDecoderP3P4: P8→prototype + P3→boundary + P4→main ──
+        p3 = query_feats["p3"].to(device)            # [1, C, H/8, W/8]
+        p4 = query_feats["p4"].to(device)            # [1, C, H/16, W/16]
+        proto_masks = query_feats["proto"].to(device)  # [1, 32, H/4, W/4]
+        mask_s4 = decoder(p3, p4, proto_masks, support_proto)
+        mask_s4 = _normalize_mask_to_4d(mask_s4)  # → [1, 1, H/4, W/4]
+
+        # Upsample to GT resolution
+        H_gt, W_gt = query_gt.shape
+        mask_pred = F.interpolate(
+            mask_s4, size=(H_gt, W_gt), mode="bilinear", align_corners=False
+        ).squeeze(0).squeeze(0)  # [H_gt, W_gt]
+
+        # Loss: BCE on sigmoid mask
+        gt_tensor = torch.from_numpy(query_gt).float().to(device)
+        bce = F.binary_cross_entropy(mask_pred.clamp(1e-7, 1 - 1e-7), gt_tensor)
+        # Dice on sigmoid mask
+        inter = (mask_pred * gt_tensor).sum()
+        union = mask_pred.sum() + gt_tensor.sum()
+        dice = (2.0 * inter + 1e-6) / (union + 1e-6)
+        d_loss = 1.0 - dice
+        loss = bce + d_loss
+        loss_dict = {"dice": d_loss.item(), "bce": bce.item(), "total": loss.item()}
     else:
         # ── Baseline FewShotDecoder: coeffs + spatial template + P4 refine ──
         support_template = compute_support_mask_template(support_bmasks).to(device)  # [1, 1, 64, 64]
@@ -835,7 +863,7 @@ def train_episode(model, decoder, optimizer, class_id: int,
 
     # IoU
     with torch.no_grad():
-        if decoder_type == "adaptive":
+        if decoder_type in ("adaptive", "adaptive-p3p4"):
             pred_bin = (mask_pred > 0.5).float()
             inter = (pred_bin * gt_tensor).sum()
             union = (pred_bin + gt_tensor).clamp(0, 1).sum()
@@ -870,9 +898,10 @@ def main():
                              "isaid_instance/新COCO tile")
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--decoder", type=str, default="baseline",
-                        choices=["baseline", "adaptive"],
-                        help="Decoder 类型 | Decoder type: baseline (FewShotDecoder + template) "
-                             "or adaptive (AdaptiveSparseDecoder w/o FDR)")
+                        choices=["baseline", "adaptive", "adaptive-p3p4"],
+                        help="Decoder 类型 | Decoder type: baseline (FewShotDecoder + template), "
+                             "adaptive (AdaptiveSparseDecoder P4-only), "
+                             "adaptive-p3p4 (P3+P4+P8 three-layer collaborative)")
     parser.add_argument("--use-spm", action="store_true",
                         help="启用 SPM tile routing (P8 → Importance → Top-K)")
     parser.add_argument("--unfreeze-layers", type=int, default=0,
@@ -988,6 +1017,12 @@ def main():
     if args.decoder == "adaptive":
         decoder = AdaptiveSparseDecoder(in_channels=_p4_channels, proto_dim=32, hidden_dim=256, use_fdr=False)
         decoder_type = "adaptive"
+    elif args.decoder == "adaptive-p3p4":
+        _p3_channels = _test_feats[0]["p3"].shape[1]
+        print(f"  Detected P3 channels: {_p3_channels}")
+        decoder = AdaptiveDecoderP3P4(p3_channels=_p3_channels, p4_channels=_p4_channels,
+                                       proto_dim=32, hidden_dim=256)
+        decoder_type = "adaptive-p3p4"
     else:
         decoder = FewShotDecoder(feat_dim=_p4_channels, proto_dim=32, hidden_dim=256, use_template=True)
         decoder_type = "baseline"
@@ -1150,7 +1185,9 @@ def main():
 
     for epoch in range(start_epoch, args.epochs):
         decoder.train()
-        epoch_losses = {"loss": [], "iou": [], "dice": [], "bce": [], "spm_mean": []}
+        epoch_losses = {"loss": [], "iou": [], "dice": [], "bce": []}
+        if spm is not None:
+            epoch_losses["spm_mean"] = []
 
         pbar = tqdm(range(args.episodes_per_epoch), desc=f"Epoch {epoch + 1}/{args.epochs}",
                     unit="ep")
@@ -1199,8 +1236,11 @@ def main():
         # Epoch summary
         avg_loss = np.mean(epoch_losses["loss"]) if epoch_losses["loss"] else 0
         avg_iou = np.mean(epoch_losses["iou"]) if epoch_losses["iou"] else 0
-        avg_spm_mean = np.mean(epoch_losses["spm_mean"]) if epoch_losses["spm_mean"] else 0
-        spm_str = f", spm_mean={avg_spm_mean:.3f}" if spm is not None else ""
+        if spm is not None:
+            avg_spm_mean = np.mean(epoch_losses.get("spm_mean", [])) if epoch_losses.get("spm_mean") else 0
+            spm_str = f", spm_mean={avg_spm_mean:.3f}"
+        else:
+            spm_str = ""
         print(f"  Epoch {epoch + 1}: loss={avg_loss:.4f}, iou={avg_iou:.4f}, "
               f"lr={scheduler.get_last_lr()[0]:.2e}{spm_str}")
 
@@ -1237,8 +1277,8 @@ def main():
                     support_feats = extract_features(model, support_imgs, device)
                     support_proto = compute_support_prototype(support_feats)
 
-                    if decoder_type == "adaptive":
-                        # Adaptive: no template needed, decoder expects (p4, proto_masks, support_proto)
+                    if decoder_type in ("adaptive", "adaptive-p3p4"):
+                        # Adaptive / P3P4: no template needed
                         support_tmpl = None
                     else:
                         support_tmpl = compute_support_mask_template(support_bmasks_v).to(device)
@@ -1255,6 +1295,15 @@ def main():
                             q_feats = extract_features(model, [td["img"]], device)[0]
                             if decoder_type == "adaptive":
                                 mask_s4 = decoder(q_feats["p4"], q_feats["proto"], support_proto)
+                                mask_s4 = _normalize_mask_to_4d(mask_s4)
+                                mask_tile = F.interpolate(
+                                    mask_s4, size=(td["h"], td["w"]),
+                                    mode="bilinear", align_corners=False
+                                ).squeeze()
+                                pred_bin_np = (mask_tile > 0.5).float().cpu().numpy()
+                            elif decoder_type == "adaptive-p3p4":
+                                mask_s4 = decoder(q_feats["p3"], q_feats["p4"],
+                                                  q_feats["proto"], support_proto)
                                 mask_s4 = _normalize_mask_to_4d(mask_s4)
                                 mask_tile = F.interpolate(
                                     mask_s4, size=(td["h"], td["w"]),
@@ -1286,6 +1335,20 @@ def main():
                         q_gt = semantic_mask_to_binary(q_mask, is_tile=is_tile)
                         if decoder_type == "adaptive":
                             mask_s4 = decoder(q_feats["p4"], q_feats["proto"], support_proto)
+                            mask_s4 = _normalize_mask_to_4d(mask_s4)
+                            H_gt, W_gt = q_gt.shape
+                            mask_tile = F.interpolate(
+                                mask_s4, size=(H_gt, W_gt),
+                                mode="bilinear", align_corners=False
+                            ).squeeze()
+                            gt_t = torch.from_numpy(q_gt).float().to(device)
+                            pred_bin = (mask_tile > 0.5).float()
+                            inter = (pred_bin * gt_t).sum()
+                            union = (pred_bin + gt_t).clamp(0, 1).sum()
+                            val_ious.append((inter / max(union, 1)).item())
+                        elif decoder_type == "adaptive-p3p4":
+                            mask_s4 = decoder(q_feats["p3"], q_feats["p4"],
+                                              q_feats["proto"], support_proto)
                             mask_s4 = _normalize_mask_to_4d(mask_s4)
                             H_gt, W_gt = q_gt.shape
                             mask_tile = F.interpolate(

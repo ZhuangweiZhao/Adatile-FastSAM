@@ -56,6 +56,7 @@ from tools.train.train_fewshot_allclass import (
     FewShotDecoder, CATEGORY_NAMES, _resolve_paths, _normalize_mask_to_4d,
 )
 from adatile.decoder.adaptive_sparse_decoder import AdaptiveSparseDecoder
+from adatile.decoder.adaptive_decoder_p3p4 import AdaptiveDecoderP3P4
 from adatile.sparse.spm import SparsePerceptionModule
 
 
@@ -147,7 +148,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--decoder", type=str, default="baseline",
-                        choices=["baseline", "adaptive"],
+                        choices=["baseline", "adaptive", "adaptive-p3p4"],
                         help="Decoder 类型 (需与训练时一致) | Decoder type (must match training)")
     parser.add_argument("--use-spm", action="store_true",
                         help="启用 SPM tile routing (需与训练时一致)")
@@ -219,6 +220,10 @@ def main():
 
     if args.decoder == "adaptive":
         decoder = AdaptiveSparseDecoder(in_channels=_p4_channels, use_fdr=False).to(device)
+    elif args.decoder == "adaptive-p3p4":
+        _p3_channels = _test_feats[0]["p3"].shape[1]
+        print(f"  Detected P3 channels: {_p3_channels}")
+        decoder = AdaptiveDecoderP3P4(p3_channels=_p3_channels, p4_channels=_p4_channels).to(device)
     else:
         decoder = FewShotDecoder(feat_dim=_p4_channels).to(device)
     decoder.load_state_dict(ckpt["decoder"])
@@ -361,7 +366,7 @@ def main():
                     support_bmasks_v.append(semantic_mask_to_binary(smask, is_tile=is_tile))
                 support_feats = extract_features(model, support_imgs, device)
                 support_proto = compute_support_prototype(support_feats)
-                if args.decoder == "adaptive":
+                if args.decoder in ("adaptive", "adaptive-p3p4"):
                     support_tmpl = None
                 else:
                     support_tmpl = compute_support_mask_template(support_bmasks_v).to(device)
@@ -420,6 +425,13 @@ def main():
                                         pred = F.interpolate(mask_s4, size=(td["h"], td["w"]),
                                                              mode="bilinear", align_corners=False)
                                         pred_bin_np = (pred > 0.5).float().squeeze().cpu().numpy()
+                                    elif args.decoder == "adaptive-p3p4":
+                                        mask_s4 = decoder(q_feats["p3"], q_feats["p4"],
+                                                          q_feats["proto"], support_proto)
+                                        mask_s4 = _normalize_mask_to_4d(mask_s4)
+                                        pred = F.interpolate(mask_s4, size=(td["h"], td["w"]),
+                                                             mode="bilinear", align_corners=False)
+                                        pred_bin_np = (pred > 0.5).float().squeeze().cpu().numpy()
                                     else:
                                         pred = decoder(q_feats["p4"], q_feats["proto"],
                                                       support_proto, support_tmpl)
@@ -451,6 +463,14 @@ def main():
                     with torch.no_grad():
                         if args.decoder == "adaptive":
                             mask_s4 = decoder(q_feats["p4"], q_feats["proto"], support_proto)
+                            mask_s4 = _normalize_mask_to_4d(mask_s4)
+                            H_gt, W_gt = q_gt.shape
+                            pred = F.interpolate(mask_s4, size=(H_gt, W_gt),
+                                                 mode="bilinear", align_corners=False)
+                            pred_bin = (pred > 0.5).float()
+                        elif args.decoder == "adaptive-p3p4":
+                            mask_s4 = decoder(q_feats["p3"], q_feats["p4"],
+                                              q_feats["proto"], support_proto)
                             mask_s4 = _normalize_mask_to_4d(mask_s4)
                             H_gt, W_gt = q_gt.shape
                             pred = F.interpolate(mask_s4, size=(H_gt, W_gt),
