@@ -201,15 +201,19 @@ def _build_class_index_instance(data_root: Path, split: str) -> dict[int, dict[s
         if 1 <= cat_id <= 15 and img_id in tile_stems:
             tile_classes[img_id][cat_id] += 1
 
-    # Dominant class per tile → hierarchical index
+    # 多类索引: 每个 tile 归属于它包含的所有类 (非仅主导类)
+    # Multi-class index: each tile belongs to ALL classes it contains (not just dominant)
+    # 之前的主导类索引导致稀有类 (helicopter/plane) 的 tile 被常见类 (ship/vehicle) "偷走",
+    # val split 中 helicopter 从 65 source → 8 source, plane 从 14 → 5.
+    # Previous dominant-class index caused rare-class tiles to be "stolen" by common classes.
     index: dict[int, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
     for img_id, cls_counts in tile_classes.items():
         if not cls_counts:
             continue
-        dom_cls = max(cls_counts, key=lambda k: cls_counts[k])
         stem = tile_stems[img_id]
         src = _extract_source_image(stem)
-        index[dom_cls][src].append(stem)
+        for cls_id in cls_counts.keys():  # 该 tile 中出现的所有类
+            index[cls_id][src].append(stem)
 
     return {k: {src: sorted(set(tiles)) for src, tiles in v.items()} for k, v in index.items()}
 
