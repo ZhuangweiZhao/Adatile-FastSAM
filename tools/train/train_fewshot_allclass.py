@@ -240,13 +240,22 @@ def _load_coco_index(data_root: Path, split: str) -> dict:
     return _COCO_CACHE[cache_key]
 
 
-def _render_instance_mask(anns: list, h: int, w: int) -> np.ndarray:
-    """从 COCO polygon 标注渲染二值 FG mask | Render binary FG mask from COCO polygons."""
+def _render_instance_mask(anns: list, h: int, w: int,
+                          target_class_id: int | None = None) -> np.ndarray:
+    """从 COCO polygon 标注渲染二值 FG mask | Render binary FG mask from COCO polygons.
+
+    :param anns: COCO 标注列表 | COCO annotation list.
+    :param h: 画布高度 | Canvas height.
+    :param w: 画布宽度 | Canvas width.
+    :param target_class_id: 仅渲染该类别实例 (None=全部) | Only render instances of this class (None=all).
+    """
     mask = np.zeros((h, w), dtype=np.uint8)
     for ann in anns:
         cat_id = ann.get("category_id", 0)
         if cat_id < 1 or cat_id > 15:
             continue
+        if target_class_id is not None and cat_id != target_class_id:
+            continue  # 跳过非目标类 | Skip non-target classes
         seg = ann.get("segmentation", [])
         if not seg:
             bx, by, bw, bh = [int(v) for v in ann.get("bbox", [0, 0, 0, 0])]
@@ -270,22 +279,32 @@ def _render_instance_mask(anns: list, h: int, w: int) -> np.ndarray:
 
 
 def load_tile_and_mask(stem: str, split: str = "val",
-                        data_root: Path = None) -> tuple[np.ndarray, np.ndarray]:
-    """旧 tile 格式: 加载 tile 图像 + 语义 mask."""
+                        data_root: Path = None,
+                        target_class_id: int | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """旧 tile 格式: 加载 tile 图像 + 语义 mask | Old tile format: load tile image + semantic mask.
+
+    :param target_class_id: 仅保留该类别 (None=全部) | Only keep this class (None=all).
+    """
     if data_root is None:
         data_root = Path("data/iSAID_tiles")
     img = np.array(Image.open(str(data_root / "images" / split / f"{stem}.png")).convert("RGB"))
     mask_path = data_root / "masks" / split / f"{stem}.png"
     if mask_path.exists():
         mask = np.array(Image.open(str(mask_path)))
+        if target_class_id is not None:
+            mask = (mask == target_class_id).astype(np.uint8)
     else:
         mask = np.zeros(img.shape[:2], dtype=np.uint8)
     return img, mask
 
 
 def load_instance_tile_and_mask(stem: str, split: str,
-                                  data_root: Path) -> tuple[np.ndarray, np.ndarray]:
-    """新 COCO tile 格式: 加载 tile 图像 + 从 COCO 渲染 mask."""
+                                  data_root: Path,
+                                  target_class_id: int | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """新 COCO tile 格式: 加载 tile 图像 + 从 COCO 渲染 mask | New COCO tile format: load image + render mask.
+
+    :param target_class_id: 仅渲染该类别实例 (None=全部) | Only render instances of this class (None=all).
+    """
     img = np.array(Image.open(str(data_root / "images" / split / f"{stem}.png")).convert("RGB"))
     H, W = img.shape[:2]
 
@@ -295,7 +314,7 @@ def load_instance_tile_and_mask(stem: str, split: str,
     anns = file_to_anns.get(f"{stem}.png", [])
 
     if anns:
-        mask = _render_instance_mask(anns, H, W)
+        mask = _render_instance_mask(anns, H, W, target_class_id=target_class_id)
     else:
         mask = np.zeros((H, W), dtype=np.uint8)
 
@@ -352,7 +371,8 @@ def _get_tile_offsets(data_root: Path, split: str) -> dict:
 
 
 def build_full_image_gt(source_img: str, tile_stems: list[str],
-                        split: str, data_root: Path) -> tuple[np.ndarray, int, int, list[dict]]:
+                        split: str, data_root: Path,
+                        target_class_id: int | None = None) -> tuple[np.ndarray, int, int, list[dict]]:
     """为一张源图构建全图 GT mask | Build full-image GT mask for a source image.
 
     将所有 tile 的 GT mask 按 orig_x/orig_y 拼回全图。
@@ -362,6 +382,7 @@ def build_full_image_gt(source_img: str, tile_stems: list[str],
     :param tile_stems: 该源图的所有 tile stem | All tile stems for this source
     :param split:      数据划分 | Data split
     :param data_root:  数据根目录 | Data root
+    :param target_class_id: 仅渲染该类别实例 (None=全部) | Only render instances of this class (None=all).
     :return: (full_gt, H_full, W_full, tile_data)
         - full_gt:    [H_full, W_full] uint8 binary mask
         - H_full, W_full: 全图尺寸 | Full image dimensions
@@ -380,7 +401,7 @@ def build_full_image_gt(source_img: str, tile_stems: list[str],
         max_x = max(max_x, ox + tw)
         max_y = max(max_y, oy + th)
 
-        img, mask = load_instance_tile_and_mask(stem, split, data_root)
+        img, mask = load_instance_tile_and_mask(stem, split, data_root, target_class_id=target_class_id)
         gt_bin = semantic_mask_to_binary(mask, is_tile=True)
         tile_data.append({
             "stem": stem, "img": img, "mask": gt_bin,
@@ -745,9 +766,9 @@ def train_episode(model, decoder, optimizer, class_id: int,
 
     def _load(stem):
         if is_instance:
-            return load_instance_tile_and_mask(stem, split, data_root)
+            return load_instance_tile_and_mask(stem, split, data_root, target_class_id=class_id)
         elif is_tile:
-            return load_tile_and_mask(stem, split, data_root)
+            return load_tile_and_mask(stem, split, data_root, target_class_id=class_id)
         else:
             return load_image_and_mask(stem, split, data_root)
 
@@ -759,7 +780,21 @@ def train_episode(model, decoder, optimizer, class_id: int,
         support_bmasks.append(semantic_mask_to_binary(mask, is_tile=is_tile))
 
     # Load query
-    query_img, query_mask = _load(query_stem)
+    # SCACS协议: Pure decoder 无 class conditioning → GT 应包含全部实例
+    # SCACS protocol: Pure decoder has no class conditioning → GT contains all instances
+    # Adaptive decoder 有 prototype conditioning → GT 仅含 target class 实例
+    # Adaptive decoder has prototype conditioning → GT only target class instances
+    if decoder_type in ("pure", "pure-p3p4"):
+        # Pure decoder: 无法区分类别, GT=全部可见实例 | Cannot distinguish classes, GT=all FG
+        if is_instance:
+            query_img, query_mask = load_instance_tile_and_mask(query_stem, split, data_root, target_class_id=None)
+        elif is_tile:
+            query_img, query_mask = load_tile_and_mask(query_stem, split, data_root, target_class_id=None)
+        else:
+            query_img, query_mask = load_image_and_mask(query_stem, split, data_root)
+    else:
+        # Adaptive decoder: 类条件, GT=仅 target class | Class-conditioned, GT=target class only
+        query_img, query_mask = _load(query_stem)
     query_gt = semantic_mask_to_binary(query_mask, is_tile=is_tile)  # [H, W] float32
 
     # Extract features
@@ -1294,8 +1329,13 @@ def main():
         scheduler.step()
 
         # ── 验证: 使用固定预采样 episodes (可复现) | Validation: fixed pre-sampled episodes ──
+        # SCACS 协议: per-class IoU → 15 类平均 → 真正 mIoU (非 episode 平均)
+        # SCACS protocol: per-class IoU → 15-class mean → true mIoU (not episode average)
         decoder.eval()
-        val_ious = []
+        is_pure_decoder = decoder_type in ("pure", "pure-p3p4")
+        val_class_inter = defaultdict(float)   # cls_id → intersection sum (adaptive decoder only)
+        val_class_union = defaultdict(float)   # cls_id → union sum (adaptive decoder only)
+        val_ious_flat = []                     # flat IoU list (pure decoder: no class conditioning)
         # 从固定池中取前 N 个 (循环偏移) | Take first N from fixed pool (cyclic offset)
         val_offset = (epoch * args.val_episodes) % max(len(_flat_val_eps), 1)
         val_batch = (_flat_val_eps[val_offset:val_offset + args.val_episodes] +
@@ -1314,9 +1354,9 @@ def main():
                     support_imgs = []; support_bmasks_v = []
                     for s in val_support_stems:
                         if is_instance_tile:
-                            simg, smask = load_instance_tile_and_mask(s, val_split, data_root)
+                            simg, smask = load_instance_tile_and_mask(s, val_split, data_root, target_class_id=cls_id)
                         elif is_tile:
-                            simg, smask = load_tile_and_mask(s, val_split, data_root)
+                            simg, smask = load_tile_and_mask(s, val_split, data_root, target_class_id=cls_id)
                         else:
                             simg, smask = load_image_and_mask(s, val_split, data_root)
                         support_imgs.append(simg)
@@ -1333,8 +1373,13 @@ def main():
 
                     # ── Query: 整张源图 → 所有 tile → 预测 → 合并 → 全图 IoU ──
                     if is_instance_tile and q_src in src_to_tiles:
+                        # Pure decoder: 无 class conditioning → GT=全部实例
+                        # Pure decoder: no class conditioning → GT=all instances
+                        # Adaptive decoder: 有 prototype conditioning → GT=仅 target class
+                        # Adaptive decoder: has prototype conditioning → GT=target class only
+                        _val_gt_cls = None if is_pure_decoder else cls_id
                         full_gt, H_full, W_full, tile_data = build_full_image_gt(
-                            q_src, src_to_tiles[q_src], val_split, data_root)
+                            q_src, src_to_tiles[q_src], val_split, data_root, target_class_id=_val_gt_cls)
                         if H_full <= 1 and W_full <= 1:
                             continue
 
@@ -1387,14 +1432,29 @@ def main():
 
                         full_pred = merge_tile_predictions(predictions, H_full, W_full)
                         full_pred_bin = (full_pred > 0.5).astype(np.float32)
-                        inter = (full_pred_bin * full_gt.astype(np.float32)).sum()
-                        union = (full_pred_bin + full_gt.astype(np.float32)).clip(0, 1).sum()
-                        val_ious.append(float(inter / max(union, 1)))
+                        gt_float = full_gt.astype(np.float32)
+                        inter = float((full_pred_bin * gt_float).sum())
+                        union = float((full_pred_bin + gt_float).clip(0, 1).sum())
+                        iou_val = inter / max(union, 1)
+                        # SCACS: adaptive→per-class 累积, pure→flat list (无 class conditioning)
+                        # SCACS: adaptive→per-class accumulation, pure→flat list (no class conditioning)
+                        if is_pure_decoder:
+                            val_ious_flat.append(iou_val)
+                        else:
+                            val_class_inter[cls_id] += inter
+                            val_class_union[cls_id] += union
                     else:
                         # 非 instance 格式 — 降级为单 tile query | Non-instance: fallback to single tile
                         val_query_stem = random.choice(src_to_tiles[q_src])
-                        q_img, q_mask = load_tile_and_mask(val_query_stem, val_split, data_root) if is_tile \
-                            else load_image_and_mask(val_query_stem, val_split, data_root)
+                        # Pure decoder: 无 class conditioning → GT=全部实例
+                        # Pure decoder: no class conditioning → GT=all instances
+                        _val_gt_cls = None if is_pure_decoder else cls_id
+                        if is_instance_tile:
+                            q_img, q_mask = load_instance_tile_and_mask(val_query_stem, val_split, data_root, target_class_id=_val_gt_cls)
+                        elif is_tile:
+                            q_img, q_mask = load_tile_and_mask(val_query_stem, val_split, data_root, target_class_id=_val_gt_cls)
+                        else:
+                            q_img, q_mask = load_image_and_mask(val_query_stem, val_split, data_root)
                         q_feats = extract_features(model, [q_img], device)[0]
                         q_gt = semantic_mask_to_binary(q_mask, is_tile=is_tile)
                         if decoder_type == "adaptive":
@@ -1407,9 +1467,9 @@ def main():
                             ).squeeze()
                             gt_t = torch.from_numpy(q_gt).float().to(device)
                             pred_bin = (mask_tile > 0.5).float()
-                            inter = (pred_bin * gt_t).sum()
-                            union = (pred_bin + gt_t).clamp(0, 1).sum()
-                            val_ious.append((inter / max(union, 1)).item())
+                            inter = float((pred_bin * gt_t).sum().item())
+                            union = float((pred_bin + gt_t).clamp(0, 1).sum().item())
+                            iou_val = inter / max(union, 1)
                         elif decoder_type == "adaptive-p3p4":
                             mask_s4 = decoder(q_feats["p3"], q_feats["p4"],
                                               q_feats["proto"], support_proto)
@@ -1421,9 +1481,9 @@ def main():
                             ).squeeze()
                             gt_t = torch.from_numpy(q_gt).float().to(device)
                             pred_bin = (mask_tile > 0.5).float()
-                            inter = (pred_bin * gt_t).sum()
-                            union = (pred_bin + gt_t).clamp(0, 1).sum()
-                            val_ious.append((inter / max(union, 1)).item())
+                            inter = float((pred_bin * gt_t).sum().item())
+                            union = float((pred_bin + gt_t).clamp(0, 1).sum().item())
+                            iou_val = inter / max(union, 1)
                         elif decoder_type == "pure":
                             mask_s4 = decoder(q_feats["p4"])
                             mask_s4 = _normalize_mask_to_4d(mask_s4)
@@ -1434,9 +1494,9 @@ def main():
                             ).squeeze()
                             gt_t = torch.from_numpy(q_gt).float().to(device)
                             pred_bin = (mask_tile > 0.5).float()
-                            inter = (pred_bin * gt_t).sum()
-                            union = (pred_bin + gt_t).clamp(0, 1).sum()
-                            val_ious.append((inter / max(union, 1)).item())
+                            inter = float((pred_bin * gt_t).sum().item())
+                            union = float((pred_bin + gt_t).clamp(0, 1).sum().item())
+                            iou_val = inter / max(union, 1)
                         elif decoder_type == "pure-p3p4":
                             mask_s4 = decoder(q_feats["p3"], q_feats["p4"])
                             mask_s4 = _normalize_mask_to_4d(mask_s4)
@@ -1447,9 +1507,9 @@ def main():
                             ).squeeze()
                             gt_t = torch.from_numpy(q_gt).float().to(device)
                             pred_bin = (mask_tile > 0.5).float()
-                            inter = (pred_bin * gt_t).sum()
-                            union = (pred_bin + gt_t).clamp(0, 1).sum()
-                            val_ious.append((inter / max(union, 1)).item())
+                            inter = float((pred_bin * gt_t).sum().item())
+                            union = float((pred_bin + gt_t).clamp(0, 1).sum().item())
+                            iou_val = inter / max(union, 1)
                         else:
                             pred = decoder(q_feats["p4"], q_feats["proto"], support_proto, support_tmpl)
                             H_gt, W_gt = q_gt.shape
@@ -1457,20 +1517,64 @@ def main():
                                                  mode="bilinear", align_corners=False)
                             gt_t = torch.from_numpy(q_gt).unsqueeze(0).unsqueeze(0).float().to(device)
                             pred_bin = (torch.sigmoid(pred) > 0.5).float()
-                            inter = (pred_bin * gt_t).sum()
-                            union = (pred_bin + gt_t).clamp(0, 1).sum()
-                            val_ious.append((inter / max(union, 1)).item())
+                            inter = float((pred_bin * gt_t).sum().item())
+                            union = float((pred_bin + gt_t).clamp(0, 1).sum().item())
+                            iou_val = inter / max(union, 1)
+                        # SCACS: adaptive→per-class 累积, pure→flat list
+                        # SCACS: adaptive→per-class accumulation, pure→flat list
+                        if is_pure_decoder:
+                            val_ious_flat.append(iou_val)
+                        else:
+                            val_class_inter[cls_id] += inter
+                            val_class_union[cls_id] += union
                 except Exception:
                     continue
 
-        avg_val_iou = np.mean(val_ious) if val_ious else 0
-        n_val_eps_used = len(val_ious)
-        print(f"  Val IoU: {avg_val_iou:.4f} (best={best_val_iou:.4f}, n={n_val_eps_used})")
+        # ── SCACS: per-class IoU → 15 类平均 → 真正 mIoU ──
+        # SCACS protocol: per-class IoU → 15-class mean → true mIoU
+        # Pure decoder: 无 class conditioning → flat IoU 平均 (非 per-class)
+        # Pure decoder: no class conditioning → flat IoU mean (not per-class)
+        if is_pure_decoder:
+            avg_val_iou = float(np.mean(val_ious_flat)) if val_ious_flat else 0.0
+            n_eps_used = len(val_ious_flat)
+            per_class_iou = {}
+            print(f"  Val IoU: {avg_val_iou:.4f} (best={best_val_iou:.4f}, "
+                  f"n_eps={n_eps_used}, no per-class breakdown for pure decoder)")
+            log_entries.append({
+                "epoch": epoch + 1, "train_loss": float(avg_loss),
+                "train_iou": float(avg_iou), "val_iou": float(avg_val_iou),
+                "val_n_eps": n_eps_used, "decoder_type": decoder_type,
+            })
+        else:
+            per_class_iou = {}
+            for cls_id in sorted(set(list(val_class_inter.keys()) + list(val_class_union.keys()))):
+                u = val_class_union[cls_id]
+                if u > 0:
+                    per_class_iou[cls_id] = val_class_inter[cls_id] / u
+                else:
+                    per_class_iou[cls_id] = 0.0
 
-        log_entries.append({
-            "epoch": epoch + 1, "train_loss": float(avg_loss),
-            "train_iou": float(avg_iou), "val_iou": float(avg_val_iou),
-        })
+            valid_ious = [v for v in per_class_iou.values() if v > 0]
+            avg_val_iou = np.mean(valid_ious) if valid_ious else 0.0
+            n_classes_eval = len(valid_ious)
+            n_eps_used = sum(1 for u in val_class_union.values() if u > 0)
+
+            # 打印 per-class IoU 分解 | Print per-class IoU breakdown
+            cls_short_str = ", ".join(
+                f"{CATEGORY_NAMES.get(c, f'c{c}')}={per_class_iou[c]:.3f}"
+                for c in sorted(per_class_iou.keys())
+            )
+            print(f"  Val mIoU: {avg_val_iou:.4f} (best={best_val_iou:.4f}, "
+                  f"n_classes={n_classes_eval}/{len(per_class_iou)}, n_eps={n_eps_used})")
+            if cls_short_str:
+                print(f"    Per-class: {cls_short_str}")
+
+            log_entries.append({
+                "epoch": epoch + 1, "train_loss": float(avg_loss),
+                "train_iou": float(avg_iou), "val_miou": float(avg_val_iou),
+                "val_per_class_iou": {str(k): round(v, 4) for k, v in per_class_iou.items()},
+                "val_n_classes": n_classes_eval,
+            })
 
         # Save checkpoint
         ckpt = {
@@ -1492,16 +1596,16 @@ def main():
         if avg_val_iou > best_val_iou:
             best_val_iou = avg_val_iou
             torch.save(ckpt, out_dir / "best_model.pt")
-            print(f"  [SAVED] best_model.pt (val_iou={best_val_iou:.4f})")
+            print(f"  [SAVED] best_model.pt (val_mIoU={best_val_iou:.4f})")
 
     # ── Save log | 保存日志 ──
     with open(out_dir / "train_log.json", "w", encoding="utf-8") as f:
-        json.dump({"k_shot": args.k_shot, "best_val_iou": best_val_iou,
+        json.dump({"k_shot": args.k_shot, "best_val_miou": best_val_iou,
                    "entries": log_entries}, f, indent=2, ensure_ascii=False)
 
     print(f"\n{'=' * 60}")
     print(f"  Training complete!")
-    print(f"  Best val IoU: {best_val_iou:.4f}")
+    print(f"  Best val mIoU: {best_val_iou:.4f}")
     print(f"  Output: {out_dir}")
     print(f"  To evaluate: python tools/eval/eval_fastsam_prompted.py "
           f"--all-classes --per-class 5 --mode bbox --diagnose --device cuda")

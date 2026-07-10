@@ -86,12 +86,24 @@ class SupervisedTileDataset(torch.utils.data.Dataset):
 
     每个 tile:
         - image: [3, H, W] float32 [0, 1]
-        - mask:  [H, W] float32 binary FG mask (所有可见类实例 → FG=1)
+        - mask:  [H, W] float32 binary FG mask
         - dominant_class: int, 面积最大的类别 ID
+
+    Parameters
+    ----------
+    fewshot_dataset : ISAIDInstanceFewShotDataset
+        底层数据集 | Underlying dataset.
+    target_class_only : bool
+        True → GT mask 仅包含主导类实例 (SCACS 协议: Pred(target) vs GT(target)).
+        True → GT mask only contains dominant class instances (SCACS protocol).
+        False → GT mask 包含全部可见类实例 (pure decoder 用).
+        False → GT mask contains all visible class instances (for pure decoder).
     """
 
-    def __init__(self, fewshot_dataset: ISAIDInstanceFewShotDataset):
+    def __init__(self, fewshot_dataset: ISAIDInstanceFewShotDataset,
+                 target_class_only: bool = False):
         self._ds = fewshot_dataset
+        self._target_class_only = target_class_only
 
     def __len__(self) -> int:
         return len(self._ds)
@@ -103,20 +115,28 @@ class SupervisedTileDataset(torch.utils.data.Dataset):
 
         H, W = image.shape[1], image.shape[2]
 
-        # ── 合并所有实例为 binary FG mask | Merge all instances → binary FG mask ──
-        mask = np.zeros((H, W), dtype=np.float32)
+        # ── 计算主导类别 (最大面积) | Compute dominant class (largest area) ──
         dominant_class = 0
         max_area = 0.0
-
         for inst in instances:
-            inst_mask = inst["mask"].numpy().astype(np.float32)  # [H, W] bool → float32
-            mask = np.maximum(mask, inst_mask)
-
-            # 追踪主导类别 | Track dominant class
             area = inst["area"]
             if area > max_area:
                 max_area = area
                 dominant_class = inst["category_id"]
+
+        # ── 渲染 GT mask | Render GT mask ──
+        # SCACS 协议: target_class_only=True → 仅主导类实例 → FG=1
+        # SCACS protocol: target_class_only=True → only dominant class instances → FG=1
+        # Pure decoder: target_class_only=False → 全部可见类实例 → FG=1
+        # Pure decoder: target_class_only=False → all visible class instances → FG=1
+        mask = np.zeros((H, W), dtype=np.float32)
+        for inst in instances:
+            # 类过滤: 当 target_class_only=True 时跳过非主导类
+            # Class filter: skip non-dominant classes when target_class_only=True
+            if self._target_class_only and inst["category_id"] != dominant_class:
+                continue
+            inst_mask = inst["mask"].numpy().astype(np.float32)  # [H, W] bool → float32
+            mask = np.maximum(mask, inst_mask)
 
         # ── BG tile (无实例) → dominant_class=0, mask 全零 ──
         mask_tensor = torch.from_numpy(mask).float()  # [H, W]
@@ -483,11 +503,18 @@ def main():
         mode="all",
     )
 
-    train_dataset = SupervisedTileDataset(train_ds)
-    val_dataset = SupervisedTileDataset(val_ds)
+    # SCACS 协议: adaptive decoder → GT 仅包含 target class 实例
+    # SCACS protocol: adaptive decoder → GT only contains target class instances
+    # Pure decoder (无 class conditioning) → GT 包含全部实例
+    # Pure decoder (no class conditioning) → GT contains all instances
+    _target_cls_only = needs_prototype  # True for adaptive/adaptive-p3p4, False for pure/pure-p3p4
+    train_dataset = SupervisedTileDataset(train_ds, target_class_only=_target_cls_only)
+    val_dataset = SupervisedTileDataset(val_ds, target_class_only=_target_cls_only)
 
-    print(f"  Train: {len(train_dataset)} tiles across {len(train_ds.get_visible_classes())} classes")
-    print(f"  Val:   {len(val_dataset)} tiles across {len(val_ds.get_visible_classes())} classes")
+    print(f"  Train: {len(train_dataset)} tiles across {len(train_ds.get_visible_classes())} classes"
+          f" (target_class_only={_target_cls_only})")
+    print(f"  Val:   {len(val_dataset)} tiles across {len(val_ds.get_visible_classes())} classes"
+          f" (target_class_only={_target_cls_only})")
 
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
@@ -777,6 +804,10 @@ def main():
             "val_miou": val_miou,
             "lr": lr_now,
         }
+        if val_miou > 0 and val_result:
+            log_entry["val_per_class_iou"] = {
+                str(k): round(v, 4) for k, v in val_result["per_class_iou"].items()
+            }
         train_log.append(log_entry)
         with open(log_path, "w") as f:
             json.dump(train_log, f, indent=2)

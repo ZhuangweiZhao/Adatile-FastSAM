@@ -374,9 +374,9 @@ def main():
                 support_imgs, support_bmasks_v = [], []
                 for s in support_stems:
                     if is_instance_tile:
-                        simg, smask = load_instance_tile_and_mask(s, eval_split, data_root)
+                        simg, smask = load_instance_tile_and_mask(s, eval_split, data_root, target_class_id=cls_id)
                     elif is_tile:
-                        simg, smask = load_tile_and_mask(s, eval_split, data_root)
+                        simg, smask = load_tile_and_mask(s, eval_split, data_root, target_class_id=cls_id)
                     else:
                         simg, smask = load_image_and_mask(s, eval_split, data_root)
                     support_imgs.append(simg)
@@ -404,8 +404,11 @@ def main():
 
                 # ── FT Query: 整张源图 → 所有 tile → 预测 → 合并 → 全图 IoU ──
                 if is_instance_tile and query_src in src_to_tiles:
+                    # Pure decoder: 无 class conditioning → GT=全部实例
+                    # Pure decoder: no class conditioning → GT=all instances
+                    _eval_gt_cls = None if args.decoder in ("pure", "pure-p3p4") else cls_id
                     full_gt, H_full, W_full, tile_data = build_full_image_gt(
-                        query_src, src_to_tiles[query_src], eval_split, data_root)
+                        query_src, src_to_tiles[query_src], eval_split, data_root, target_class_id=_eval_gt_cls)
                     if H_full > 1 and W_full > 1:
                         predictions = []
                         zs_tile_ious = []
@@ -497,10 +500,14 @@ def main():
                         zs_iou = float(np.mean(zs_tile_ious)) if zs_tile_ious else 0.0
                 else:
                     # Fallback: single tile query
-                    q_img, q_mask = load_instance_tile_and_mask(query_tile, eval_split, data_root) \
-                        if is_instance_tile else (
-                        load_tile_and_mask(query_tile, eval_split, data_root) if is_tile
-                        else load_image_and_mask(query_tile, eval_split, data_root))
+                    # Pure decoder: 无 class conditioning → GT=全部实例
+                    _eval_gt_cls = None if args.decoder in ("pure", "pure-p3p4") else cls_id
+                    if is_instance_tile:
+                        q_img, q_mask = load_instance_tile_and_mask(query_tile, eval_split, data_root, target_class_id=_eval_gt_cls)
+                    elif is_tile:
+                        q_img, q_mask = load_tile_and_mask(query_tile, eval_split, data_root, target_class_id=_eval_gt_cls)
+                    else:
+                        q_img, q_mask = load_image_and_mask(query_tile, eval_split, data_root)
                     q_feats = extract_features(model, [q_img], device)[0]
                     q_gt = semantic_mask_to_binary(q_mask, is_tile=is_tile)
                     with torch.no_grad():
