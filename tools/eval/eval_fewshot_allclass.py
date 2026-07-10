@@ -279,7 +279,9 @@ def main():
     #   - Support tiles 必须来自不同的源图像（scene diversity）
     #   - Query selection is K-independent. Support from different source images.
     test_episodes = {}  # cls_id → [(support_stems, query_stem), ...]
-    max_k = 10  # 预分配足够多的 support source | Reserve enough support sources for max K
+    max_k = args.k_shot  # 仅需当前 K 个 support source | Only need K support sources
+    # 之前 max_k = 10 导致 K=1 时要求 ≥11 个源图, 过滤掉源图少的类.
+    # Old max_k = 10 required ≥11 source images per class, dropping sparse classes.
     test_eps_for_json = {}  # 用于保存到 JSON | For JSON export
     for cls_id, src_to_tiles in list(class_index.items()):
         # src_to_tiles = {source_img: [tile_stems]}

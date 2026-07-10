@@ -1185,7 +1185,11 @@ def main():
     val_query_rng = random.Random(args.seed + 88888)  # Query 独立于 support | Query independent of support
 
     fixed_val_episodes = {}  # cls_id → [{support_sources, query_source, query_tiles}, ...]
-    max_val_k = max(args.k_shot, 10)  # 预留足够 K | Reserve enough for max K
+    max_val_k = args.k_shot  # 仅需当前 K 个 support source | Only need K support sources for current run
+    # 之前 max(args.k_shot, 10) 导致 K=1 时要求 ≥11 个源图才能建验证 episode,
+    # 大量 val split 中源图少的类被丢弃, n_classes 从 15 降到 11-12.
+    # Old max(args.k_shot, 10) required ≥11 source images per class for val episodes,
+    # dropping many classes with few sources in val split (n_classes dropped from 15 to 11-12).
     for cls_id, src_to_tiles in sorted(val_index.items()):
         sources = list(src_to_tiles.keys())
         if len(sources) < 2:
