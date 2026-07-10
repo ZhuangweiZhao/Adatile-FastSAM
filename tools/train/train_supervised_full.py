@@ -344,7 +344,7 @@ def validate(
             proto_vecs = []
             for cls_id in dominant_classes:
                 if cls_id > 0 and cls_id in prototypes:
-                    proto_vecs.append(prototypes[cls_id])
+                    proto_vecs.append(prototypes[cls_id].to(device))
                 else:
                     # BG tile: 使用零向量 | BG tile: use zero vector
                     proto_vecs.append(torch.zeros(p4.shape[1], device=device))
