@@ -40,6 +40,35 @@ import numpy as np
 from typing import Optional
 
 
+def _json_default_bytes(o):
+    """json.dump 兜底: 将 bytes 解码为 str | json.dump fallback: decode bytes to str.
+
+    pycocotools 的 COCOeval(iouType='segm') 会就地把 GT 的 polygon 分割替换为 RLE dict,
+    其 counts 为 bytes; 因此 evaluate() 之后深拷贝的 GT 含 bytes, 需在序列化时解码.
+    COCOeval(segm) mutates GT segmentations in place to RLE dicts whose counts are bytes;
+    a GT deep-copied after evaluate() therefore contains bytes that must be decoded on dump.
+    """
+    if isinstance(o, bytes):
+        return o.decode("utf-8")
+    raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
+
+
+def _summarize(coco_eval, verbose: bool) -> None:
+    """调用 COCOeval.summarize() 以填充 .stats; 非 verbose 时抑制其 stdout.
+    Call COCOeval.summarize() to populate .stats; suppress its stdout when not verbose.
+
+    注意: .stats 仅由 summarize() 填充, 因此即使静默也必须调用, 否则 stats 为空列表.
+    Note: .stats is only populated by summarize(), so it must run even when quiet,
+    otherwise .stats is an empty list (→ IndexError downstream).
+    """
+    if verbose:
+        coco_eval.summarize()
+    else:
+        import io, contextlib
+        with contextlib.redirect_stdout(io.StringIO()):
+            coco_eval.summarize()
+
+
 def mask_to_bbox(mask: np.ndarray) -> list[float]:
     """
     二值掩码 → COCO 格式 bbox [x, y, width, height]。
@@ -172,11 +201,16 @@ class COCOInstanceEvaluator:
         for mask, cat_id, score, bbox in zip(masks, category_ids, scores, bboxes):
             self.add_prediction(image_id, cat_id, mask, score, bbox)
 
-    def evaluate(self, verbose: bool = True) -> dict:
+    def evaluate(self, verbose: bool = True,
+                 image_ids: Optional[list[int]] = None) -> dict:
         """
         运行 COCO 评估 | Run COCO evaluation.
 
         :param verbose: 是否打印 COCOeval 的标准输出 | Whether to print COCOeval's standard output.
+        :param image_ids: 若给定, 仅在这些图像上评估 (AP 分母 = 这些图像).
+            None → 在 GT 全部图像上评估 (原行为, 向后兼容).
+            If given, evaluate only on these images (AP denominator = these images).
+            None → evaluate on all GT images (original behavior, backward compatible).
         :return: dict with keys:
             - "AP": AP @ IoU=0.50:0.95 (area=all, maxDets=100)
             - "AP50": AP @ IoU=0.50
@@ -205,11 +239,14 @@ class COCOInstanceEvaluator:
 
         # ── 运行 COCOeval | Run COCOeval ──
         coco_eval = COCOeval(self.coco_gt, coco_pred, self.iouType)
+        # 限定评估图像集 (AP 分母 = 评估的 query tiles) | Restrict evaluated image set
+        if image_ids is not None:
+            coco_eval.params.imgIds = sorted(int(i) for i in image_ids)
         coco_eval.evaluate()
         coco_eval.accumulate()
 
-        if verbose:
-            coco_eval.summarize()
+        # summarize() 填充 .stats (即使静默也必须调用) | populate .stats (must run even when quiet)
+        _summarize(coco_eval, verbose)
 
         # ── 提取指标 | Extract metrics ──
         # COCOeval.stats = [AP, AP50, AP75, AP_small, AP_medium, AP_large,
@@ -233,7 +270,8 @@ class COCOInstanceEvaluator:
         """清空预测缓存 | Clear prediction cache."""
         self.predictions = []
 
-    def evaluate_class_agnostic(self, verbose: bool = True) -> dict:
+    def evaluate_class_agnostic(self, verbose: bool = True,
+                                image_ids: Optional[list[int]] = None) -> dict:
         """
         Class-agnostic COCO 评估 | Class-Agnostic COCO Evaluation.
 
@@ -245,6 +283,7 @@ class COCOInstanceEvaluator:
         这通过创建临时 GT 拷贝实现，不修改原始 COCO GT 对象。
         This creates a temporary GT copy, leaving the original COCO GT unchanged.
 
+        :param image_ids: 若给定, 仅在这些图像上评估 | If given, evaluate only on these images.
         :return: same dict format as evaluate().
         """
         import copy, tempfile, json, os
@@ -278,7 +317,7 @@ class COCOInstanceEvaluator:
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".json", delete=False,
         ) as f:
-            json.dump(gt_agnostic, f)
+            json.dump(gt_agnostic, f, default=_json_default_bytes)
 
         try:
             from pycocotools.coco import COCO
@@ -288,12 +327,14 @@ class COCOInstanceEvaluator:
             coco_pred = coco_gt_ag.loadRes(preds_remapped)
             coco_eval = COCOeval(coco_gt_ag, coco_pred, self.iouType)
             coco_eval.params.catIds = [1]
+            if image_ids is not None:
+                coco_eval.params.imgIds = sorted(int(i) for i in image_ids)
             coco_eval.evaluate()
             coco_eval.accumulate()
 
             if verbose:
                 print("\n--- Class-Agnostic COCO Evaluation ---")
-                coco_eval.summarize()
+            _summarize(coco_eval, verbose)
 
             stats = coco_eval.stats
             return {
@@ -311,7 +352,7 @@ class COCOInstanceEvaluator:
         finally:
             os.unlink(f.name)  # 清理临时文件 | Clean up temp file
 
-    def get_per_category_ap(self) -> dict[int, float]:
+    def get_per_category_ap(self, image_ids: Optional[list[int]] = None) -> dict[int, float]:
         """
         获取每类 AP@50 | Get per-category AP@50.
 
@@ -319,6 +360,7 @@ class COCOInstanceEvaluator:
         Get per-category AP@50 by running COCOeval per category.
         Note: this is relatively slow (rebuilds index for each evaluate).
 
+        :param image_ids: 若给定, 仅在这些图像上评估 | If given, evaluate only on these images.
         :return: {category_id: AP50} 映射.
         """
         if len(self.predictions) == 0:
@@ -328,6 +370,7 @@ class COCOInstanceEvaluator:
 
         per_cat_ap = {}
         all_preds = self.predictions
+        _img_ids = None if image_ids is None else sorted(int(i) for i in image_ids)
 
         for cat_id in sorted(self._gt_cat_ids):
             # 过滤出该类别的预测 | Filter predictions for this category
@@ -340,6 +383,8 @@ class COCOInstanceEvaluator:
                 coco_pred = self.coco_gt.loadRes(cat_preds)
                 coco_eval = COCOeval(self.coco_gt, coco_pred, self.iouType)
                 coco_eval.params.catIds = [cat_id]
+                if _img_ids is not None:
+                    coco_eval.params.imgIds = _img_ids
                 coco_eval.evaluate()
                 coco_eval.accumulate()
                 per_cat_ap[cat_id] = float(coco_eval.stats[1])  # AP50

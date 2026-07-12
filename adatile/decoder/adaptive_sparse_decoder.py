@@ -92,12 +92,19 @@ class AdaptiveSparseDecoder(nn.Module):
         proto_dim: int = 32,
         hidden_dim: int = 256,
         use_fdr: bool = True,
+        normalize_proto: str = "none",
     ):
         super().__init__()
 
         self.in_channels = in_channels
         self.proto_dim = proto_dim
         self.use_fdr = use_fdr
+        # ── proto basis 归一化 (修复未约束 basis 幅值导致的 sigmoid 饱和) | proto-basis normalization ──
+        #    none=identity(默认,零影响); l2=逐 basis 单位 L2; layernorm=逐 basis 标准化; scale=固定缩放
+        self.normalize_proto = normalize_proto
+        # ── 诊断: forward 时收集前向统计 (默认关闭) | optional forward-stat collection ──
+        self.collect_stats = False
+        self.last_stats: dict = {}
 
         # ═══════════════════════════════════════════════════════════
         # 1. 系数预测器 | Coefficient Predictor (~400K params)
@@ -154,6 +161,11 @@ class AdaptiveSparseDecoder(nn.Module):
             nn.Conv2d(32, 1, kernel_size=1),
         )
 
+        # ── proto basis 归一化模块 (仅 layernorm 模式需可学习参数) | learnable norm (layernorm only) ──
+        #    逐 basis 零均值单位方差 + 可学习仿射; InstanceNorm2d 对空间尺寸无关 (size-agnostic layernorm-per-basis)
+        self.proto_norm = (nn.InstanceNorm2d(proto_dim, affine=True)
+                           if normalize_proto == "layernorm" else None)
+
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -170,6 +182,34 @@ class AdaptiveSparseDecoder(nn.Module):
                     nn.init.ones_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
+
+    def _normalize_proto(self, proto_masks: torch.Tensor) -> torch.Tensor:
+        """归一化 proto basis 幅值, 防止 coeffs@proto 进入 sigmoid 饱和死区。
+        Normalize the proto-basis magnitude to keep coeffs@proto out of the sigmoid dead zone.
+
+        根因: 解冻微调使 FastSAM proto basis 幅值爆炸 (523→1e11), 无归一化时 pre-sigmoid→1e9 → 全饱和
+        → ∂L/∂coeffs=0。本方法把 basis 幅值约束回可训练范围。
+        Root cause: unfrozen fine-tuning explodes the proto basis (523→1e11); without normalization the
+        pre-sigmoid hits ~1e9 → full saturation → zero gradient. This bounds the basis magnitude.
+
+        :param proto_masks: [proto_dim, H, W] (已 squeeze) | squeezed proto basis.
+        :return: 同形状归一化结果 | normalized, same shape.
+        """
+        mode = self.normalize_proto
+        if mode == "none":
+            return proto_masks
+        C, H, W = proto_masks.shape
+        if mode == "l2":
+            # 每个 basis 单位 L2 (over spatial) → ‖row‖=1 → pre-sigmoid 受 ‖coeffs‖ 约束
+            flat = F.normalize(proto_masks.reshape(C, -1), p=2, dim=1)
+            return flat.view(C, H, W)
+        if mode == "scale":
+            # 朴素固定缩放 (预期弱于自适应归一化, 作对照行) | naive fixed scale (control row)
+            return proto_masks / (float(H * W) ** 0.5)
+        if mode == "layernorm":
+            # 逐 basis 零均值单位方差 + 可学习仿射 (InstanceNorm2d = size-agnostic)
+            return self.proto_norm(proto_masks.unsqueeze(0)).squeeze(0)
+        raise ValueError(f"unknown normalize_proto: {mode}")
 
     def forward(
         self,
@@ -194,7 +234,10 @@ class AdaptiveSparseDecoder(nn.Module):
         if proto_masks.dim() == 4:
             proto_masks = proto_masks.squeeze(0)  # [1, 32, H, W] → [32, H, W]
         if support_proto.dim() == 2:
-            support_proto = support_proto.squeeze(0)  # [1, 1280] → [1280]
+            support_proto = support_proto.squeeze(0)
+
+        # ── proto basis 归一化 (防饱和; 默认 none=identity, 零影响) | normalize proto basis ──
+        proto_masks = self._normalize_proto(proto_masks)  # [1, 1280] → [1280]
 
         # ═══════════════════════════════════════════════════════════
         # Step 1: 从 support prototype 预测 proto mask 系数
@@ -204,6 +247,19 @@ class AdaptiveSparseDecoder(nn.Module):
         proto_mask = self.coeff_predictor.generate_mask(
             coeffs, proto_masks
         )  # [1, H/4, W/4] — coarse mask at stride 4
+
+        # ── 可选: 收集前向统计 (机制诊断: basis 幅值/系数/饱和度) | optional forward-stat collection ──
+        if self.collect_stats:
+            with torch.no_grad():
+                pf = proto_masks.reshape(proto_masks.shape[0], -1)
+                pre = coeffs @ pf                      # pre-sigmoid logit
+                pm = proto_mask.detach()
+                self.last_stats = {
+                    "proto_basis_l2": float(pf.norm(dim=1).mean().item()),   # post-norm 每基 L2 均值
+                    "coeff_l2": float(coeffs.detach().norm().item()),
+                    "pre_sigmoid_absmax": float(pre.abs().max().item()),
+                    "sat_frac": float(((pm < 1e-6) | (pm > 1 - 1e-6)).float().mean().item()),
+                }
 
         # ═══════════════════════════════════════════════════════════
         # Step 2: P4 特征精炼 | P4 Feature Refinement

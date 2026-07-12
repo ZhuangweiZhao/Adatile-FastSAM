@@ -1564,4 +1564,6 @@ def _create_diagnosis_grid(worst_cases: list, out_dir: Path, top_n: int = 4):
 
 
 if __name__ == "__main__":
+    from tools._deprecated_guard import require_legacy_optin
+    require_legacy_optin(__file__)  # DEPRECATED: pre-V3 protocol (see EVALUATION_PROTOCOL_V3.md §12.4)
     main()

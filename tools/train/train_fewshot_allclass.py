@@ -923,6 +923,15 @@ def train_episode(model, decoder, optimizer, class_id: int,
     # Backward
     optimizer.zero_grad()
     loss.backward()
+
+    # ── 前向统计 (机制诊断, 仅 collect_stats; 在 clip 前读 coeff 梯度) | forward stats (pre-clip) ──
+    fwd_stats = {}
+    if getattr(decoder, "collect_stats", False) and hasattr(decoder, "coeff_predictor"):
+        cg_sq = sum(float(p.grad.detach().pow(2).sum().item())
+                    for p in decoder.coeff_predictor.parameters() if p.grad is not None)
+        fwd_stats = dict(getattr(decoder, "last_stats", {}))  # basis_l2/coeff_l2/pre_sigmoid/sat_frac
+        fwd_stats["coeff_grad_norm"] = cg_sq ** 0.5
+
     all_params = list(decoder.parameters())
     if spm is not None:
         all_params += list(spm.parameters())
@@ -941,7 +950,7 @@ def train_episode(model, decoder, optimizer, class_id: int,
             union = (pred_bin + gt_tensor).clamp(0, 1).sum()
         iou = (inter / max(union, 1)).item()
 
-    return {"loss": loss.item(), "iou": iou, **loss_dict}
+    return {"loss": loss.item(), "iou": iou, **loss_dict, **fwd_stats}
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -983,6 +992,13 @@ def main():
                         help="Prototype 特征来源 | Prototype feature source: "
                              "p4 (stride-16, semantic-spatial balance) / "
                              "p8 (stride-32, global semantics)")
+    parser.add_argument("--normalize-proto", type=str, default="none",
+                        choices=["none", "l2", "layernorm", "scale"],
+                        help="proto basis 归一化 (修复饱和; 仅 adaptive) | proto-basis normalization "
+                             "(fixes saturation; adaptive decoder only): none/l2/layernorm/scale")
+    parser.add_argument("--log-forward-stats", action="store_true",
+                        help="记录逐 epoch 前向统计 (basis/coeff/pre-sigmoid/sat/grad; 仅 adaptive) | "
+                             "log per-epoch forward stats (adaptive only)")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -1008,6 +1024,8 @@ def main():
             tag += "_spm"
         if args.prototype_source != "p4":
             tag += f"_proto{args.prototype_source}"
+        if args.normalize_proto != "none":
+            tag += f"_norm{args.normalize_proto}"
         args.output_dir = f"runs/train_fewshot_allcls_K{args.k_shot}_{tag}_{ts}"
     out_dir = Path(args.output_dir).resolve()  # 绝对路径 (ultralytics torch_save wrapper 需要)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1092,7 +1110,9 @@ def main():
     _p4_channels = _test_feats[0]["p4"].shape[1]
     print(f"  Detected P4 channels: {_p4_channels}")
     if args.decoder == "adaptive":
-        decoder = AdaptiveSparseDecoder(in_channels=_p4_channels, proto_dim=32, hidden_dim=256, use_fdr=False)
+        decoder = AdaptiveSparseDecoder(in_channels=_p4_channels, proto_dim=32, hidden_dim=256,
+                                        use_fdr=False, normalize_proto=args.normalize_proto)
+        decoder.collect_stats = args.log_forward_stats  # 前向统计仅 adaptive | forward-stats: adaptive only
         decoder_type = "adaptive"
     elif args.decoder == "adaptive-p3p4":
         _p3_channels = _test_feats[0]["p3"].shape[1]
@@ -1277,6 +1297,9 @@ def main():
         epoch_losses = {"loss": [], "iou": [], "dice": [], "bce": []}
         if spm is not None:
             epoch_losses["spm_mean"] = []
+        if getattr(decoder, "collect_stats", False):  # 前向统计键 (须与 result 键一致) | forward-stat keys
+            for _k in ("proto_basis_l2", "coeff_l2", "pre_sigmoid_absmax", "sat_frac", "coeff_grad_norm"):
+                epoch_losses[_k] = []
 
         pbar = tqdm(range(args.episodes_per_epoch), desc=f"Epoch {epoch + 1}/{args.epochs}",
                     unit="ep")
@@ -1326,13 +1349,21 @@ def main():
         # Epoch summary
         avg_loss = np.mean(epoch_losses["loss"]) if epoch_losses["loss"] else 0
         avg_iou = np.mean(epoch_losses["iou"]) if epoch_losses["iou"] else 0
+        # 前向统计逐 epoch 均值 (formation 曲线) | per-epoch forward-stat means
+        fwd_means = {}
+        if getattr(decoder, "collect_stats", False):
+            for _k in ("proto_basis_l2", "coeff_l2", "pre_sigmoid_absmax", "sat_frac", "coeff_grad_norm"):
+                _v = epoch_losses.get(_k, [])
+                fwd_means[_k] = float(np.mean(_v)) if _v else 0.0
+        fwd_str = (f" | basis_l2={fwd_means['proto_basis_l2']:.2e} sat={fwd_means['sat_frac']:.3f} "
+                   f"cgrad={fwd_means['coeff_grad_norm']:.2e}") if fwd_means else ""
         if spm is not None:
             avg_spm_mean = np.mean(epoch_losses.get("spm_mean", [])) if epoch_losses.get("spm_mean") else 0
             spm_str = f", spm_mean={avg_spm_mean:.3f}"
         else:
             spm_str = ""
         print(f"  Epoch {epoch + 1}: loss={avg_loss:.4f}, iou={avg_iou:.4f}, "
-              f"lr={scheduler.get_last_lr()[0]:.2e}{spm_str}")
+              f"lr={scheduler.get_last_lr()[0]:.2e}{spm_str}{fwd_str}")
 
         scheduler.step()
 
@@ -1552,6 +1583,7 @@ def main():
                 "epoch": epoch + 1, "train_loss": float(avg_loss),
                 "train_iou": float(avg_iou), "val_iou": float(avg_val_iou),
                 "val_n_eps": n_eps_used, "decoder_type": decoder_type,
+                **fwd_means,
             })
         else:
             per_class_iou = {}
@@ -1582,6 +1614,7 @@ def main():
                 "train_iou": float(avg_iou), "val_miou": float(avg_val_iou),
                 "val_per_class_iou": {str(k): round(v, 4) for k, v in per_class_iou.items()},
                 "val_n_classes": n_classes_eval,
+                **fwd_means,
             })
 
         # Save checkpoint
@@ -1590,6 +1623,7 @@ def main():
             "optimizer": optimizer.state_dict(), "val_iou": float(avg_val_iou),
             "k_shot": args.k_shot, "decoder_type": decoder_type,
             "unfreeze_layers": args.unfreeze_layers,
+            "normalize_proto": args.normalize_proto,
         }
         if backbone_trainable:
             # 保存解冻的 backbone 层权重 | Save unfrozen backbone layer weights

@@ -1,0 +1,30 @@
+#!/bin/sh
+# ============================================================================
+# AdaTile-FastSAM — Evaluation Protocol V3 Freeze Guard (pre-commit hook)
+# 评估协议 V3 冻结守卫 (提交前钩子)
+# ----------------------------------------------------------------------------
+# 任何对 Metric / Matching / IoU / AP / Zero-shot / Support-Query / Manifest
+# 冻结定义的改动都会阻断本次 commit。见 EVALUATION_PROTOCOL_V3.md。
+# Any change to the frozen protocol definitions blocks this commit.
+# Install once:  git config core.hooksPath .githooks
+# ============================================================================
+
+python -m pytest tests/test_protocol_frozen.py -q
+status=$?
+
+if [ "$status" -ne 0 ]; then
+  echo ""
+  echo "  ✖ COMMIT BLOCKED — Evaluation Protocol V3 is FROZEN."
+  echo "    A frozen metric/matching/IoU/AP/zero-shot/support-query/manifest"
+  echo "    definition was changed. This is a protocol violation."
+  echo ""
+  echo "    • If this is NOT intended: revert the change to the frozen function(s)."
+  echo "    • If this is an APPROVED protocol amendment (EVALUATION_PROTOCOL_V3.md"
+  echo "      §Amendment): regenerate the lock, then commit both together:"
+  echo "          python tests/test_protocol_frozen.py --update"
+  echo ""
+  echo "    No V4/V5 without a published amendment."
+  exit 1
+fi
+
+exit 0

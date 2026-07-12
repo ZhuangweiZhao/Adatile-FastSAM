@@ -30,6 +30,11 @@ from adatile.metrics.coco_eval import (
     instances_to_coco_predictions,
     mask_to_bbox,
 )
+from adatile.metrics.instance_match import (
+    pairwise_iou,
+    greedy_match,
+    instance_miou,
+)
 
 __all__ = [
     "compute_miou",
@@ -41,4 +46,7 @@ __all__ = [
     "connected_components_to_instances",
     "instances_to_coco_predictions",
     "mask_to_bbox",
+    "pairwise_iou",
+    "greedy_match",
+    "instance_miou",
 ]
