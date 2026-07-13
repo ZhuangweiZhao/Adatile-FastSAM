@@ -38,7 +38,6 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from adatile.backbone.fastsam_backbone import FastSAMBackbone
 from adatile.utils.seed import set_seed
 
 import matplotlib
@@ -88,7 +87,7 @@ def pad_to_32(h: int, w: int) -> tuple[int, int]:
     return (32 - h % 32) % 32, (32 - w % 32) % 32
 
 
-def run_inference(image_np: np.ndarray, backbone, decoder, decoder_type: str,
+def run_inference(image_np: np.ndarray, model, decoder, decoder_type: str,
                   class_protos: dict, device, class_names: dict):
     """
     Run inference on a single image. Returns dict of results keyed by class_id.
@@ -105,11 +104,10 @@ def run_inference(image_np: np.ndarray, backbone, decoder, decoder_type: str,
     else:
         img_padded = image_np
 
-    import torchvision.transforms as T
-    img_tensor = T.ToTensor()(img_padded).unsqueeze(0).to(device)  # [1, 3, H, W]
+    from tools.train.train_fewshot_allclass import extract_features
 
     with torch.no_grad():
-        feats, _ = backbone(img_tensor)
+        feats = extract_features(model, [img_padded], device)[0]
 
     results = {}
 
@@ -415,20 +413,32 @@ def main():
     unfreeze_layers = ckpt.get("unfreeze_layers", ckpt_cfg.get("unfreeze_layers", 8))
     print(f"  Checkpoint: epoch {ckpt.get('epoch', '?')}")
 
-    # ── Load Backbone ──
-    backbone = FastSAMBackbone(device=device)
-    if unfreeze_layers > 0:
-        backbone.set_trainable_layers(unfreeze_layers)
-    if "backbone_state" in ckpt:
-        backbone.load_state_dict(ckpt["backbone_state"], strict=False)
-        print(f"  Restored {unfreeze_layers} backbone layers")
+    # ── Load Backbone (same pattern as evaluate_instance.py) ──
+    from ultralytics import FastSAM
+    from tools.eval.evaluate_instance import _fastsam_weights_path
+    from tools.train.train_fewshot_allclass import extract_features
+
+    fastsam_path = _fastsam_weights_path()
+    model = FastSAM(str(fastsam_path))
+    model.model.to(device).eval()
+    for p in model.model.parameters():
+        p.requires_grad = False
+
+    # Restore unfrozen backbone layers from checkpoint
+    unfreeze_layers = ckpt.get("unfreeze_layers", 0)
+    if unfreeze_layers > 0 and "backbone" in ckpt:
+        seq = model.model.model  # Sequential[23]
+        for i_str, state in ckpt["backbone"].items():
+            seq[int(i_str)].load_state_dict(state)
+        print(f"  Restored {unfreeze_layers} backbone layers from checkpoint")
+    elif unfreeze_layers > 0:
+        print(f"  [WARN] unfreeze_layers={unfreeze_layers} but no backbone weights in ckpt")
 
     # ── Detect channels ──
-    test_img = torch.zeros(1, 3, 896, 896).to(device)
-    with torch.no_grad():
-        test_feats, _ = backbone(test_img)
-    p3_channels = test_feats["p3"].shape[1]
-    p4_channels = test_feats["p4"].shape[1]
+    test_img = np.zeros((896, 896, 3), dtype=np.uint8)
+    test_feats = extract_features(model, [test_img], device)
+    p3_channels = test_feats[0]["p3"].shape[1]
+    p4_channels = test_feats[0]["p4"].shape[1]
     print(f"  P3 channels={p3_channels}, P4 channels={p4_channels}")
 
     # ── Load Decoder ──
@@ -465,7 +475,7 @@ def main():
         stem = os.path.splitext(os.path.basename(img_path))[0]
         print(f"\n  [{img_idx + 1}/{len(image_paths)}] {stem} ({H}×{W})")
 
-        results = run_inference(image, backbone, decoder, args.decoder,
+        results = run_inference(image, model, decoder, args.decoder,
                                 class_protos, device, class_names)
 
         # ── Visualize per class ──
