@@ -56,6 +56,10 @@ from adatile.utils.seed import set_seed
 from adatile.decoder.adaptive_sparse_decoder import AdaptiveSparseDecoder
 from adatile.decoder.adaptive_decoder_p3p4 import AdaptiveDecoderP3P4
 from adatile.decoder.pure_cnn_decoder import PureDecoder, PureDecoderP3P4
+from adatile.decoder.dynamic_kernel_decoder import DynamicKernelDecoder
+from adatile.metrics.hungarian_matcher import (
+    hungarian_match_instances, multi_instance_loss, mask_scores,
+)
 from adatile.sparse.spm import SparsePerceptionModule
 
 # ═══════════════════════════════════════════════════════════════════
@@ -341,6 +345,72 @@ def semantic_mask_to_binary(mask: np.ndarray, is_tile: bool = False) -> np.ndarr
     if is_tile:
         return (mask > 0).astype(np.float32)
     return (mask.max(axis=-1) > 0).astype(np.float32)
+
+
+def load_instance_masks_from_coco(stem: str, split: str, data_root: Path,
+                                  target_class_id: int,
+                                  target_size: tuple[int, int] | None = None
+                                  ) -> list[np.ndarray]:
+    """从 COCO 标注加载逐实例二值 mask | Load per-instance binary masks from COCO annotations.
+
+    用于 DynamicKernelDecoder 训练: 每个 GT 实例一个独立 mask。
+    Used for DynamicKernelDecoder training: one mask per GT instance.
+
+    :param stem: Tile stem (不含扩展名) | Tile stem (without extension).
+    :param split: "train" or "val".
+    :param data_root: 数据根目录 | Data root directory.
+    :param target_class_id: 仅加载此类实例 | Only load instances of this class.
+    :param target_size: (H, W) 目标分辨率 (None=保持原图) | Target resolution (None=keep original).
+    :return: [mask_0, mask_1, ...] 每元素 [H, W] uint8 binary.
+    """
+    coco_idx = _load_coco_index(data_root, split)
+    file_to_anns = coco_idx.get("file_to_anns", {})
+    anns = file_to_anns.get(f"{stem}.png", [])
+
+    # 加载图像获取尺寸 | Load image to get dimensions
+    img_path = data_root / "images" / split / f"{stem}.png"
+    if img_path.exists():
+        img = np.array(Image.open(str(img_path)))
+        H, W = img.shape[:2]
+    else:
+        H, W = 896, 896  # 默认 | default
+
+    instances = []
+    for ann in anns:
+        cat_id = ann.get("category_id", 0)
+        if cat_id < 1 or cat_id > 15:
+            continue
+        if cat_id != target_class_id:
+            continue
+
+        # 渲染单个实例 mask | Render single instance mask
+        mask = np.zeros((H, W), dtype=np.uint8)
+        seg = ann.get("segmentation", [])
+        if not seg:
+            bx, by, bw, bh = [int(v) for v in ann.get("bbox", [0, 0, 0, 0])]
+            mask[max(0, by):min(H, by + bh), max(0, bx):min(W, bx + bw)] = 1
+        elif isinstance(seg, list):
+            if isinstance(seg[0], list):
+                polys = seg
+            elif isinstance(seg[0], (int, float)):
+                polys = [seg]
+            else:
+                continue
+            for poly in polys:
+                if len(poly) < 6:
+                    continue
+                pts = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
+                pts[:, :, 0] = np.clip(pts[:, :, 0], 0, W - 1)
+                pts[:, :, 1] = np.clip(pts[:, :, 1], 0, H - 1)
+                cv2.fillPoly(mask, [pts], 1)
+
+        if mask.sum() > 0:
+            if target_size is not None:
+                mask = cv2.resize(mask, (target_size[1], target_size[0]),
+                                  interpolation=cv2.INTER_NEAREST)
+            instances.append(mask)
+
+    return instances
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -858,6 +928,77 @@ def train_episode(model, decoder, optimizer, class_id: int,
         d_loss = 1.0 - dice
         loss = bce + d_loss
         loss_dict = {"dice": d_loss.item(), "bce": bce.item(), "total": loss.item()}
+    elif decoder_type == "dynamic_kernel":
+        # ── DynamicKernelDecoder: Prototype → N Kernels → N Instance Masks ──
+        p3 = query_feats["p3"].to(device)            # [1, C, H/8, W/8]
+        p4 = query_feats["p4"].to(device)            # [1, C, H/16, W/16]
+        proto_masks = query_feats["proto"].to(device)  # [1, 32, H/4, W/4]
+
+        # Decoder forward: N masks at stride-8 + proto_mask at stride-4
+        masks_s8, proto_mask = decoder(p3, p4, proto_masks, support_proto)
+        # masks_s8: [N_kernels, H/8, W/8] sigmoid ∈ [0,1]
+        # proto_mask: [H/4, W/4]
+
+        # Get output spatial dims for GT resizing
+        _, H_s8, W_s8 = masks_s8.shape
+        H_gt, W_gt = query_gt.shape
+
+        # Load per-instance GT masks (resized to stride-8 for matching)
+        gt_instance_masks = load_instance_masks_from_coco(
+            query_stem, split, data_root, class_id, target_size=(H_s8, W_s8),
+        )
+
+        if len(gt_instance_masks) == 0:
+            # 无 GT 实例: 所有预测拉向零 | No GT instances: pull all predictions to zero
+            loss = masks_s8.mean() * 0.1  # weak zero-pull
+            loss_dict = {"n_matched": 0, "n_gt": 0, "total": loss.item()}
+        else:
+            gt_tensor = torch.from_numpy(np.stack(gt_instance_masks)).float().to(device)
+            # gt_tensor: [M, H/8, W/8]
+
+            # Upsample predicted masks to GT resolution for loss
+            masks_gt = F.interpolate(
+                masks_s8.unsqueeze(0), size=(H_gt, W_gt),
+                mode='bilinear', align_corners=False,
+            ).squeeze(0)  # [N, H_gt, W_gt]
+
+            # GT at original resolution for loss
+            gt_masks_full = [m for m in [
+                load_instance_masks_from_coco(query_stem, split, data_root, class_id,
+                                              target_size=None)
+            ] if m]
+            if gt_masks_full and gt_masks_full[0]:
+                gt_full_tensor = torch.from_numpy(
+                    np.stack(gt_masks_full[0])
+                ).float().to(device)  # [M, H_gt, W_gt]
+            else:
+                gt_full_tensor = gt_tensor  # fallback
+
+            # Hungarian matching at stride-8 (faster)
+            matched, unmatched_pred, unmatched_gt = hungarian_match_instances(
+                masks_s8, gt_tensor, min_dice=0.05,
+            )
+
+            # Multi-instance loss at original resolution
+            loss, loss_dict = multi_instance_loss(
+                masks_gt, gt_full_tensor, matched, unmatched_pred, unmatched_gt,
+                dice_weight=1.0, bce_weight=1.0, empty_weight=0.1,
+            )
+
+        # IoU: use proto_mask vs query_gt for a quick semantic-level metric
+        proto_up = F.interpolate(
+            proto_mask.unsqueeze(0).unsqueeze(0), size=(H_gt, W_gt),
+            mode='bilinear', align_corners=False,
+        ).squeeze()
+        pred_bin = (proto_up > 0.5).float()
+        gt_tensor_iou = torch.from_numpy(query_gt).float().to(device)
+        inter = (pred_bin * gt_tensor_iou).sum()
+        union = (pred_bin + gt_tensor_iou).clamp(0, 1).sum()
+        iou = (inter / max(union, 1)).item()
+
+        # ── 确保 loss 是标量 (multi_instance_loss 已归一化) ──
+        if loss.dim() > 0:
+            loss = loss.mean()
     elif decoder_type in ("pure", "pure-p3p4"):
         # ── PureDecoder / PureDecoderP3P4: 无 prototype, 纯 query-driven ──
         p4 = query_feats["p4"].to(device)            # [1, C, H/16, W/16]
@@ -940,15 +1081,19 @@ def train_episode(model, decoder, optimizer, class_id: int,
 
     # IoU
     with torch.no_grad():
-        if decoder_type in ("adaptive", "adaptive-p3p4", "pure", "pure-p3p4"):
+        if decoder_type == "dynamic_kernel":
+            # IoU already computed in training branch (proto mask semantic)
+            pass  # iou variable already set
+        elif decoder_type in ("adaptive", "adaptive-p3p4", "pure", "pure-p3p4"):
             pred_bin = (mask_pred > 0.5).float()
             inter = (pred_bin * gt_tensor).sum()
             union = (pred_bin + gt_tensor).clamp(0, 1).sum()
+            iou = (inter / max(union, 1)).item()
         else:
             pred_bin = (torch.sigmoid(pred) > 0.5).float()
             inter = (pred_bin * gt_tensor).sum()
             union = (pred_bin + gt_tensor).clamp(0, 1).sum()
-        iou = (inter / max(union, 1)).item()
+            iou = (inter / max(union, 1)).item()
 
     return {"loss": loss.item(), "iou": iou, **loss_dict, **fwd_stats}
 
@@ -975,12 +1120,14 @@ def main():
                              "isaid_instance/新COCO tile")
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--decoder", type=str, default="baseline",
-                        choices=["baseline", "adaptive", "adaptive-p3p4", "pure", "pure-p3p4"],
+                        choices=["baseline", "adaptive", "adaptive-p3p4", "pure", "pure-p3p4",
+                                 "dynamic_kernel"],
                         help="Decoder 类型 | Decoder type: baseline (FewShotDecoder + template), "
                              "adaptive (AdaptiveSparseDecoder P4-only), "
                              "adaptive-p3p4 (P3+P4+P8), "
                              "pure (PureDecoder P4-only, no prototype), "
-                             "pure-p3p4 (PureDecoderP3P4, no prototype)")
+                             "pure-p3p4 (PureDecoderP3P4, no prototype), "
+                             "dynamic_kernel (DynamicKernelDecoder: Prototype→Kernels→N masks)")
     parser.add_argument("--use-spm", action="store_true",
                         help="启用 SPM tile routing (P8 → Importance → Top-K)")
     parser.add_argument("--unfreeze-layers", type=int, default=0,
@@ -996,6 +1143,9 @@ def main():
                         choices=["none", "l2", "layernorm", "scale"],
                         help="proto basis 归一化 (修复饱和; 仅 adaptive) | proto-basis normalization "
                              "(fixes saturation; adaptive decoder only): none/l2/layernorm/scale")
+    parser.add_argument("--n-kernels", type=int, default=16,
+                        help="DynamicKernelDecoder 每类核数 (max instances per class) | "
+                             "Number of kernels per class (only for dynamic_kernel decoder)")
     parser.add_argument("--log-forward-stats", action="store_true",
                         help="记录逐 epoch 前向统计 (basis/coeff/pre-sigmoid/sat/grad; 仅 adaptive) | "
                              "log per-epoch forward stats (adaptive only)")
@@ -1128,6 +1278,17 @@ def main():
         print(f"  Detected P3 channels: {_p3_channels}")
         decoder = PureDecoderP3P4(p3_channels=_p3_channels, p4_channels=_p4_channels)
         decoder_type = "pure-p3p4"
+    elif args.decoder == "dynamic_kernel":
+        _p3_channels = _test_feats[0]["p3"].shape[1]
+        print(f"  Detected P3 channels: {_p3_channels}")
+        decoder = DynamicKernelDecoder(
+            p3_channels=_p3_channels, p4_channels=_p4_channels,
+            proto_dim=32, n_kernels=args.n_kernels, kernel_dim=256, fpn_dim=256,
+            normalize_proto=args.normalize_proto,
+        )
+        decoder.collect_stats = args.log_forward_stats
+        decoder_type = "dynamic_kernel"
+        print(f"    n_kernels={args.n_kernels}")
     else:
         decoder = FewShotDecoder(feat_dim=_p4_channels, proto_dim=32, hidden_dim=256, use_template=True)
         decoder_type = "baseline"
@@ -1404,7 +1565,7 @@ def main():
                     support_proto = compute_support_prototype(support_feats,
                                                               source=args.prototype_source)
 
-                    if decoder_type in ("adaptive", "adaptive-p3p4", "pure", "pure-p3p4"):
+                    if decoder_type in ("adaptive", "adaptive-p3p4", "pure", "pure-p3p4", "dynamic_kernel"):
                         # Adaptive / P3P4: no template needed
                         support_tmpl = None
                     else:
@@ -1453,6 +1614,18 @@ def main():
                             elif decoder_type == "pure-p3p4":
                                 mask_s4 = decoder(q_feats["p3"], q_feats["p4"])
                                 mask_s4 = _normalize_mask_to_4d(mask_s4)
+                                mask_tile = F.interpolate(
+                                    mask_s4, size=(td["h"], td["w"]),
+                                    mode="bilinear", align_corners=False
+                                ).squeeze()
+                                pred_bin_np = (mask_tile > 0.5).float().cpu().numpy()
+                            elif decoder_type == "dynamic_kernel":
+                                # Use proto_mask output (semantic) for validation IoU
+                                _, proto_mask = decoder(
+                                    q_feats["p3"], q_feats["p4"],
+                                    q_feats["proto"], support_proto,
+                                )
+                                mask_s4 = _normalize_mask_to_4d(proto_mask)
                                 mask_tile = F.interpolate(
                                     mask_s4, size=(td["h"], td["w"]),
                                     mode="bilinear", align_corners=False
@@ -1549,6 +1722,23 @@ def main():
                             inter = float((pred_bin * gt_t).sum().item())
                             union = float((pred_bin + gt_t).clamp(0, 1).sum().item())
                             iou_val = inter / max(union, 1)
+                        elif decoder_type == "dynamic_kernel":
+                            # Use proto_mask for semantic validation IoU
+                            _, proto_mask = decoder(
+                                q_feats["p3"], q_feats["p4"],
+                                q_feats["proto"], support_proto,
+                            )
+                            mask_s4 = _normalize_mask_to_4d(proto_mask)
+                            H_gt, W_gt = q_gt.shape
+                            mask_tile = F.interpolate(
+                                mask_s4, size=(H_gt, W_gt),
+                                mode="bilinear", align_corners=False
+                            ).squeeze()
+                            gt_t = torch.from_numpy(q_gt).float().to(device)
+                            pred_bin = (mask_tile > 0.5).float()
+                            inter = float((pred_bin * gt_t).sum().item())
+                            union = float((pred_bin + gt_t).clamp(0, 1).sum().item())
+                            iou_val = inter / max(union, 1)
                         else:
                             pred = decoder(q_feats["p4"], q_feats["proto"], support_proto, support_tmpl)
                             H_gt, W_gt = q_gt.shape
@@ -1625,6 +1815,8 @@ def main():
             "unfreeze_layers": args.unfreeze_layers,
             "normalize_proto": args.normalize_proto,
         }
+        if decoder_type == "dynamic_kernel":
+            ckpt["n_kernels"] = args.n_kernels
         if backbone_trainable:
             # 保存解冻的 backbone 层权重 | Save unfrozen backbone layer weights
             seq = model.model.model

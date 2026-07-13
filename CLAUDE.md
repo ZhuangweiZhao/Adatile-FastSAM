@@ -45,13 +45,58 @@ paper-b   → Active development (v3: all new experiments)
        Base pre-train → K-shot fine-tune → direct inference
 
 3. Experiments
-   3.1 Zero-Shot Baseline (AP=0.015)
+   3.1 Zero-Shot Baseline (AP=0.0182 @ 896² tiles)
    3.2 Spatial Sparsity (60% empty, Top-40% → 96.5% FG)
    3.3 Few-Shot Scaling (K=1/3/5/10, SSI-1=88.6%)
    3.4 SPM Efficiency (FLOPs vs AP Pareto frontier)
    3.5 Decoder Ablation (ProtoOnly vs +Refinement, Δ=+34.5%)
-   3.6 Cross-Dataset (NWPU, category-agnostic)
+   3.6 Prototype Mechanism-Function-Task Decoupling (NEW)
+       → L2 restores gradient (Mech ✓) but NOT class-conditioning (Func ✗)
+       → Yet Task improves (+31% AP) → attribution probes needed
+   3.7 Cross-Dataset (NWPU, category-agnostic)
+
+## Mechanism-Function-Task Analysis Framework
+
+**Three layers must be verified independently — one does NOT imply another:**
+
 ```
+Mechanism (梯度流/数值稳定性)
+    ↓
+Function (模块是否承担设计的语义角色)
+    ↓
+Task (下游指标: AP, IoU, etc.)
+```
+
+**Current state (l2 vs none, uf8 backbone):**
+- **Mechanism ✓**: L2 restores gradient flow (basis≈1, sat≈0, coeff_grad≈4e-3)
+- **Function ✗**: Prototype still dead (coeff_cos=1.0, Normal≈Zero)
+- **Task ✓**: AP +31%, class-agnostic 9×
+
+**Key insight**: Mechanism recovery ≠ Function recovery ≠ Performance gain. The T/F/T combination is the discovery.
+
+**Attribution probes** (see `tools/diag/`):
+- Probe 1 (`diag_proto_mask_stats.py`): Proto mask statistics (mean/std/entropy/FG IoU)
+- Probe 2 (`diag_fusion_attribution.py`): Fusion contribution ratio (||proto||/||query||)
+- Probe 3 (TBD): Proto OFF ablation — causal cut to isolate gain source
+
+## Evaluation Protocol V3 (Frozen)
+
+**`EVALUATION_PROTOCOL_V3.md` is the single official evaluation protocol.** All paper results MUST come from the V3 evaluator. Key facts:
+
+- **Official evaluator**: `tools/eval/evaluate_instance.py` — the ONLY sanctioned entry point
+- **Protocol guards**: `tests/test_protocol_frozen.py` (freeze) + `tests/test_protocol_audit.py` (audit) + `tests/test_instance_match.py` (matching)
+- **Commit hook**: `.githooks/pre-commit` — blocks any commit that changes frozen metric/matching definitions
+- **Experiment registry**: `EXPERIMENT_MANIFEST.md` — binds every paper experiment ID → Protocol → Manifest → Seed → Checkpoint → Commit (single source of truth)
+
+```bash
+# Enable protocol freeze guard (once per clone)
+git config core.hooksPath .githooks
+
+# Verify protocol integrity
+pytest tests/test_protocol_frozen.py tests/test_protocol_audit.py tests/test_instance_match.py -q
+```
+
+**Protocol boundary**: The protocol defines evaluation semantics (AP, Instance mIoU, one-to-one matching, no union masks). Model-side choices (decoder design, score aggregation, connected-component threshold) are outside the protocol and can be freely improved.
 
 ## Development Rules
 
@@ -93,15 +138,24 @@ adatile/
 ├── logging/         ✅ Structured logging (Console, File/JSONL, Wandb backends)
 ├── backbone/        ✅ FastSAMBackbone (hook P3/P4/P8, Proto extraction, eval-mode enforced)
 ├── config/          ✅ ExperimentConfig + ExperimentRecorder + generate_exp_id()
-├── metrics/         ✅ compute_miou, compute_dice, FPSMeter, count_params, COCOInstanceEvaluator
+├── metrics/
+│   ├── instance_match.py       ✅ Instance-level matching + Instance mIoU (pure numpy)
+│   └── coco_eval.py            ✅ COCO AP official wrapper (ONLY file calling pycocotools.COCOeval)
 ├── decoder/
-│   ├── light_decoder.py         ✅ LightDecoder (716K, P4-only)
-│   ├── light_decoder_p3p4.py    ✅ LightDecoderP3P4 (274K, multi-scale)
-│   └── adaptive_decoder.py      ✅ AdaptiveDecoder + ProtoOnlyDecoder (v2: InstanceNorm2d)
+│   ├── adaptive_sparse_decoder.py  ✅ AdaptiveSparseDecoder + ProtoOnlyDecoder (v3 main)
+│   ├── adaptive_decoder_p3p4.py    ✅ AdaptiveDecoderP3P4 (multi-scale P3+P4)
+│   ├── pure_cnn_decoder.py         ✅ PureDecoder + PureDecoderP3P4 (no-prototype baseline)
+│   ├── conditioned_decoder.py      ✅ ConditionedDecoder (support-template conditioned)
+│   ├── light_decoder.py            ✅ LightDecoder + LightDecoderP3/P3P4 (v2 reference)
+│   ├── proto_module.py             ✅ ProtoModule (standalone proto mask generation)
+│   ├── instance_decoder.py         ✅ InstanceDecoder (instance-level head)
+│   ├── linear_probe.py             ✅ LinearProbe (1×1 Conv, E002)
+│   └── fusion_probe.py             ✅ FusionProbe (P4+P8, E003)
+├── adapter/           ✅ ConvAdapter + MultiScaleAdapter (CAT-SAM-style channel attention)
+├── prompt/            ✅ GenericPrompt + PrototypePrompt + Fusion (class-conditional prompt tokens)
 ├── sparse/
-│   ├── spm.py                   🔄 SparsePerceptionModule (renamed from spatial_router.py)
-│   │   ├── ImportanceHead       ← DensityHead (重命名)
-│   │   └── TileRouter           ← select_tiles()
+│   ├── spm.py                   ✅ SparsePerceptionModule + ImportanceHead + TileRouter
+│   ├── spatial_router.py        ✅ SpatialRouter (v2 reference, kept for ablation)
 │   └── coefficient_predictor.py ✅ ProtoCoeffPredictor (3-layer MLP, ~427K)
 ├── datasets/
 │   ├── isaid_tiles.py              ✅ FastISAIDTileDataset (1024² tiles)
@@ -123,17 +177,39 @@ tools/
 │   ├── prep_isaid_tiles.py          Full pipeline: render mask -> cut tiles -> metadata
 │   └── prep_isaid_instance.py       ✅ iSAID Instance Few-Shot Split
 ├── train/                           # Training entry points (v3)
+│   ├── train_fewshot_allclass.py    ✅ V3: All-15-class K-shot fine-tuning (main training script)
+│   ├── train_fewshot_finetune.py    ✅ V3: K-shot fine-tune variant
 │   ├── train_base.py                ✅ V3-05: Base pre-training on 10 classes
 │   ├── train_fewshot.py             ✅ V3-06: Novel K-shot fine-tune (fixed support set)
-│   └── train_supervised.py          ✅ A-Series: full supervision (archived reference)
+│   ├── train_supervised_full.py     ✅ V3: Full supervision (all 15 classes)
+│   ├── train_supervised.py          ✅ A-Series: full supervision (archived reference)
+│   ├── train_catsam_style.py        CAT-SAM-style prompt training
+│   └── train_instance_fewshot.py    D-Series archive (v3 NaN fixes preserved)
 ├── eval/                            # Evaluation (v3)
-│   ├── eval_zero_shot.py            ✅ V3-01: Zero-shot COCO AP baseline (AP=0.0182)
-│   └── eval_fewshot.py              🔄 NEW: Few-shot COCO AP evaluation
-├── archive/                         # v2 archived scripts (reference only)
-│   ├── train_instance_fewshot.py    D-Series training script (v3 NaN fixes preserved)
+│   ├── evaluate_instance.py         ✅ OFFICIAL V3 evaluator (ONLY sanctioned entry point)
+│   ├── eval_fewshot_allclass.py     ✅ V3: All-class few-shot eval
+│   ├── eval_novel_fewshot.py        ✅ V3: Novel-class few-shot eval
+│   ├── eval_zero_shot.py            ✅ V3-01: Zero-shot COCO AP baseline
+│   ├── eval_fastsam_prompted.py     ✅ FastSAM prompted eval
+│   ├── export_results_csv.py        ✅ Export eval results to CSV
+│   └── run_ablation.py              ✅ Ablation sweep runner
+├── instance/                        # v2 archived eval scripts (reference only)
 │   ├── eval_baseline_instance.py    D-00 zero-shot baseline
+│   ├── eval_c02a_fastsam_fewshot.py C-02a FastSAM few-shot
 │   ├── eval_c03_catsam_fewshot.py   C-03 Cross-Attention FSS
 │   └── eval_c04_full_fewshot.py     C-04 Full 15-class FSS
+├── diag/                            # Diagnostics
+│   ├── diag_proto_mask_stats.py     🆕 Probe 1: Proto mask statistics (l2 vs none)
+│   ├── diag_fusion_attribution.py   🆕 Probe 2: Fusion contribution ratio analysis
+│   ├── diag_prototype_analysis.py   ✅ Proto collapse & diversity diagnosis
+│   ├── diag_gradient_starvation.py  ✅ Gradient starvation diagnosis
+│   ├── diag_object_size.py          ✅ Object size distribution analysis
+│   ├── diag_feature_vis.py          ✅ Feature space visualization
+│   ├── diag_feature_space.py        ✅ Feature space analysis
+│   ├── diag_attention_sparse.py     ✅ Sparse attention quality
+│   ├── diag_dense_analysis.py       ✅ Dense matching analysis
+│   ├── diag_causal_dense_softmax.py ✅ Causal dense softmax
+│   └── ...                          (25+ diagnostic scripts total)
 ├── paper_a/                         # Paper A archive (main branch, historical)
 ├── paper_b/                         # B-Series experiments (reusable in v3)
 │   ├── eval_b00_tile_size_sensitivity.py   → V3-02
@@ -141,11 +217,6 @@ tools/
 │   ├── eval_b02_learnability.py            → V3-04
 │   ├── eval_b03_router_architecture.py     → SPM ablation
 │   └── ...
-├── diag/                            # Diagnostics
-│   ├── diag_b04_overfit.py
-│   ├── diag_class_stats.py
-│   ├── diag_check_labels.py
-│   └── diag_trace_labels.py
 └── viz/                             # Visualization
     ├── viz_paper_a_p6.py
     └── viz_paper_a_router.py
@@ -206,7 +277,7 @@ High-Res Image (H×W, up to 4000×4000)
 
 ```
 Phase 1: Zero-Shot Baseline
-  V3-01: FastSAM on iSAID Instance Split → AP=0.015
+  V3-01: FastSAM on iSAID Instance Split → AP=0.0182
 
 Phase 2: Spatial Sparsity (reuse B-00→B-03)
   V3-02: Tile FG distribution → 60% empty @ 1024px
@@ -302,31 +373,56 @@ Three-layer protection:
 
 Fixed: `buffer_size=1`, `flush_interval=1.0` globally in `adatile/logging/backends.py`. Every record immediately written.
 
+### Proto-basis magnitude explosion (saturation death)
+
+Unfrozen fine-tuning (uf≥5) causes FastSAM proto basis norm to explode (523 → 3.4e7 → 1e11).
+This pushes `coeffs@proto` into the sigmoid dead zone → zero gradient → CoeffPredictor dies.
+
+**Workaround**: `--normalize-proto l2` constrains per-basis L2 norm to 1, restoring gradient flow.
+**Caveat**: Saturation can "transfer" from basis to coefficients (coeff_l2 → 19183).
+LayerNorm variant (`--normalize-proto layernorm`) constrains both basis and coeffs simultaneously.
+See `AdaptiveSparseDecoder._normalize_proto()`.
+
 ## Common Commands
 
 ```bash
-# Dev install (full toolchain)
-pip install -e ".[dev,viz]"
+# One-time setup
+pip install -e ".[dev,viz]"                              # dev install
+git config core.hooksPath .githooks                      # enable protocol freeze guard
 
 # Tests
 pytest tests/ -v
 pytest tests/ -v --cov=adatile --cov-report=term-missing
+pytest tests/test_protocol_frozen.py tests/test_protocol_audit.py tests/test_instance_match.py -q
 
 # Lint / Format
 ruff check adatile/
 black adatile/ tests/
 
-# Data preprocessing (new v3 pipeline)
+# Data preprocessing
 python tools/data/prep_isaid.py                         # Step 0: fix COCO JSON
-python tools/data/prep_isaid_instance.py                # 🔄 NEW: Instance Few-Shot Split
+python tools/data/prep_isaid_instance.py                # Instance Few-Shot Split
 
-# v3 Training
-python tools/train/train_base.py --epochs 50 --batch-size 8    # 🔄 NEW: Base pre-training
-python tools/train/train_fewshot.py --k-shot 5 --fold 0        # 🔄 NEW: Few-shot fine-tune
+# v3 Training (main entry points)
+python tools/train/train_fewshot_allclass.py --k-shot 1 --epochs 50 --unfreeze-layers 8
+python tools/train/train_base.py --epochs 50 --batch-size 8
+python tools/train/train_supervised_full.py --epochs 50
 
-# v3 Evaluation
-python tools/eval/eval_zero_shot.py --split val                 # 🔄 NEW
-python tools/eval/eval_fewshot.py --checkpoint best_model.pt    # 🔄 NEW
+# v3 Evaluation (OFFICIAL — use evaluate_instance.py for ALL paper numbers)
+python tools/eval/evaluate_instance.py \
+    --checkpoint best_model.pt --decoder adaptive --prototype-source p4 \
+    --data-root data/iSAID_instance_fewshot --data-format isaid_instance \
+    --k-shot 1 --seed 42            # writes instance_metrics.json
+
+# Zero-shot baseline
+python tools/eval/eval_zero_shot.py --split val --data-format isaid_instance
+
+# Protocol guards
+pytest tests/test_protocol_frozen.py tests/test_protocol_audit.py tests/test_instance_match.py -q
+
+# Diagnostics (Probe 1 & 2 — M-F-T attribution)
+python tools/diag/diag_proto_mask_stats.py --checkpoint-a <none.pt> --checkpoint-b <l2.pt> --device cuda
+python tools/diag/diag_fusion_attribution.py --checkpoint-a <none.pt> --checkpoint-b <l2.pt> --device cuda
 
 # B-Series (reusable in v3)
 python tools/paper_b/eval_b00_tile_size_sensitivity.py
@@ -336,11 +432,15 @@ python tools/paper_b/eval_b02_learnability.py
 
 ## Supplementary Docs
 
+- **`EVALUATION_PROTOCOL_V3.md`** — ⚠️ Official frozen evaluation protocol (single source of truth for all paper results)
+- **`EXPERIMENT_MANIFEST.md`** — Paper experiment registry: each ID → Protocol → Manifest → Seed → Checkpoint → Commit
 - **`docs/V3_RESTRUCTURE_PLAN.md`** — v3 restructuring plan (strategy, module rename, data protocol, experiment line)
 - **`docs/PROJECT_MASTER.md`** — Full project overview (all A/B/C/D series + engineering)
 - **`docs/D_series_master.md`** — D-Series complete archive (5 experiments + NaN engineering)
 - **`RESEARCH_MAP.md`** — Research map with evidence chains and architecture diagrams
 - **`docs/c04_code_explanation.md`** — Line-by-line walkthrough of C-04 full 15-class experiment
+- **`docs/appendix_A_protocol_validation.md`** — Protocol V3 ↔ COCO consistency proof (Supplementary Material)
+- **`docs/protocol_reconciliation.md`** — Historical protocol → V3 migration (why historical results are NOT used in paper)
 
 ## Persistent Memory
 

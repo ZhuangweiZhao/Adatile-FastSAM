@@ -71,6 +71,7 @@ from adatile.metrics.coco_eval import (
     mask_to_bbox,
 )
 from adatile.metrics.instance_match import greedy_match, instance_miou
+from adatile.metrics.instance_generation import generate_instances, InstanceMethod
 
 # ── 复用训练脚本中的数据/特征/原型工具 | Reuse data/feature/prototype helpers ──
 from tools.train.train_fewshot_allclass import (
@@ -90,9 +91,10 @@ from tools.train.train_fewshot_allclass import (
 from adatile.decoder.adaptive_sparse_decoder import AdaptiveSparseDecoder
 from adatile.decoder.adaptive_decoder_p3p4 import AdaptiveDecoderP3P4
 from adatile.decoder.pure_cnn_decoder import PureDecoder, PureDecoderP3P4
+from adatile.decoder.dynamic_kernel_decoder import DynamicKernelDecoder
 
 # 类别是否具备条件化能力 (需要 prototype) | Whether a decoder is class-conditioned
-_CLASS_CONDITIONED = {"adaptive", "adaptive-p3p4", "baseline"}
+_CLASS_CONDITIONED = {"adaptive", "adaptive-p3p4", "baseline", "dynamic_kernel"}
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -209,6 +211,16 @@ def build_model_and_decoder(args, device: str, logger):
     elif args.decoder == "pure-p3p4":
         p3_channels = test_feats[0]["p3"].shape[1]
         decoder = PureDecoderP3P4(p3_channels=p3_channels, p4_channels=p4_channels).to(device)
+    elif args.decoder == "dynamic_kernel":
+        p3_channels = test_feats[0]["p3"].shape[1]
+        normalize_proto = ckpt.get("normalize_proto", "none")
+        n_kernels = ckpt.get("n_kernels", args.n_kernels)
+        decoder = DynamicKernelDecoder(
+            p3_channels=p3_channels, p4_channels=p4_channels,
+            proto_dim=32, n_kernels=n_kernels, kernel_dim=256, fpn_dim=256,
+            normalize_proto=normalize_proto,
+        ).to(device)
+        logger.log_info("decoder", f"  n_kernels={n_kernels} normalize_proto={normalize_proto}")
     else:  # baseline — FewShotDecoder 定义在训练脚本中 | defined in the training script
         from tools.train.train_fewshot_allclass import FewShotDecoder
         decoder = FewShotDecoder(feat_dim=p4_channels).to(device)
@@ -345,20 +357,27 @@ def decoder_prob_map(decoder, feats, support_proto, support_tmpl,
 
 
 def prob_map_to_instances(prob_map: np.ndarray, category_id: int,
-                          score_thr: float, min_area: int) -> list[dict]:
-    """前景概率图 → 实例列表 (连通域分解, 置信度=块内概率均值).
-    Foreground prob map → instance list (connected components, score = mean prob in component).
+                          score_thr: float, min_area: int,
+                          method: InstanceMethod = "connected_components",
+                          min_distance: int = 12) -> list[dict]:
+    """前景概率图 → 实例列表 (支持多种实例化方法).
+    Foreground prob map → instance list (multiple generation methods).
 
-    :return: list of {category_id, mask(bool [H,W]), score}
+    :param method: 实例化方法 | Instance generation method.
+        connected_components — baseline
+        watershed_distance    — distance transform + watershed (best for splitting touching objects)
+        watershed_gradient    — probability gradient + watershed
+    :param min_distance: 最近峰值间距 (watershed 系列参数) | Min distance between peaks.
     """
-    binary = (prob_map > score_thr).astype(np.uint8)
-    comps = connected_components_to_instances(binary, min_area=min_area)
-    instances = []
-    for comp in comps:
-        # 置信度 = 连通块内前景概率均值 | score = mean FG probability inside the component
-        score = float(prob_map[comp].mean())
-        instances.append({"category_id": category_id, "mask": comp, "score": score})
-    return instances
+    instances_raw = generate_instances(
+        prob_map, method=method,
+        score_thr=score_thr, min_area=min_area,
+        min_distance=min_distance,
+    )
+    # 添加 category_id | Attach category_id
+    for inst in instances_raw:
+        inst["category_id"] = category_id
+    return instances_raw
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -447,7 +466,11 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--output-dir", type=str, default=None)
     p.add_argument("--decoder", type=str, default="adaptive",
-                   choices=["baseline", "adaptive", "adaptive-p3p4", "pure", "pure-p3p4"])
+                   choices=["baseline", "adaptive", "adaptive-p3p4", "pure", "pure-p3p4",
+                            "dynamic_kernel"])
+    p.add_argument("--n-kernels", type=int, default=16,
+                   help="DynamicKernelDecoder: 每类动态核数 (需与训练一致) | "
+                        "Kernels per class (must match training checkpoint)")
     p.add_argument("--prototype-source", type=str, default="p4", choices=["p4", "p8"])
     p.add_argument("--iou-thr", type=float, default=0.5,
                    help="Instance mIoU / TP-FP-FN 的匹配阈值 | Match threshold for mIoU/TP-FP-FN")
@@ -455,6 +478,12 @@ def parse_args():
                    help="前景二值化阈值 | Foreground binarization threshold")
     p.add_argument("--min-area", type=int, default=16,
                    help="连通域最小面积 | Min connected-component area")
+    p.add_argument("--instance-method", type=str, default="connected_components",
+                   choices=["connected_components", "watershed_distance", "watershed_gradient"],
+                   help="实例生成方法 | Instance generation method. "
+                        "watershed_distance: distance transform + watershed (best for touching objects)")
+    p.add_argument("--min-distance", type=int, default=12,
+                   help="Watershed 最近峰值间距 (像素) | Min distance between watershed peaks")
     p.add_argument("--no-zero-shot", action="store_true", help="跳过 zero-shot 基线 | Skip zero-shot baseline")
     p.add_argument("--manifest", type=str, default=None,
                    help="固定评估集清单路径 | Fixed evaluation-set manifest path. "
@@ -568,16 +597,47 @@ def main():
 
         # 逐类前景图 → 实例 | per-class FG map → instances
         pred_by_class = defaultdict(list)   # cls → [inst dict]
-        if is_conditioned:
+        if args.decoder == "dynamic_kernel":
+            # DynamicKernelDecoder: Prototype → N Kernels → N Instance Masks
+            # Each kernel output is a candidate instance (no CC decomposition needed)
+            for cls_id, pk in class_protos.items():
+                with torch.no_grad():
+                    masks_s8, proto_mask = decoder(
+                        feats["p3"], feats["p4"], feats["proto"], pk["proto"],
+                    )
+                # masks_s8: [N_kernels, H/8, W/8] sigmoid ∈ [0,1]
+                # Upsample each kernel mask to tile resolution
+                for k_idx in range(masks_s8.shape[0]):
+                    kernel_mask = masks_s8[k_idx]  # [H/8, W/8]
+                    mask_up = F.interpolate(
+                        kernel_mask.unsqueeze(0).unsqueeze(0),
+                        size=(H, W), mode="bilinear", align_corners=False,
+                    ).squeeze()  # [H, W]
+                    mask_np = mask_up.float().cpu().numpy()
+
+                    # Score = mean prob within mask region (only for score_thr filtering)
+                    binary = mask_np > args.score_thr
+                    if binary.sum() < args.min_area:
+                        continue
+                    score = float(mask_np[binary].mean())
+
+                    pred_by_class[cls_id].append({
+                        "mask": binary,
+                        "score": score,
+                        "category_id": cls_id,
+                    })
+        elif is_conditioned:
             for cls_id, pk in class_protos.items():
                 prob = decoder_prob_map(decoder, feats, pk["proto"], pk["support_tmpl"],
                                         args.decoder, H, W)
-                insts = prob_map_to_instances(prob, cls_id, args.score_thr, args.min_area)
+                insts = prob_map_to_instances(prob, cls_id, args.score_thr, args.min_area,
+                                               method=args.instance_method, min_distance=args.min_distance)
                 pred_by_class[cls_id].extend(insts)
         else:
             # pure decoder: 无类条件 → 单张前景图, 类无关 | class-agnostic single FG map
             prob = decoder_prob_map(decoder, feats, None, None, args.decoder, H, W)
-            insts = prob_map_to_instances(prob, 1, args.score_thr, args.min_area)
+            insts = prob_map_to_instances(prob, 1, args.score_thr, args.min_area,
+                                          method=args.instance_method, min_distance=args.min_distance)
             pred_by_class[1].extend(insts)
 
         # 送入 COCO AP 评估器 | Feed COCO AP evaluator
