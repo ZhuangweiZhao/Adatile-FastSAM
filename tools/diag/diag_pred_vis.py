@@ -536,6 +536,30 @@ def run_full_image_mode(args, model, decoder, extract_features, ckpt, device):
     print(f"  Prototypes: {[ISAID_CLASSES.get(c, f'c{c}') for c in sorted(class_protos.keys())]}")
     print(f"  [TIMING] Prototype building: {time.perf_counter() - t0:.2f}s")
 
+    # ── ⑤ Prototype-Query Similarity per class | Prototype-Query 相似度 ──
+    print(f"\n  [⑤ Prototype-Query Cosine Similarity]")
+    # Use first tile's features as query representation
+    first_tile = tiles[0]["img"]
+    pad_h, pad_w = (32 - first_tile.shape[0] % 32) % 32, (32 - first_tile.shape[1] % 32) % 32
+    if pad_h or pad_w:
+        first_tile_pad = np.pad(first_tile, ((0, pad_h), (0, pad_w), (0, 0)), mode="reflect")
+    else:
+        first_tile_pad = first_tile
+    with torch.no_grad():
+        qf = extract_features(model, [first_tile_pad], device)[0]
+    query_vec = F.normalize(qf[args.prototype_source].mean(dim=(1, 2)), p=2, dim=0).cpu().numpy()
+    print(f"    {'Class':<22s} {'CosSim':>8s}")
+    print(f"    {'-'*32}")
+    proto_sims = {}
+    for cls_id in sorted(class_protos.keys()):
+        pv = class_protos[cls_id]["proto"]
+        pv_norm = pv / (np.linalg.norm(pv) + 1e-8)
+        sim = float(np.dot(pv_norm, query_vec))
+        proto_sims[cls_id] = sim
+        cname = ISAID_CLASSES.get(cls_id, f"c{cls_id}")
+        bar = "█" * max(0, int(sim * 20)) + "░" * max(0, 20 - int(sim * 20))
+        print(f"    {cname:<22s} {sim:>8.4f}  {bar}")
+
     # ── Per-tile inference ──
     print(f"\n  Running inference on {len(tiles)} tiles...")
     all_tile_results = []
@@ -566,6 +590,11 @@ def run_full_image_mode(args, model, decoder, extract_features, ckpt, device):
                     feats["proto"].unsqueeze(0) if feats["proto"].dim() == 3 else feats["proto"],
                     proto_vec,
                 )
+                # Save center_hm for stitching (diagnostic: GT center vs pred center)
+                center_np = F.interpolate(
+                    center_hm.unsqueeze(0).unsqueeze(0) if center_hm.dim() == 2 else center_hm.unsqueeze(0),
+                    size=(tile_size, tile_size), mode="bilinear", align_corners=False,
+                ).squeeze().cpu().numpy()
                 # Per-class proto mask → aggregate
                 best_prob = np.zeros((tile_size, tile_size), dtype=np.float32)
                 for cls_id, pk in class_protos.items():
@@ -617,6 +646,7 @@ def run_full_image_mode(args, model, decoder, extract_features, ckpt, device):
 
         all_tile_results.append({
             "y0": y0, "x0": x0, "h": h, "w": w, "prob": tile_prob,
+            "center": center_np if args.decoder == "center_affinity" else None,
         })
 
         if (ti + 1) % max(1, len(tiles) // 5) == 0:
@@ -631,6 +661,12 @@ def run_full_image_mode(args, model, decoder, extract_features, ckpt, device):
     print(f"\n  Stitching {len(all_tile_results)} tile predictions...")
     full_prob = stitch_prob_maps(all_tile_results, H_full, W_full, tile_size, stride_val)
     full_binary = full_prob > args.score_thr
+    # Stitch center heatmap (center_affinity only)
+    full_center = None
+    if args.decoder == "center_affinity":
+        center_results = [{"y0": tr["y0"], "x0": tr["x0"], "h": tr["h"], "w": tr["w"],
+                           "prob": tr["center"]} for tr in all_tile_results]
+        full_center = stitch_prob_maps(center_results, H_full, W_full, tile_size, stride_val)
     print(f"  [TIMING] Stitching: {time.perf_counter() - t0:.2f}s")
 
     # ── Generate instances from stitched prob map ──
@@ -822,7 +858,7 @@ def run_full_image_mode(args, model, decoder, extract_features, ckpt, device):
     out_path = os.path.join(args.output, f"{img_stem}_full_summary.png")
     _plot_full_image_summary(
         full_img, img_stem, gt_anns_raw, gt_full["class_ids"], pred_instances,
-        full_prob, full_binary,
+        full_prob, full_binary, full_center,
         tp, fp_count, fn_count, tp_mask, fp_mask, fn_mask,
         H_full, W_full, out_path,
     )
@@ -831,8 +867,8 @@ def run_full_image_mode(args, model, decoder, extract_features, ckpt, device):
 
 
 def _plot_full_image_summary(full_img, stem, gt_anns_raw, gt_class_ids, pred_insts,
-                             prob, binary, tp, fp_count, fn, tp_mask, fp_mask, fn_mask,
-                             H, W, out_path):
+                             prob, binary, center_hm, tp, fp_count, fn,
+                             tp_mask, fp_mask, fn_mask, H, W, out_path):
     """全图综合可视化: 2×3 grid | Full-image summary: 2×3 grid.
 
     GT 从 polygon 按需渲染, 不预存 mask | GT rendered from polygons on-demand.
@@ -859,10 +895,15 @@ def _plot_full_image_summary(full_img, stem, gt_anns_raw, gt_class_ids, pred_ins
                          f"Classes: {', '.join(gt_classes[:6])}", fontsize=9)
     axes[0, 0].axis("off")
 
-    # [0,1] GT per-class mask (per-instance too cluttered with 3304 instances)
-    gt_class_map = np.zeros((H, W), dtype=np.int32)
+    # [0,1] Center Heatmap + GT Centers | 中心热力图 + GT 中心点
+    axes[0, 1].imshow(full_img, alpha=0.4)
+    if center_hm is not None:
+        axes[0, 1].imshow(center_hm, cmap="hot", alpha=0.6, vmin=0, vmax=max(center_hm.max(), 0.01))
+        c_max, c_mean = center_hm.max(), center_hm.mean()
+    else:
+        c_max, c_mean = 0, 0
+    # Draw GT centers: color by class, size by area
     for gt_ann in gt_anns_raw:
-        cat_id = gt_ann["category_id"]
         seg = gt_ann.get("segmentation", [])
         if not seg:
             continue
@@ -871,13 +912,15 @@ def _plot_full_image_summary(full_img, stem, gt_anns_raw, gt_class_ids, pred_ins
             if len(poly) < 6:
                 continue
             pts = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
-            cv2.fillPoly(gt_class_map, [pts], cat_id)
-    axes[0, 1].imshow(full_img, alpha=0.3)
-    axes[0, 1].imshow(gt_class_map, cmap="tab20", alpha=0.5, vmin=1, vmax=15)
-    legend_patches = [Patch(color=CLASS_COLORS[c], label=ISAID_CLASSES.get(c, f"c{c}"))
-                      for c in sorted(gt_class_ids)]
-    axes[0, 1].legend(handles=legend_patches, loc='lower right', fontsize=6, ncol=1)
-    axes[0, 1].set_title(f"GT (per-class)\n{n_gt} instances, {len(gt_class_ids)} classes", fontsize=9)
+            cy, cx = pts[:, 0, 1].mean(), pts[:, 0, 0].mean()
+            cat_id = gt_ann["category_id"]
+            rgba = list(CLASS_COLORS[cat_id])
+            sz = max(3, min(15, np.sqrt(gt_ann["area"]) / 8))
+            axes[0, 1].plot(cx, cy, 'o', color=rgba, markersize=sz, markeredgewidth=0.5,
+                           markerfacecolor='none', alpha=0.7)
+    axes[0, 1].set_title(f"Center Heatmap + GT Centers\n"
+                         f"HM max={c_max:.3f}, mean={c_mean:.4f}\n"
+                         f"Circles = GT centers (color=class, size∝√area)", fontsize=9)
     axes[0, 1].axis("off")
 
     # [0,2] Predicted prob map
