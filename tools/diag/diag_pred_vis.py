@@ -748,17 +748,74 @@ def run_full_image_mode(args, model, decoder, extract_features, ckpt, device):
         print(f"    TP={tp}, FP={fp_count}, FN={fn_count}")
         print(f"    Precision={precision:.3f}, Recall={recall:.3f}, F1={f1:.3f}")
 
-        # Per-class breakdown (render GT masks only when counting)
-        print(f"\n  Per-Class Breakdown:")
+        # ── ① Per-class Recall | 按类别统计 Recall ──
+        print(f"\n  [① Per-Class Recall]")
         n_per_class = defaultdict(int)
         n_matched_per_class = defaultdict(int)
         for j, gt_ann in enumerate(gt_anns_raw):
             n_per_class[gt_ann["category_id"]] += 1
             if gt_matched[j]:
                 n_matched_per_class[gt_ann["category_id"]] += 1
+        print(f"    {'Class':<22s} {'Recall':>7s}  {'Matched':>8s}  {'GT':>6s}")
+        print(f"    {'-'*50}")
         for cls_id in sorted(gt_full["class_ids"]):
+            n_gt_c = n_per_class.get(cls_id, 0)
+            n_tp_c = n_matched_per_class.get(cls_id, 0)
+            r_c = n_tp_c / max(n_gt_c, 1)
             cname = ISAID_CLASSES.get(cls_id, f"c{cls_id}")
-            print(f"    {cname} (id={cls_id}): matched={n_matched_per_class.get(cls_id, 0)}/{n_per_class.get(cls_id, 0)}")
+            bar = "█" * int(r_c * 20) + "░" * (20 - int(r_c * 20))
+            print(f"    {cname:<22s} {r_c:6.1%}  {n_tp_c:>8d}  {n_gt_c:>6d}  {bar}")
+
+        # ── ② Area-bucket Recall | 按目标面积统计 Recall ──
+        print(f"\n  [② Area-Bucket Recall]")
+        area_buckets = [(0, 32), (32, 64), (64, 128), (128, 256), (256, 512), (512, 999999)]
+        area_n = defaultdict(int)
+        area_tp = defaultdict(int)
+        for j, gt_ann in enumerate(gt_anns_raw):
+            a = gt_ann["area"]
+            for lo, hi in area_buckets:
+                if lo <= a < hi:
+                    area_n[(lo, hi)] += 1
+                    if gt_matched[j]:
+                        area_tp[(lo, hi)] += 1
+                    break
+        print(f"    {'Area Range':<16s} {'Recall':>7s}  {'Matched':>8s}  {'GT':>6s}")
+        print(f"    {'-'*45}")
+        for lo, hi in area_buckets:
+            n_a = area_n.get((lo, hi), 0)
+            tp_a = area_tp.get((lo, hi), 0)
+            if n_a > 0:
+                r_a = tp_a / n_a
+                bar = "█" * int(r_a * 20) + "░" * (20 - int(r_a * 20))
+                print(f"    [{lo:>4d}, {hi:>6d})  {r_a:6.1%}  {tp_a:>8d}  {n_a:>6d}  {bar}")
+
+        # ── ③ Score Distribution | 预测分数分布 ──
+        print(f"\n  [③ Prediction Score Distribution]")
+        if pred_instances:
+            scores = np.array([p.get("score", 0) for p in pred_instances])
+            print(f"    n_pred={len(scores)}, min={scores.min():.4f}, max={scores.max():.4f}, "
+                  f"mean={scores.mean():.4f}, std={scores.std():.4f}")
+            # Histogram bins
+            bins = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+            print(f"    Score histogram:")
+            for lo, hi in zip(bins[:-1], bins[1:]):
+                n = ((scores >= lo) & (scores < hi)).sum()
+                if n > 0:
+                    bar = "█" * n
+                    print(f"      [{lo:.1f}, {hi:.1f}): {n:>4d}  {bar}")
+
+        # ── ④ Probability Map Statistics | 概率图统计 ──
+        print(f"\n  [④ Probability Map Stats]")
+        print(f"    Stitched prob map: min={full_prob.min():.6f}, max={full_prob.max():.4f}, "
+              f"mean={full_prob.mean():.6f}, median={np.median(full_prob):.6f}")
+        # Percentiles
+        for pct in [50, 90, 95, 99, 99.9]:
+            v = np.percentile(full_prob, pct)
+            print(f"    P{pct:>4.1f}: {v:.6f}")
+        # Fraction of pixels above common thresholds
+        for thr in [0.1, 0.2, 0.3, 0.5, 0.7, 0.9]:
+            frac = (full_prob > thr).mean()
+            print(f"    frac > {thr:.1f}: {frac:.4%} ({int(frac * full_prob.size):,} px)")
 
     # ── Generate full-image visualization ──
     t0 = time.perf_counter()
