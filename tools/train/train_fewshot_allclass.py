@@ -942,61 +942,89 @@ def train_episode(model, decoder, optimizer, class_id: int,
         _, H_s8, W_s8 = masks_s8.shape
         H_gt, W_gt = query_gt.shape
 
-        # Load per-instance GT masks at FULL resolution (once, for both matching & loss)
+        # ── Common GT | 共享 GT ──
+        gt_tensor = torch.from_numpy(query_gt).float().to(device)  # [H_gt, W_gt] merged
+
+        # ═══════════════════════════════════════════════════════════════
+        # Loss 1: Proto auxiliary (训练 coeff_predictor + proto_norm)
+        #          始终激活, 防止 proto branch 梯度枯竭
+        # ═══════════════════════════════════════════════════════════════
+        proto_up = F.interpolate(
+            proto_mask.unsqueeze(0).unsqueeze(0), size=(H_gt, W_gt),
+            mode='bilinear', align_corners=False,
+        ).squeeze(0).squeeze(0)  # [H_gt, W_gt]
+        proto_bce = F.binary_cross_entropy(proto_up.clamp(1e-7, 1 - 1e-7), gt_tensor)
+        proto_inter = (proto_up * gt_tensor).sum()
+        proto_union = proto_up.sum() + gt_tensor.sum()
+        proto_dice_val = (2.0 * proto_inter + 1e-6) / (proto_union + 1e-6)
+        proto_loss = proto_bce + (1.0 - proto_dice_val)
+
+        # ═══════════════════════════════════════════════════════════════
+        # Loss 2: Semantic warmup (训练 FPN + mask_feat + kernel_generator)
+        #          max-pool over kernels = OR → BCE+Dice vs merged GT
+        #          所有 kernel 合并后的前景应覆盖全部 GT
+        #          Always active, ensures FPN/mask_feat/kernel_gen get gradient
+        # ═══════════════════════════════════════════════════════════════
+        kernel_merged = masks_s8.max(dim=0)[0]  # [H/8, W/8] — OR across N kernels
+        kernel_up = F.interpolate(
+            kernel_merged.unsqueeze(0).unsqueeze(0), size=(H_gt, W_gt),
+            mode='bilinear', align_corners=False,
+        ).squeeze(0).squeeze(0)  # [H_gt, W_gt]
+        kernel_bce = F.binary_cross_entropy(kernel_up.clamp(1e-7, 1 - 1e-7), gt_tensor)
+        kernel_inter = (kernel_up * gt_tensor).sum()
+        kernel_union = kernel_up.sum() + gt_tensor.sum()
+        kernel_dice_val = (2.0 * kernel_inter + 1e-6) / (kernel_union + 1e-6)
+        kernel_sem_loss = kernel_bce + (1.0 - kernel_dice_val)
+
+        # ═══════════════════════════════════════════════════════════════
+        # Loss 3: Instance-level Hungarian matching (per-instance GT)
+        #          初期 match 可能 = 0, 随着 semantic warmup 学会 FG 后逐步激活
+        # ═══════════════════════════════════════════════════════════════
         gt_full_list = load_instance_masks_from_coco(
             query_stem, split, data_root, class_id, target_size=None,
         )
 
         if len(gt_full_list) == 0:
-            # 无 GT 实例: 所有预测拉向零 | No GT instances: pull all predictions to zero
-            loss = masks_s8.mean() * 0.1
-            loss_dict = {"dice": 0.0, "bce": 0.0,
-                         "n_matched": 0, "n_unmatched_pred": 0,
-                         "n_unmatched_gt": 0, "n_gt": 0}
+            inst_loss = masks_s8.mean() * 0.1
+            loss_dict = {
+                "dice": proto_dice_val.item(), "bce": proto_bce.item(),
+                "kernel_dice": kernel_dice_val.item(),
+                "n_matched": 0, "n_unmatched_pred": 0,
+                "n_unmatched_gt": 0, "n_gt": 0,
+            }
         else:
             gt_full = torch.from_numpy(np.stack(gt_full_list)).float().to(device)
-            # gt_full: [M, H_gt, W_gt]
-
-            # Resize GT to stride-8 for Hungarian matching (faster than full-res)
             gt_s8 = F.interpolate(
                 gt_full.unsqueeze(1).float(), size=(H_s8, W_s8),
                 mode='nearest',
             ).squeeze(1)  # [M, H_s8, W_s8]
-
-            # Upsample predicted masks to GT resolution for loss
             masks_gt = F.interpolate(
                 masks_s8.unsqueeze(0), size=(H_gt, W_gt),
                 mode='bilinear', align_corners=False,
             ).squeeze(0)  # [N, H_gt, W_gt]
 
-            # Hungarian matching at stride-8 (faster than full-res)
             matched, unmatched_pred, unmatched_gt = hungarian_match_instances(
                 masks_s8, gt_s8, min_dice=0.05,
             )
-
-            # Multi-instance loss at original resolution
-            loss, loss_dict = multi_instance_loss(
+            inst_loss, loss_dict = multi_instance_loss(
                 masks_gt, gt_full, matched, unmatched_pred, unmatched_gt,
                 dice_weight=1.0, bce_weight=1.0, empty_weight=0.1,
             )
-            # Ensure epoch tracking has all required keys
-            loss_dict["dice"] = 0.0
-            loss_dict["bce"] = 0.0
+            loss_dict["dice"] = proto_dice_val.item()
+            loss_dict["bce"] = proto_bce.item()
+            loss_dict["kernel_dice"] = kernel_dice_val.item()
             loss_dict["n_gt"] = len(gt_full_list)
 
-        # IoU: use proto_mask vs query_gt for a quick semantic-level metric
+        # ── Total loss: proto auxiliary + kernel semantic + instance matching ──
+        loss = proto_loss + kernel_sem_loss + inst_loss
+
+        # IoU: kernel semantic output (max-pool of all kernels)
         with torch.no_grad():
-            proto_up = F.interpolate(
-                proto_mask.unsqueeze(0).unsqueeze(0), size=(H_gt, W_gt),
-                mode='bilinear', align_corners=False,
-            ).squeeze()
-            pred_bin = (proto_up > 0.5).float()
-            gt_tensor_iou = torch.from_numpy(query_gt).float().to(device)
-            inter_iou = (pred_bin * gt_tensor_iou).sum()
-            union_iou = (pred_bin + gt_tensor_iou).clamp(0, 1).sum()
+            pred_bin = (kernel_up > 0.5).float()
+            inter_iou = (pred_bin * gt_tensor).sum()
+            union_iou = (pred_bin + gt_tensor).clamp(0, 1).sum()
             iou = (inter_iou / max(union_iou, 1)).item()
 
-        # Ensure loss is scalar
         if loss.dim() > 0:
             loss = loss.mean()
     elif decoder_type in ("pure", "pure-p3p4"):
@@ -1526,13 +1554,19 @@ def main():
             spm_str = f", spm_mean={avg_spm_mean:.3f}"
         else:
             spm_str = ""
-        # Dynamic kernel: show matching stats
+        # Dynamic kernel: show matching stats + kernel semantic Dice
         dk_str = ""
         if decoder_type == "dynamic_kernel":
             matched_vals = epoch_losses.get("n_matched", [])
             gt_vals = epoch_losses.get("n_gt", [])
+            kdice_vals = [v for v in epoch_losses.get("kernel_dice", []) if v is not None]
+            parts = []
+            if kdice_vals:
+                parts.append(f"kdice={np.mean(kdice_vals):.3f}")
             if matched_vals and gt_vals:
-                dk_str = f", match={np.mean(matched_vals):.1f}/{np.mean(gt_vals):.1f}"
+                parts.append(f"match={np.mean(matched_vals):.1f}/{np.mean(gt_vals):.1f}")
+            if parts:
+                dk_str = ", " + ", ".join(parts)
         print(f"  Epoch {epoch + 1}: loss={avg_loss:.4f}, iou={avg_iou:.4f}, "
               f"lr={scheduler.get_last_lr()[0]:.2e}{spm_str}{dk_str}{fwd_str}")
 
