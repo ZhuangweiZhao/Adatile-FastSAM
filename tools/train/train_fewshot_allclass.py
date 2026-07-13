@@ -970,7 +970,7 @@ def train_episode(model, decoder, optimizer, class_id: int,
 
         for inst_mask in gt_full_list:
             # Compute centroid of each instance mask at stride-8 resolution
-            inst = torch.from_numpy(inst_mask).float()
+            inst = torch.from_numpy(inst_mask).float().to(device)
             H_i, W_i = inst.shape
             # Downsample mask to stride-8 for center computation
             inst_s8 = F.interpolate(
@@ -1004,7 +1004,7 @@ def train_episode(model, decoder, optimizer, class_id: int,
         fg_mask_s8 = torch.zeros(H_c, W_c, device=device)    # which pixels are FG
 
         for inst_mask in gt_full_list:
-            inst = torch.from_numpy(inst_mask).float()
+            inst = torch.from_numpy(inst_mask).float().to(device)
             H_i, W_i = inst.shape
             inst_s8 = F.interpolate(
                 inst.unsqueeze(0).unsqueeze(0), size=(H_c, W_c),
