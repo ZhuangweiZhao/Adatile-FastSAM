@@ -764,49 +764,63 @@ def run_full_image_mode(args, model, decoder, extract_features, ckpt, device):
     t0 = time.perf_counter()
     out_path = os.path.join(args.output, f"{img_stem}_full_summary.png")
     _plot_full_image_summary(
-        full_img, img_stem, gt_full, pred_instances, full_prob, full_binary,
-        tp, fp_count, fn_count, tp_mask if gt_full["instances"] else None,
-        fp_mask if gt_full["instances"] else None,
-        fn_mask if gt_full["instances"] else None,
+        full_img, img_stem, gt_anns_raw, gt_full["class_ids"], pred_instances,
+        full_prob, full_binary,
+        tp, fp_count, fn_count, tp_mask, fp_mask, fn_mask,
         H_full, W_full, out_path,
     )
     print(f"\n  [SAVED] {out_path}")
     print(f"  [TIMING] Visualization rendering: {time.perf_counter() - t0:.2f}s")
 
 
-def _plot_full_image_summary(full_img, stem, gt, pred_insts, prob, binary,
-                             tp, fp_count, fn, tp_mask, fp_mask, fn_mask,
+def _plot_full_image_summary(full_img, stem, gt_anns_raw, gt_class_ids, pred_insts,
+                             prob, binary, tp, fp_count, fn, tp_mask, fp_mask, fn_mask,
                              H, W, out_path):
-    """全图综合可视化: 2×3 grid."""
-    # Downsample large images for display
-    max_display = 1200
-    scale = min(1.0, max_display / max(H, W))
-    if scale < 1.0:
-        dh, dw = int(H * scale), int(W * scale)
-        img_disp = cv2.resize(full_img, (dw, dh))
-    else:
-        img_disp = full_img
-        dh, dw = H, W
+    """全图综合可视化: 2×3 grid | Full-image summary: 2×3 grid.
+
+    GT 从 polygon 按需渲染, 不预存 mask | GT rendered from polygons on-demand.
+    """
+    n_gt = len(gt_anns_raw)
 
     fig, axes = plt.subplots(2, 3, figsize=(21, 14))
     fig.suptitle(f"Full-Image Prediction — {stem} ({H}×{W})", fontsize=14, fontweight="bold")
 
-    # [0,0] Original + GT overlay
+    # [0,0] Original + GT overlay (polygon contours, no full mask render)
     axes[0, 0].imshow(full_img)
-    _draw_gt_overlay(axes[0, 0], gt)
-    gt_classes = [ISAID_CLASSES.get(c, f"c{c}") for c in sorted(gt["class_ids"])]
-    axes[0, 0].set_title(f"Original + GT ({len(gt['instances'])} insts)\n"
+    for gt_ann in gt_anns_raw:
+        rgba = list(CLASS_COLORS[gt_ann["category_id"]])
+        seg = gt_ann.get("segmentation", [])
+        if seg:
+            polys = seg if isinstance(seg[0], list) else [seg]
+            for poly in polys:
+                if len(poly) < 6:
+                    continue
+                pts = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
+                axes[0, 0].plot(pts[:, 0, 0], pts[:, 0, 1], color=rgba, linewidth=0.5, alpha=0.6)
+    gt_classes = [ISAID_CLASSES.get(c, f"c{c}") for c in sorted(gt_class_ids)]
+    axes[0, 0].set_title(f"Original + GT ({n_gt} insts)\n"
                          f"Classes: {', '.join(gt_classes[:6])}", fontsize=9)
     axes[0, 0].axis("off")
 
-    # [0,1] GT mask only
+    # [0,1] GT per-class mask (per-instance too cluttered with 3304 instances)
+    gt_class_map = np.zeros((H, W), dtype=np.int32)
+    for gt_ann in gt_anns_raw:
+        cat_id = gt_ann["category_id"]
+        seg = gt_ann.get("segmentation", [])
+        if not seg:
+            continue
+        polys = seg if isinstance(seg[0], list) else [seg]
+        for poly in polys:
+            if len(poly) < 6:
+                continue
+            pts = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.fillPoly(gt_class_map, [pts], cat_id)
     axes[0, 1].imshow(full_img, alpha=0.3)
-    gt_label = np.zeros((H, W), dtype=np.int32)
-    for idx, inst in enumerate(gt["instances"], 1):
-        gt_label[inst["mask"]] = idx
-    axes[0, 1].imshow(gt_label, cmap="tab20", alpha=0.7, vmin=0, vmax=max(1, len(gt["instances"])))
-    axes[0, 1].set_title(f"GT Instance Masks\n{len(gt['instances'])} instances, {len(gt['class_ids'])} classes",
-                         fontsize=9)
+    axes[0, 1].imshow(gt_class_map, cmap="tab20", alpha=0.5, vmin=1, vmax=15)
+    legend_patches = [Patch(color=CLASS_COLORS[c], label=ISAID_CLASSES.get(c, f"c{c}"))
+                      for c in sorted(gt_class_ids)]
+    axes[0, 1].legend(handles=legend_patches, loc='lower right', fontsize=6, ncol=1)
+    axes[0, 1].set_title(f"GT (per-class)\n{n_gt} instances, {len(gt_class_ids)} classes", fontsize=9)
     axes[0, 1].axis("off")
 
     # [0,2] Predicted prob map
@@ -817,8 +831,7 @@ def _plot_full_image_summary(full_img, stem, gt, pred_insts, prob, binary,
     # [1,0] Binary prediction
     axes[1, 0].imshow(full_img, alpha=0.3)
     axes[1, 0].imshow(binary, cmap="gray", alpha=0.6)
-    axes[1, 0].set_title(f"Binary > {0.3 if 'score_thr' not in dir() else 0.3}\n"
-                         f"FG area={binary.sum():,} px ({100 * binary.mean():.1f}%)", fontsize=9)
+    axes[1, 0].set_title(f"Binary >0.3\nFG area={binary.sum():,} px ({100 * binary.mean():.1f}%)", fontsize=9)
     axes[1, 0].axis("off")
 
     # [1,1] Predicted instances
@@ -832,11 +845,10 @@ def _plot_full_image_summary(full_img, stem, gt, pred_insts, prob, binary,
     axes[1, 1].axis("off")
 
     # [1,2] TP/FP/FN or stats
-    if tp_mask is not None and gt["instances"]:
+    if tp_mask is not None and n_gt > 0:
         axes[1, 2].imshow(full_img, alpha=0.4)
         _draw_tp_fp_fn_overlay(axes[1, 2], tp_mask, fp_mask, fn_mask, tp, fp_count, fn)
     else:
-        # Show per-class prob stats
         axes[1, 2].axis("off")
         axes[1, 2].text(0.5, 0.5, f"{len(pred_insts)} predicted instances\n"
                                   f"(no GT available for metrics)",
