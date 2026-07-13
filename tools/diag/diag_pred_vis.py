@@ -1,374 +1,282 @@
 """
-Decoder Prediction Visualizer | Decoder 预测可视化工具.
-========================================================
-
-对指定图片/目录运行模型推理，可视化 decoder 的多通道输出，
-帮助诊断实例分离失败的具体位置。
-
-Supports: adaptive, adaptive-p3p4, dynamic_kernel, center_affinity
+Decoder Prediction Visualizer | Decoder 预测可视化工具 (v2 — 复用 eval 基础设施).
 
 用法 | Usage:
-    # 单张图片
     python tools/diag/diag_pred_vis.py \
         --checkpoint runs/.../best_model.pt \
-        --decoder center_affinity \
+        --decoder dynamic_kernel \
         --image data/iSAID_instance_fewshot/images/P0089.png \
-        --output vis_output/ --device cuda
-
-    # 整个目录 (自动取前 N 张)
-    python tools/diag/diag_pred_vis.py \
-        --checkpoint runs/.../best_model.pt \
-        --decoder center_affinity \
-        --image-dir data/iSAID_instance_fewshot/images/ \
-        --n-images 10 \
         --output vis_output/ --device cuda
 """
 
 from __future__ import annotations
 
-import argparse
-import json
-import os
-import sys
+import argparse, json, os, sys, random
+from collections import defaultdict
 
 import numpy as np
 from PIL import Image
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, _PROJECT_ROOT)
 
 from adatile.utils.seed import set_seed
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.patches import Patch
 
 
-def _load_decoder(decoder_type: str, ckpt: dict, p3_channels: int, p4_channels: int, device):
-    """Load decoder from checkpoint based on type."""
+# ═══════════════════════════════════════════════════════════════════
+# Lightweight prototype builder (no dependency on eval module internals)
+# ═══════════════════════════════════════════════════════════════════
+
+def _fastsam_weights_path():
+    """Locate FastSAM-x.pt."""
+    paths = [
+        os.path.join(_PROJECT_ROOT, "weights", "FastSAM-x.pt"),
+        os.path.join(_PROJECT_ROOT, "FastSAM-x.pt"),
+        os.path.join(os.path.expanduser("~"), ".cache", "torch", "hub", "checkpoints", "FastSAM-x.pt"),
+    ]
+    for p in paths:
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError("FastSAM-x.pt not found. Download from https://github.com/CASIA-IVA-Lab/FastSAM")
+
+
+def _load_model(ckpt_path: str, unfreeze_layers: int, decoder_type: str, device: str):
+    """Load FastSAM + decoder from checkpoint. Returns (model, decoder, ckpt_meta)."""
+    from ultralytics import FastSAM
+    from tools.train.train_fewshot_allclass import extract_features
+
+    model = FastSAM(str(_fastsam_weights_path()))
+    model.model.to(device).eval()
+    for p in model.model.parameters():
+        p.requires_grad = False
+
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+
+    # Restore backbone
+    if unfreeze_layers > 0 and "backbone" in ckpt:
+        seq = model.model.model
+        for i_str, state in ckpt["backbone"].items():
+            seq[int(i_str)].load_state_dict(state)
+        print(f"  Restored {unfreeze_layers} backbone layers")
+
+    # Detect channels
+    test_img = np.zeros((896, 896, 3), dtype=np.uint8)
+    test_feats = extract_features(model, [test_img], device)
+    p3_channels = test_feats[0]["p3"].shape[1]
+    p4_channels = test_feats[0]["p4"].shape[1]
+    print(f"  P3={p3_channels}, P4={p4_channels}")
+
+    # Build decoder
     normalize_proto = ckpt.get("normalize_proto", "none")
-
-    if decoder_type == "adaptive":
-        from adatile.decoder.adaptive_sparse_decoder import AdaptiveSparseDecoder
-        d = AdaptiveSparseDecoder(in_channels=p4_channels, use_fdr=False,
-                                  normalize_proto=normalize_proto).to(device)
-    elif decoder_type == "adaptive-p3p4":
-        from adatile.decoder.adaptive_decoder_p3p4 import AdaptiveDecoderP3P4
-        d = AdaptiveDecoderP3P4(p3_channels=p3_channels, p4_channels=p4_channels,
-                                proto_dim=32, hidden_dim=256).to(device)
-    elif decoder_type == "dynamic_kernel":
+    if decoder_type == "dynamic_kernel":
         from adatile.decoder.dynamic_kernel_decoder import DynamicKernelDecoder
         n_kernels = ckpt.get("n_kernels", 16)
-        d = DynamicKernelDecoder(
+        decoder = DynamicKernelDecoder(
             p3_channels=p3_channels, p4_channels=p4_channels,
             proto_dim=32, n_kernels=n_kernels, kernel_dim=256, fpn_dim=256,
             normalize_proto=normalize_proto,
         ).to(device)
+        print(f"  decoder=dynamic_kernel n_kernels={n_kernels}")
     elif decoder_type == "center_affinity":
         from adatile.decoder.center_affinity_decoder import CenterAffinityDecoder
-        d = CenterAffinityDecoder(
+        decoder = CenterAffinityDecoder(
             p3_channels=p3_channels, p4_channels=p4_channels,
-            proto_dim=32, fpn_dim=64,
-            normalize_proto=normalize_proto,
+            proto_dim=32, fpn_dim=64, normalize_proto=normalize_proto,
         ).to(device)
+        print(f"  decoder=center_affinity")
+    elif decoder_type == "adaptive":
+        from adatile.decoder.adaptive_sparse_decoder import AdaptiveSparseDecoder
+        decoder = AdaptiveSparseDecoder(in_channels=p4_channels, use_fdr=False,
+                                        normalize_proto=normalize_proto).to(device)
+    elif decoder_type == "adaptive-p3p4":
+        from adatile.decoder.adaptive_decoder_p3p4 import AdaptiveDecoderP3P4
+        decoder = AdaptiveDecoderP3P4(p3_channels=p3_channels, p4_channels=p4_channels,
+                                      proto_dim=32, hidden_dim=256).to(device)
     else:
-        raise ValueError(f"Unknown decoder type: {decoder_type}")
+        raise ValueError(f"Unknown decoder: {decoder_type}")
 
-    d.load_state_dict(ckpt["decoder"], strict=False)
-    d.eval()
+    decoder.load_state_dict(ckpt["decoder"], strict=False)
+    decoder.eval()
     print(f"  Loaded {decoder_type} decoder (epoch {ckpt.get('epoch', '?')})")
-    return d
+
+    return model, decoder, extract_features
 
 
-def pad_to_32(h: int, w: int) -> tuple[int, int]:
-    """Pad dimensions to multiples of 32."""
-    return (32 - h % 32) % 32, (32 - w % 32) % 32
-
-
-def run_inference(image_np: np.ndarray, model, decoder, decoder_type: str,
-                  class_protos: dict, device, class_names: dict):
+def _build_prototypes_from_checkpoint(model, decoder_type, ckpt_path: str, device: str):
     """
-    Run inference on a single image. Returns dict of results keyed by class_id.
-
-    For center_affinity: returns center_hm, offset_field, proto_mask, instances, raw_output
-    For others: returns prob_map, instances
+    Build per-class prototypes by re-running the support-set forward pass.
+    Uses the same support sources stored in the checkpoint's fixed_val_episodes.
     """
-    H, W = image_np.shape[:2]
-    pad_h, pad_w = pad_to_32(H, W)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
 
-    # Pad and convert to tensor
-    if pad_h > 0 or pad_w > 0:
-        img_padded = np.pad(image_np, ((0, pad_h), (0, pad_w), (0, 0)), mode="reflect")
+    # Check if prototypes were cached
+    if "class_prototypes" in ckpt and ckpt["class_prototypes"]:
+        print(f"  Loaded {len(ckpt['class_prototypes'])} cached prototypes")
+        return ckpt["class_prototypes"], ckpt.get("class_names", {})
+
+    # Try loading from fixed_val_episodes
+    run_dir = os.path.dirname(ckpt_path)
+    val_eps_path = os.path.join(run_dir, "fixed_val_episodes.json")
+    if not os.path.exists(val_eps_path):
+        # Try the run dir at the default location
+        alt_paths = [os.path.join(os.path.dirname(ckpt_path), "fixed_val_episodes.json")]
+        for p in alt_paths:
+            if os.path.exists(p):
+                val_eps_path = p
+                break
+        else:
+            print("  [ERROR] No class_prototypes in ckpt and no fixed_val_episodes.json found")
+            return {}, {}
+
+    with open(val_eps_path) as f:
+        val_eps = json.load(f)
+
+    from tools.train.train_fewshot_allclass import extract_features, compute_support_prototype
+
+    ckpt_cfg = ckpt.get("config", {})
+    # Determine data root from run config or default
+    data_root = ckpt_cfg.get("data_root", "data/iSAID_instance_fewshot")
+    data_format = ckpt_cfg.get("data_format", "isaid_instance")
+    split = "train"
+    proto_source = ckpt_cfg.get("prototype_source", "p8")
+
+    # Load tile helper
+    if data_format in ("isaid_instance", "TILES COCO (new)"):
+        from adatile.datasets.isaid_instance_fewshot import ISAIDInstanceFewShotDataset
+        is_instance = True
     else:
-        img_padded = image_np
+        from adatile.datasets.isaid_tiles import FastISAIDTileDataset
+        is_instance = False
 
-    from tools.train.train_fewshot_allclass import extract_features
+    class_index = defaultdict(lambda: defaultdict(list))
+    for ep in val_eps:
+        cls_id = ep["class_id"]
+        for stem in ep.get("support_tiles", ep.get("support_stems", [])):
+            src = ep.get("support_sources", [None])[0] if "support_sources" in ep else "unknown"
+            class_index[cls_id][src].append(stem)
 
-    with torch.no_grad():
-        feats = extract_features(model, [img_padded], device)[0]
+    class_protos = {}
+    class_names = ckpt.get("class_names", {})
 
-    results = {}
+    for cls_id, src_to_tiles in class_index.items():
+        if not src_to_tiles:
+            continue
+        # Take K sources
+        k_shot = ckpt_cfg.get("k_shot", 1)
+        sources = list(src_to_tiles.keys())[:k_shot]
+        support_stems = []
+        for s in sources:
+            support_stems.extend(src_to_tiles[s])
 
-    if decoder_type == "center_affinity":
-        # ── Center-Affinity specific ──
-        # Generate center+offset ONCE (class-agnostic)
-        first_pk = list(class_protos.values())[0]
-        first_proto = torch.from_numpy(first_pk["proto"]).float().to(device)
-
-        with torch.no_grad():
-            center_hm, offset_field, _ = decoder(
-                feats["p3"], feats["p4"], feats["proto"], first_proto,
-            )
-
-        # Upsample center+offset to tile resolution
-        center_full = F.interpolate(
-            center_hm.unsqueeze(0).unsqueeze(0),
-            size=(H, W), mode="bilinear", align_corners=False,
-        ).squeeze().cpu().numpy()
-        offset_full = F.interpolate(
-            offset_field.unsqueeze(0),
-            size=(H, W), mode="bilinear", align_corners=False,
-        ).squeeze(0).cpu().numpy()
-
-        # Per-class proto + grouping
-        for cls_id_str, pk in class_protos.items():
-            cls_id = int(cls_id_str)
-            proto_vec = torch.from_numpy(pk["proto"]).float().to(device)
-
-            with torch.no_grad():
-                proto_mask = decoder.forward_proto_only(feats["proto"], proto_vec)
-
-            proto_full = F.interpolate(
-                proto_mask.unsqueeze(0).unsqueeze(0),
-                size=(H, W), mode="bilinear", align_corners=False,
-            ).squeeze().cpu().numpy()
-
-            fg_mask = proto_full > 0.3
-
-            from adatile.metrics.instance_generation import generate_instances_center_affinity
-            instances = generate_instances_center_affinity(
-                center_full, offset_full, fg_mask,
-                score_thr=0.2, min_area=16, min_distance=8, max_instances=100,
-            )
-
-            results[cls_id] = {
-                "center": center_full,
-                "offset": offset_full,
-                "proto_mask": proto_full,
-                "instances": instances,
-                "fg_mask": fg_mask,
-            }
-    else:
-        # ── Other decoders ──
-        for cls_id_str, pk in class_protos.items():
-            cls_id = int(cls_id_str)
-            proto_vec = torch.from_numpy(pk["proto"]).float().to(device)
-
-            with torch.no_grad():
-                if decoder_type in ("adaptive", "adaptive-p3p4"):
-                    if hasattr(decoder, "forward_proto_only"):
-                        prob = decoder.forward_proto_only(feats["proto"], proto_vec)
-                    else:
-                        if decoder_type == "adaptive":
-                            prob = decoder(feats["p4"], feats["proto"], proto_vec)
-                        else:
-                            prob = decoder(feats["p3"], feats["p4"], feats["proto"], proto_vec)
-                elif decoder_type == "dynamic_kernel":
-                    masks_s8, proto_mask = decoder(
-                        feats["p3"], feats["p4"], feats["proto"], proto_vec,
-                    )
-                    prob = proto_mask  # Use proto branch for semantic
+        support_imgs, support_masks = [], []
+        for stem in support_stems[:50]:  # limit for speed
+            try:
+                if is_instance:
+                    from tools.eval.evaluate_instance import _load_tile_img_mask
+                    img, m = _load_tile_img_mask(stem, split, data_root, is_instance=True,
+                                                  target_class_id=cls_id)
                 else:
-                    continue
+                    from tools.eval.evaluate_instance import _load_tile_img_mask
+                    img, m = _load_tile_img_mask(stem, split, data_root, is_instance=False,
+                                                  target_class_id=cls_id)
+                support_imgs.append(img)
+                support_masks.append(m)
+            except Exception as e:
+                continue
 
-            # Upsample to tile resolution
-            if prob.dim() == 2:
-                prob = prob.unsqueeze(0).unsqueeze(0)
-            elif prob.dim() == 3:
-                prob = prob.unsqueeze(0)
-            prob_full = F.interpolate(
-                prob, size=(H, W), mode="bilinear", align_corners=False,
-            ).squeeze().cpu().numpy()
+        if not support_imgs:
+            continue
 
-            # Generate instances via CC
-            from adatile.metrics.instance_generation import generate_instances
-            instances = generate_instances(
-                prob_full, method="connected_components",
-                score_thr=0.3, min_area=16, max_instances=100,
-            )
+        support_feats = extract_features(model, support_imgs, device)
+        proto = compute_support_prototype(support_feats, source=proto_source, masks=support_masks)
+        class_protos[cls_id] = {"proto": proto.cpu().numpy()}
+        cls_name = class_names.get(str(cls_id), f"class_{cls_id}")
+        print(f"  Class {cls_id:>2d} ({cls_name:<20s}): {len(support_imgs)} support tiles")
 
-            results[cls_id] = {
-                "prob_map": prob_full,
-                "instances": instances,
-            }
-
-    return results
+    print(f"  Built {len(class_protos)} class prototypes")
+    return class_protos, class_names
 
 
-def plot_center_affinity(image: np.ndarray, class_name: str, result: dict, out_path: str):
-    """Plot center-affinity decoder outputs."""
-    center = result["center"]
-    offset = result["offset"]
-    proto = result["proto_mask"]
-    instances = result["instances"]
-    fg_mask = result["fg_mask"]
+# ═══════════════════════════════════════════════════════════════════
+# Visualization
+# ═══════════════════════════════════════════════════════════════════
 
-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-    fig.suptitle(f"Center-Affinity Decoder — {class_name}", fontsize=14, fontweight="bold")
+def plot_dynamic_kernel(image: np.ndarray, class_name: str, masks_s8, proto_mask, out_path: str):
+    """Visualize DynamicKernelDecoder outputs: 16 kernel masks + proto."""
+    H, W = image.shape[:2]
+    N = masks_s8.shape[0]
 
-    # (0,0): Original image
+    # Upsample all masks to image resolution
+    masks_full = F.interpolate(
+        masks_s8.unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False,
+    ).squeeze(0).cpu().numpy()  # [N, H, W]
+
+    proto_full = F.interpolate(
+        proto_mask.unsqueeze(0).unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False,
+    ).squeeze().cpu().numpy()  # [H, W]
+
+    n_cols = 6
+    n_rows = (N + 3 + n_cols - 1) // n_cols  # +3 for: input, proto, max-pool
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3.5, n_rows * 3.5))
+    axes = axes.reshape(n_rows, n_cols)
+
+    # Input
     axes[0, 0].imshow(image)
-    axes[0, 0].set_title("Input Image")
-    axes[0, 0].axis("off")
-
-    # (0,1): Proto mask (FG prior)
-    axes[0, 1].imshow(proto, cmap="hot", vmin=0, vmax=1)
-    axes[0, 1].set_title(f"Proto Mask (class-conditioned)\nmean={proto.mean():.3f}")
-    axes[0, 1].axis("off")
-
-    # (0,2): Center heatmap
-    axes[0, 2].imshow(center, cmap="hot", vmin=0, vmax=1)
-    axes[0, 2].set_title(f"Center Heatmap\nmax={center.max():.3f}, peaks={len(instances)}")
-    axes[0, 2].axis("off")
-
-    # (1,0): Offset field (quiver)
-    H, W = center.shape
-    step = max(H // 40, 1)  # subsample for visibility
-    y, x = np.mgrid[step//2:H:step, step//2:W:step]
-    dx = offset[0, y, x]
-    dy = offset[1, y, x]
-
-    axes[1, 0].imshow(image)
-    # Only show arrows on FG pixels
-    fg_y, fg_x = y, x
-    mask = fg_mask[y, x]
-    axes[1, 0].quiver(fg_x[mask], fg_y[mask], dx[mask], dy[mask],
-                      color="cyan", alpha=0.7, scale=50, width=0.003)
-    axes[1, 0].set_title(f"Offset Field (FG pixels only)\nstep={step}")
-    axes[1, 0].axis("off")
-
-    # (1,1): FG mask overlay with detected centers
-    axes[1, 1].imshow(image)
-    # Show FG mask as green overlay
-    fg_overlay = np.zeros((H, W, 4))
-    fg_overlay[fg_mask, 1] = 0.5  # green
-    fg_overlay[fg_mask, 3] = 0.3  # alpha
-    axes[1, 1].imshow(fg_overlay)
-
-    # Mark detected centers
-    from scipy.ndimage import maximum_filter
-    local_max = (center == maximum_filter(center, size=17))  # 8*2+1
-    valid_peaks = local_max & (center > 0.2) & fg_mask
-    py, px = np.where(valid_peaks)
-    axes[1, 1].scatter(px, py, c="red", s=30, marker="x", linewidths=1.5)
-    axes[1, 1].set_title(f"FG Mask + Centers\n{len(py)} peaks detected")
-    axes[1, 1].axis("off")
-
-    # (1,2): Instance masks
-    axes[1, 2].imshow(image)
-    colors = plt.cm.tab20(np.linspace(0, 1, max(len(instances), 1)))
-    for i, inst in enumerate(instances[:20]):
-        mask = inst["mask"]
-        # Overlay with color
-        color_mask = np.zeros((H, W, 4))
-        color_mask[mask, :3] = colors[i][:3]
-        color_mask[mask, 3] = 0.4
-        axes[1, 2].imshow(color_mask)
-        # Center of mass
-        yy, xx = np.where(mask)
-        if len(yy) > 0:
-            axes[1, 2].text(xx.mean(), yy.mean(), str(i + 1),
-                            fontsize=6, color="white", weight="bold",
-                            ha="center", va="center",
-                            bbox=dict(boxstyle="round", fc="black", alpha=0.6))
-
-    axes[1, 2].set_title(f"Instance Masks ({len(instances)} detected)")
-    axes[1, 2].axis("off")
-
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"  [SAVED] {out_path}")
-
-
-def plot_semantic(image: np.ndarray, class_name: str, result: dict, decoder_type: str, out_path: str):
-    """Plot semantic/prob-map based decoder outputs."""
-    prob_map = result["prob_map"]
-    instances = result["instances"]
-
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    fig.suptitle(f"{decoder_type} Decoder — {class_name}", fontsize=14, fontweight="bold")
-
-    # Original
-    axes[0].imshow(image)
-    axes[0].set_title("Input Image")
-    axes[0].axis("off")
-
-    # Prob map
-    axes[1].imshow(prob_map, cmap="hot", vmin=0, vmax=1)
-    axes[1].set_title(f"Probability Map\nmean={prob_map.mean():.3f}")
-    axes[1].axis("off")
-
-    # Instances
-    axes[2].imshow(image)
-    colors = plt.cm.tab20(np.linspace(0, 1, max(len(instances), 1)))
-    for i, inst in enumerate(instances[:20]):
-        mask = inst["mask"]
-        color_mask = np.zeros((*mask.shape, 4))
-        color_mask[mask, :3] = colors[i][:3]
-        color_mask[mask, 3] = 0.4
-        axes[2].imshow(color_mask)
-    axes[2].set_title(f"Instances ({len(instances)} via CC)")
-    axes[2].axis("off")
-
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"  [SAVED] {out_path}")
-
-
-def plot_dynamic_kernel(image: np.ndarray, class_name: str, result: dict, out_path: str):
-    """Plot dynamic_kernel decoder outputs."""
-    proto_mask = result.get("proto_mask", None)
-    kernel_masks = result.get("kernel_masks", None)
-    instances = result["instances"]
-
-    n_kernels = len(kernel_masks) if kernel_masks is not None else 0
-    n_cols = min(n_kernels + 2, 8)
-    n_rows = (n_kernels + 2 + n_cols - 1) // n_cols
-    n_rows = max(n_rows, 1)
-
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 4, n_rows * 4))
-    if n_rows == 1:
-        axes = axes.reshape(1, -1)
-    fig.suptitle(f"DynamicKernel Decoder — {class_name}", fontsize=14, fontweight="bold")
-
-    # Input image
-    axes[0, 0].imshow(image)
-    axes[0, 0].set_title("Input Image")
+    axes[0, 0].set_title("Input Image", fontsize=8)
     axes[0, 0].axis("off")
 
     # Proto mask
-    if proto_mask is not None:
-        pm = proto_mask.squeeze().cpu().numpy() if hasattr(proto_mask, "cpu") else proto_mask
-        axes[0, 1].imshow(pm, cmap="hot", vmin=0, vmax=1)
-        axes[0, 1].set_title(f"Proto Mask\nmean={pm.mean():.3f}")
+    axes[0, 1].imshow(proto_full, cmap="hot", vmin=0, vmax=1)
+    axes[0, 1].set_title(f"Proto Mask\nmean={proto_full.mean():.3f}", fontsize=8)
     axes[0, 1].axis("off")
 
+    # Max-pool of all kernels
+    kernel_max = masks_full.max(axis=0)
+    axes[0, 2].imshow(kernel_max, cmap="hot", vmin=0, vmax=1)
+    axes[0, 2].set_title(f"Max(kernels)\nmax={kernel_max.max():.3f}", fontsize=8)
+    axes[0, 2].axis("off")
+
+    # Binary threshold of max (what CC would see)
+    binary_max = kernel_max > 0.3
+    axes[0, 3].imshow(binary_max, cmap="gray")
+    axes[0, 3].set_title(f"Max>0.3\narea={binary_max.sum()}", fontsize=8)
+    axes[0, 3].axis("off")
+
+    # Per-kernel IoU with previous (diversity check)
+    pw_ious = []
+    for i in range(1, N):
+        bi = masks_full[i] > 0.5
+        bj = masks_full[0] > 0.5
+        inter = (bi & bj).sum()
+        union = (bi | bj).sum()
+        pw_ious.append(inter / max(union, 1))
+    axes[0, 4].bar(range(1, N), pw_ious)
+    axes[0, 4].set_title(f"Pairwise IoU vs K0\nmean={np.mean(pw_ious):.3f}", fontsize=8)
+    axes[0, 4].set_xlabel("Kernel idx")
+    axes[0, 4].set_ylabel("IoU")
+
+    # Empty
+    axes[0, 5].axis("off")
+
     # Individual kernel masks
-    for ki in range(min(n_kernels, n_rows * n_cols - 2)):
-        r, c = divmod(ki + 2, n_cols)
+    for ki in range(N):
+        r, c = divmod(ki + 6, n_cols)  # start from row 1
         if r < n_rows and c < n_cols:
-            km = kernel_masks[ki]
-            km_np = km.squeeze().cpu().numpy() if hasattr(km, "cpu") else km
-            axes[r, c].imshow(km_np, cmap="hot", vmin=0, vmax=1)
-            axes[r, c].set_title(f"Kernel {ki}\nmax={km_np.max():.3f}")
+            km = masks_full[ki]
+            axes[r, c].imshow(km, cmap="hot", vmin=0, vmax=1)
+            bin_km = km > 0.3
+            n_px = bin_km.sum()
+            axes[r, c].set_title(f"K{ki}: max={km.max():.3f} px={n_px}", fontsize=7)
             axes[r, c].axis("off")
 
-    # Hide unused axes
-    for idx in range(n_kernels + 2, n_rows * n_cols):
+    # Hide remaining
+    for idx in range(6 + N, n_rows * n_cols):
         r, c = divmod(idx, n_cols)
         axes[r, c].axis("off")
 
@@ -378,138 +286,169 @@ def plot_dynamic_kernel(image: np.ndarray, class_name: str, result: dict, out_pa
     print(f"  [SAVED] {out_path}")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Decoder Prediction Visualizer")
-    parser.add_argument("--checkpoint", type=str, required=True,
-                        help="Path to .pt checkpoint")
-    parser.add_argument("--decoder", type=str, required=True,
-                        choices=["baseline", "adaptive", "adaptive-p3p4", "dynamic_kernel", "center_affinity"])
-    parser.add_argument("--image", type=str, default=None,
-                        help="Single image path")
-    parser.add_argument("--image-dir", type=str, default=None,
-                        help="Image directory (process first N images)")
-    parser.add_argument("--n-images", type=int, default=8,
-                        help="Number of images from directory")
-    parser.add_argument("--output", type=str, default="vis_output",
-                        help="Output directory")
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--data-root", type=str, default="data/iSAID_instance_fewshot",
-                        help="Data root for COCO annotations")
-    args = parser.parse_args()
+def plot_semantic(image: np.ndarray, class_name: str, prob_map: np.ndarray, out_path: str):
+    """Visualize semantic decoder output."""
+    H, W = image.shape[:2]
 
-    assert args.image or args.image_dir, "Must specify --image or --image-dir"
+    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+    fig.suptitle(f"Semantic Decoder — {class_name}", fontsize=14, fontweight="bold")
+
+    axes[0].imshow(image)
+    axes[0].set_title("Input Image")
+    axes[0].axis("off")
+
+    axes[1].imshow(prob_map, cmap="hot", vmin=0, vmax=1)
+    axes[1].set_title(f"Prob Map\nmean={prob_map.mean():.3f}")
+    axes[1].axis("off")
+
+    binary = prob_map > 0.3
+    axes[2].imshow(binary, cmap="gray")
+    axes[2].set_title(f"Binary >0.3\narea={binary.sum()}")
+    axes[2].axis("off")
+
+    # Contours
+    import cv2
+    contours, _ = cv2.findContours(binary.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    overlay = image.copy()
+    cv2.drawContours(overlay, contours, -1, (0, 255, 0), 2)
+    axes[3].imshow(overlay)
+    axes[3].set_title(f"CC Contours ({len(contours)} blobs)")
+    axes[3].axis("off")
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  [SAVED] {out_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(description="Decoder Prediction Visualizer v2")
+    parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--decoder", type=str, required=True,
+                        choices=["adaptive", "adaptive-p3p4", "dynamic_kernel", "center_affinity"])
+    parser.add_argument("--image", type=str, required=True)
+    parser.add_argument("--output", type=str, default="vis_output")
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--score-thr", type=float, default=0.3)
+    args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     set_seed(42)
 
     print("=" * 70)
-    print(f"  Decoder Visualization — {args.decoder}")
+    print(f"  Decoder Visualization v2 — {args.decoder}")
     print("=" * 70)
 
-    # ── Load checkpoint ──
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    ckpt_cfg = ckpt.get("config", {})
-    unfreeze_layers = ckpt.get("unfreeze_layers", ckpt_cfg.get("unfreeze_layers", 8))
-    print(f"  Checkpoint: epoch {ckpt.get('epoch', '?')}")
+    unfreeze_layers = ckpt.get("unfreeze_layers", ckpt.get("config", {}).get("unfreeze_layers", 8))
 
-    # ── Load Backbone (same pattern as evaluate_instance.py) ──
-    from ultralytics import FastSAM
-    from tools.eval.evaluate_instance import _fastsam_weights_path
-    from tools.train.train_fewshot_allclass import extract_features
+    # Load model + decoder
+    model, decoder, extract_features = _load_model(
+        args.checkpoint, unfreeze_layers, args.decoder, device,
+    )
 
-    fastsam_path = _fastsam_weights_path()
-    model = FastSAM(str(fastsam_path))
-    model.model.to(device).eval()
-    for p in model.model.parameters():
-        p.requires_grad = False
-
-    # Restore unfrozen backbone layers from checkpoint
-    unfreeze_layers = ckpt.get("unfreeze_layers", 0)
-    if unfreeze_layers > 0 and "backbone" in ckpt:
-        seq = model.model.model  # Sequential[23]
-        for i_str, state in ckpt["backbone"].items():
-            seq[int(i_str)].load_state_dict(state)
-        print(f"  Restored {unfreeze_layers} backbone layers from checkpoint")
-    elif unfreeze_layers > 0:
-        print(f"  [WARN] unfreeze_layers={unfreeze_layers} but no backbone weights in ckpt")
-
-    # ── Detect channels ──
-    test_img = np.zeros((896, 896, 3), dtype=np.uint8)
-    test_feats = extract_features(model, [test_img], device)
-    p3_channels = test_feats[0]["p3"].shape[1]
-    p4_channels = test_feats[0]["p4"].shape[1]
-    print(f"  P3 channels={p3_channels}, P4 channels={p4_channels}")
-
-    # ── Load Decoder ──
-    decoder = _load_decoder(args.decoder, ckpt, p3_channels, p4_channels, device)
-
-    # ── Load class prototypes ──
+    # Build / load prototypes
     class_protos = ckpt.get("class_prototypes", {})
     class_names = ckpt.get("class_names", {})
+
     if not class_protos:
-        print("  [ERROR] No class_prototypes in checkpoint!")
+        # Try building from fixed_val_episodes
+        class_protos, class_names = _build_prototypes_from_checkpoint(
+            model, args.decoder, args.checkpoint, device,
+        )
+
+    if not class_protos:
+        # Fallback: use random prototype (still useful for kernel diversity check)
+        print("  [WARN] No prototypes available — using random (masks will be random, but")
+        print("         kernel diversity pattern is still visible)")
+        # Detect proto dim from decoder
+        proto_dim = 640  # P4 channels
+        # Create 15 random class prototypes
+        class_protos = {}
+        class_names = {}
+        for cid in range(1, 16):
+            class_protos[str(cid)] = {"proto": np.random.randn(proto_dim).astype(np.float32)}
+            class_names[str(cid)] = f"class_{cid}"
+
+    # Load input image
+    if not os.path.exists(args.image):
+        print(f"  [FATAL] Image not found: {args.image}")
         sys.exit(1)
-    print(f"  Loaded {len(class_protos)} class prototypes")
+    image_np = np.array(Image.open(args.image).convert("RGB"))
+    H, W = image_np.shape[:2]
+    stem = os.path.splitext(os.path.basename(args.image))[0]
+    print(f"\n  Image: {stem} ({H}×{W})")
 
-    # ── Get image list ──
-    if args.image:
-        image_paths = [args.image]
+    # Pad + extract features
+    pad_h = (32 - H % 32) % 32
+    pad_w = (32 - W % 32) % 32
+    if pad_h > 0 or pad_w > 0:
+        img_padded = np.pad(image_np, ((0, pad_h), (0, pad_w), (0, 0)), mode="reflect")
     else:
-        image_paths = sorted([
-            os.path.join(args.image_dir, f)
-            for f in os.listdir(args.image_dir)
-            if f.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff"))
-        ])[:args.n_images]
+        img_padded = image_np
 
-    print(f"  Processing {len(image_paths)} image(s)")
+    with torch.no_grad():
+        feats = extract_features(model, [img_padded], device)[0]
 
-    # ── Per-image inference + visualization ──
-    for img_idx, img_path in enumerate(image_paths):
-        if not os.path.exists(img_path):
-            print(f"  [SKIP] File not found: {img_path}")
+    # ── Per-class inference + visualization ──
+    # Sort classes by proto norm (prioritize distinctive prototypes)
+    proto_norms = []
+    for cid, pk in class_protos.items():
+        proto_norms.append((int(cid), float(np.linalg.norm(pk["proto"]))))
+    proto_norms.sort(key=lambda x: -x[1])
+
+    n_plotted = 0
+    for cls_id, _ in proto_norms[:8]:  # top 8 classes
+        cls_id_str = str(cls_id)
+        if cls_id_str not in class_protos:
             continue
+        pk = class_protos[cls_id_str]
+        cls_name = class_names.get(cls_id_str, f"class_{cls_id}")
+        safe_name = cls_name.replace(" ", "_").replace("/", "_")
+        out_path = os.path.join(args.output, f"{stem}_{cls_id:02d}_{safe_name}.png")
 
-        image = np.array(Image.open(img_path).convert("RGB"))
-        H, W = image.shape[:2]
-        stem = os.path.splitext(os.path.basename(img_path))[0]
-        print(f"\n  [{img_idx + 1}/{len(image_paths)}] {stem} ({H}×{W})")
+        proto_vec = torch.from_numpy(pk["proto"]).float().to(device)
 
-        results = run_inference(image, model, decoder, args.decoder,
-                                class_protos, device, class_names)
-
-        # ── Visualize per class ──
-        # Filter to classes that have many tiles (likely to have objects)
-        # Select top 5 classes by proto norm (more distinctive prototypes)
-        proto_norms = []
-        for cls_id_str, pk in class_protos.items():
-            proto_norms.append((cls_id_str, float(np.linalg.norm(pk["proto"]))))
-        proto_norms.sort(key=lambda x: -x[1])
-        top_classes = [int(c) for c, _ in proto_norms[:5]]
-
-        for cls_id in top_classes:
-            cls_id_str = str(cls_id)
-            if cls_id not in results:
-                continue
-            cls_name = class_names.get(cls_id_str, f"class_{cls_id}")
-            result = results[cls_id]
-
-            safe_name = cls_name.replace(" ", "_").replace("/", "_")
-            out_path = os.path.join(args.output, f"{stem}_{safe_name}.png")
-
-            if args.decoder == "center_affinity":
-                plot_center_affinity(image, cls_name, result, out_path)
-            elif args.decoder == "dynamic_kernel":
-                plot_dynamic_kernel(image, cls_name, result, out_path)
+        with torch.no_grad():
+            if args.decoder == "dynamic_kernel":
+                masks_s8, proto_mask = decoder(
+                    feats["p3"], feats["p4"], feats["proto"], proto_vec,
+                )
+                plot_dynamic_kernel(image_np, cls_name, masks_s8, proto_mask, out_path)
+            elif args.decoder == "center_affinity":
+                center_hm, offset_field, proto_mask = decoder(
+                    feats["p3"], feats["p4"], feats["proto"], proto_vec,
+                )
+                # TODO: full center_affinity plot (needs grouping)
+                # For now, just show proto mask
+                proto_full = F.interpolate(
+                    proto_mask.unsqueeze(0).unsqueeze(0),
+                    size=(H, W), mode="bilinear", align_corners=False,
+                ).squeeze().cpu().numpy()
+                plot_semantic(image_np, cls_name, proto_full, out_path)
             else:
-                plot_semantic(image, cls_name, result, args.decoder, out_path)
+                # adaptive / adaptive-p3p4
+                if args.decoder == "adaptive":
+                    prob = decoder(feats["p4"], feats["proto"], proto_vec)
+                else:
+                    prob = decoder(feats["p3"], feats["p4"], feats["proto"], proto_vec)
+                if prob.dim() == 2:
+                    prob = prob.unsqueeze(0).unsqueeze(0)
+                elif prob.dim() == 3:
+                    prob = prob.unsqueeze(0)
+                prob_full = F.interpolate(
+                    prob, size=(H, W), mode="bilinear", align_corners=False,
+                ).squeeze().cpu().numpy()
+                plot_semantic(image_np, cls_name, prob_full, out_path)
 
-            # Only visualize first 3 classes per image to avoid too many files
-            if len(top_classes) > 3 and cls_id == top_classes[2]:
-                break
+        n_plotted += 1
 
-    print(f"\n  Done. Output in: {args.output}/")
-    print(f"  Total images: {len(image_paths)}")
+    print(f"\n  Done. {n_plotted} visualizations → {args.output}/")
 
 
 if __name__ == "__main__":
