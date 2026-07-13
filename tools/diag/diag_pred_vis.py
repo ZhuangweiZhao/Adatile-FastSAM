@@ -201,6 +201,15 @@ def load_gt_for_tile(stem: str, data_root: Path, split: str,
     return {"instances": instances, "class_ids": {i["category_id"] for i in instances}, "merged_mask": merged}
 
 
+def _render_gt_mask_on_demand(gt_ann: dict, H: int, W: int) -> np.ndarray:
+    """按需渲染单个 GT 实例 mask | Render a single GT instance mask on demand.
+
+    避免预存 3304×7MB=23GB 的 mask 数组 | Avoids storing 23GB of pre-rendered masks.
+    """
+    return _render_polygon_mask({"segmentation": gt_ann["segmentation"],
+                                  "bbox": gt_ann["bbox"]}, H, W)
+
+
 def _render_polygon_mask(ann: dict, H: int, W: int) -> np.ndarray:
     """从 COCO annotation 渲染二值 mask | Render binary mask from COCO annotation."""
     seg = ann.get("segmentation", [])
@@ -454,17 +463,19 @@ def run_full_image_mode(args, model, decoder, extract_features, ckpt, device):
     print(f"\n  Full image: {img_stem} ({H_full}×{W_full})")
 
     # ── Load full-image GT ──
+    # 关键: 不预渲染 mask (3304 实例 × 7MB = 23GB 内存爆炸)
+    # Key: don't pre-render masks (3304 insts × 7MB each = 23GB RAM explosion)
+    # 改为存 polygon/bbox → 匹配时按需渲染 | Store polygons → render on-demand for matching
+    gt_anns_raw = []
     gt_full = {"instances": [], "class_ids": set(), "merged_mask": np.zeros((H_full, W_full), dtype=bool)}
     if args.full_gt and os.path.exists(args.full_gt):
         with open(args.full_gt) as f:
             full_coco = json.load(f)
         img_name = os.path.basename(args.image)
         img_id_to_file = {img["id"]: img["file_name"] for img in full_coco["images"]}
-        img_id_to_info = {img["id"]: img for img in full_coco["images"]}
         file_to_id = {v: k for k, v in img_id_to_file.items()}
         target_id = file_to_id.get(img_name)
         if target_id is None:
-            # Try matching by stem
             for fid, fname in img_id_to_file.items():
                 if os.path.splitext(fname)[0] == img_stem:
                     target_id = fid
@@ -477,16 +488,17 @@ def run_full_image_mode(args, model, decoder, extract_features, ckpt, device):
                 cat_id = ann.get("category_id", 0)
                 if cat_id < 1 or cat_id > 15:
                     continue
-                mask = _render_polygon_mask(ann, H_full, W_full)
-                if mask.sum() > 0:
-                    gt_full["instances"].append({
-                        "category_id": cat_id, "mask": mask,
-                        "area": float(mask.sum()),
-                    })
-                    gt_full["class_ids"].add(cat_id)
-                    gt_full["merged_mask"] = gt_full["merged_mask"] | mask
-            print(f"  Full GT: {len(gt_full['instances'])} instances in "
-                  f"{len(gt_full['class_ids'])} classes")
+                # 存 polygon/bbox 而非完整 mask | Store polygon/bbox, not full mask
+                bbox = ann.get("bbox", [0, 0, 0, 0])
+                area = ann.get("area", bbox[2] * bbox[3])
+                gt_anns_raw.append({
+                    "category_id": cat_id,
+                    "segmentation": ann.get("segmentation", []),
+                    "bbox": bbox, "area": float(area),
+                })
+                gt_full["class_ids"].add(cat_id)
+            print(f"  Full GT: {len(gt_anns_raw)} instances in "
+                  f"{len(gt_full['class_ids'])} classes (polygons only, masks rendered on-demand)")
         else:
             print(f"  [WARN] No GT found for {img_name} in {args.full_gt}")
     else:
@@ -635,24 +647,64 @@ def run_full_image_mode(args, model, decoder, extract_features, ckpt, device):
     print(f"  [TIMING] Instance generation: {time.perf_counter() - t0:.2f}s")
 
     # ── Compute metrics ──
+    # 按需渲染 + bbox 预筛选: 避免 O(P×G) 次完整 mask 渲染
+    # On-demand rendering + bbox pre-filter: avoids O(P×G) full mask renders
     t0 = time.perf_counter()
     tp, fp_count, fn_count = 0, 0, 0
-    if gt_full["instances"]:
-        # Build TP/FP/FN masks
-        gt_matched = [False] * len(gt_full["instances"])
-        tp_mask = np.zeros((H_full, W_full), dtype=bool)
-        fp_mask = np.zeros((H_full, W_full), dtype=bool)
-        fn_mask = np.zeros((H_full, W_full), dtype=bool)
+    tp_mask = np.zeros((H_full, W_full), dtype=bool)
+    fp_mask = np.zeros((H_full, W_full), dtype=bool)
+    fn_mask = np.zeros((H_full, W_full), dtype=bool)
+
+    if gt_anns_raw:
+        n_gt = len(gt_anns_raw)
+        gt_matched = [False] * n_gt
 
         for pred in sorted(pred_instances, key=lambda x: x.get("score", 0), reverse=True):
             pm = pred["mask"]
+            pred_cat = pred.get("category_id", 1)
+            # 获取 pred 的 bbox | Get prediction bbox
+            pm_ys, pm_xs = np.where(pm)
+            if len(pm_ys) == 0:
+                fp_count += 1; fp_mask |= pm; continue
+            p_by, p_bx = int(pm_ys.min()), int(pm_xs.min())
+            p_ey, p_ex = int(pm_ys.max()) + 1, int(pm_xs.max()) + 1
+
             best_iou, best_j = 0.0, -1
-            for j, gt in enumerate(gt_full["instances"]):
+            for j in range(n_gt):
                 if gt_matched[j]:
                     continue
-                inter = (pm & gt["mask"]).sum()
-                union = (pm | gt["mask"]).sum()
-                iou = inter / max(union, 1)
+                gt_ann = gt_anns_raw[j]
+                if pred_cat != gt_ann["category_id"]:
+                    continue
+                # Bbox 预筛选: 不重叠 → IoU=0, 跳过昂贵的 mask 渲染
+                # Bbox pre-filter: no overlap → IoU=0, skip expensive mask render
+                gx, gy, gw, gh = [int(v) for v in gt_ann["bbox"]]
+                if (p_ex <= gx or p_bx >= gx + gw or
+                    p_ey <= gy or p_by >= gy + gh):
+                    continue
+                # ROI 渲染: 只在 pred+GT 交叠区域渲染, 比全图画布快 100-1000×
+                # ROI render: only in pred+GT overlap region, 100-1000× faster
+                rx = max(p_bx, gx); ry = max(p_by, gy)
+                rw = min(p_ex, gx + gw) - rx
+                rh = min(p_ey, gy + gh) - ry
+                if rw <= 0 or rh <= 0:
+                    continue
+                gt_roi = np.zeros((rh, rw), dtype=np.uint8)
+                seg = gt_ann.get("segmentation", [])
+                if seg:
+                    polys = seg if isinstance(seg[0], list) else [seg]
+                    for poly in polys:
+                        if len(poly) < 6:
+                            continue
+                        pts = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
+                        pts[:, :, 0] = pts[:, :, 0] - rx
+                        pts[:, :, 1] = pts[:, :, 1] - ry
+                        cv2.fillPoly(gt_roi, [pts], 1)
+                gt_roi = gt_roi.astype(bool)
+                pred_roi = pm[ry:ry + rh, rx:rx + rw]
+                inter = (pred_roi & gt_roi).sum()
+                union = (pred_roi | gt_roi).sum()
+                iou = inter / max(union, 1) if union > 0 else 0.0
                 if iou > best_iou:
                     best_iou, best_j = iou, j
             if best_iou >= args.iou_thr:
@@ -663,10 +715,30 @@ def run_full_image_mode(args, model, decoder, extract_features, ckpt, device):
                 fp_count += 1
                 fp_mask |= pm
 
-        for j, gt in enumerate(gt_full["instances"]):
+        # FN: ROI 渲染 (小目标只渲染 bbox 区域, 快 1000×) | ROI render for speed
+        for j in range(n_gt):
             if not gt_matched[j]:
                 fn_count += 1
-                fn_mask |= gt["mask"]
+                gt_ann = gt_anns_raw[j]
+                gx, gy, gw, gh = [int(v) for v in gt_ann["bbox"]]
+                gx, gy = max(0, gx), max(0, gy)
+                gw = min(gw, W_full - gx)
+                gh = min(gh, H_full - gy)
+                if gw <= 0 or gh <= 0:
+                    continue
+                # 在 ROI 内渲染, 比全图画布快 ~1000× | Render in ROI, ~1000× faster
+                roi = np.zeros((gh, gw), dtype=np.uint8)
+                seg = gt_ann.get("segmentation", [])
+                if seg:
+                    polys = seg if isinstance(seg[0], list) else [seg]
+                    for poly in polys:
+                        if len(poly) < 6:
+                            continue
+                        pts = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
+                        pts[:, :, 0] = pts[:, :, 0] - gx
+                        pts[:, :, 1] = pts[:, :, 1] - gy
+                        cv2.fillPoly(roi, [pts], 1)
+                fn_mask[gy:gy + gh, gx:gx + gw] |= roi.astype(bool)
 
         precision = tp / max(tp + fp_count, 1)
         recall = tp / max(tp + fn_count, 1)
@@ -676,14 +748,17 @@ def run_full_image_mode(args, model, decoder, extract_features, ckpt, device):
         print(f"    TP={tp}, FP={fp_count}, FN={fn_count}")
         print(f"    Precision={precision:.3f}, Recall={recall:.3f}, F1={f1:.3f}")
 
-        # Per-class breakdown
+        # Per-class breakdown (render GT masks only when counting)
         print(f"\n  Per-Class Breakdown:")
+        n_per_class = defaultdict(int)
+        n_matched_per_class = defaultdict(int)
+        for j, gt_ann in enumerate(gt_anns_raw):
+            n_per_class[gt_ann["category_id"]] += 1
+            if gt_matched[j]:
+                n_matched_per_class[gt_ann["category_id"]] += 1
         for cls_id in sorted(gt_full["class_ids"]):
-            cls_tp = sum(1 for j, gt in enumerate(gt_full["instances"])
-                         if gt["category_id"] == cls_id and gt_matched[j])
-            cls_gt = sum(1 for gt in gt_full["instances"] if gt["category_id"] == cls_id)
             cname = ISAID_CLASSES.get(cls_id, f"c{cls_id}")
-            print(f"    {cname} (id={cls_id}): matched={cls_tp}/{cls_gt}")
+            print(f"    {cname} (id={cls_id}): matched={n_matched_per_class.get(cls_id, 0)}/{n_per_class.get(cls_id, 0)}")
 
     # ── Generate full-image visualization ──
     t0 = time.perf_counter()
