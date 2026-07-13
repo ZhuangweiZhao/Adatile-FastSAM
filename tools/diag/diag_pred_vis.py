@@ -111,101 +111,6 @@ def _load_model(ckpt_path: str, unfreeze_layers: int, decoder_type: str, device:
     return model, decoder, extract_features
 
 
-def _build_prototypes_from_checkpoint(model, decoder_type, ckpt_path: str, device: str):
-    """
-    Build per-class prototypes by re-running the support-set forward pass.
-    Uses the same support sources stored in the checkpoint's fixed_val_episodes.
-    """
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-
-    # Check if prototypes were cached
-    if "class_prototypes" in ckpt and ckpt["class_prototypes"]:
-        print(f"  Loaded {len(ckpt['class_prototypes'])} cached prototypes")
-        return ckpt["class_prototypes"], ckpt.get("class_names", {})
-
-    # Try loading from fixed_val_episodes
-    run_dir = os.path.dirname(ckpt_path)
-    val_eps_path = os.path.join(run_dir, "fixed_val_episodes.json")
-    if not os.path.exists(val_eps_path):
-        # Try the run dir at the default location
-        alt_paths = [os.path.join(os.path.dirname(ckpt_path), "fixed_val_episodes.json")]
-        for p in alt_paths:
-            if os.path.exists(p):
-                val_eps_path = p
-                break
-        else:
-            print("  [ERROR] No class_prototypes in ckpt and no fixed_val_episodes.json found")
-            return {}, {}
-
-    with open(val_eps_path) as f:
-        val_eps = json.load(f)
-
-    from tools.train.train_fewshot_allclass import extract_features, compute_support_prototype
-
-    ckpt_cfg = ckpt.get("config", {})
-    # Determine data root from run config or default
-    data_root = ckpt_cfg.get("data_root", "data/iSAID_instance_fewshot")
-    data_format = ckpt_cfg.get("data_format", "isaid_instance")
-    split = "train"
-    proto_source = ckpt_cfg.get("prototype_source", "p8")
-
-    # Load tile helper
-    if data_format in ("isaid_instance", "TILES COCO (new)"):
-        from adatile.datasets.isaid_instance_fewshot import ISAIDInstanceFewShotDataset
-        is_instance = True
-    else:
-        from adatile.datasets.isaid_tiles import FastISAIDTileDataset
-        is_instance = False
-
-    class_index = defaultdict(lambda: defaultdict(list))
-    for ep in val_eps:
-        cls_id = ep["class_id"]
-        for stem in ep.get("support_tiles", ep.get("support_stems", [])):
-            src = ep.get("support_sources", [None])[0] if "support_sources" in ep else "unknown"
-            class_index[cls_id][src].append(stem)
-
-    class_protos = {}
-    class_names = ckpt.get("class_names", {})
-
-    for cls_id, src_to_tiles in class_index.items():
-        if not src_to_tiles:
-            continue
-        # Take K sources
-        k_shot = ckpt_cfg.get("k_shot", 1)
-        sources = list(src_to_tiles.keys())[:k_shot]
-        support_stems = []
-        for s in sources:
-            support_stems.extend(src_to_tiles[s])
-
-        support_imgs, support_masks = [], []
-        for stem in support_stems[:50]:  # limit for speed
-            try:
-                if is_instance:
-                    from tools.eval.evaluate_instance import _load_tile_img_mask
-                    img, m = _load_tile_img_mask(stem, split, data_root, is_instance=True,
-                                                  target_class_id=cls_id)
-                else:
-                    from tools.eval.evaluate_instance import _load_tile_img_mask
-                    img, m = _load_tile_img_mask(stem, split, data_root, is_instance=False,
-                                                  target_class_id=cls_id)
-                support_imgs.append(img)
-                support_masks.append(m)
-            except Exception as e:
-                continue
-
-        if not support_imgs:
-            continue
-
-        support_feats = extract_features(model, support_imgs, device)
-        proto = compute_support_prototype(support_feats, source=proto_source, masks=support_masks)
-        class_protos[cls_id] = {"proto": proto.cpu().numpy()}
-        cls_name = class_names.get(str(cls_id), f"class_{cls_id}")
-        print(f"  Class {cls_id:>2d} ({cls_name:<20s}): {len(support_imgs)} support tiles")
-
-    print(f"  Built {len(class_protos)} class prototypes")
-    return class_protos, class_names
-
-
 # ═══════════════════════════════════════════════════════════════════
 # Visualization
 # ═══════════════════════════════════════════════════════════════════
@@ -355,28 +260,15 @@ def main():
         args.checkpoint, unfreeze_layers, args.decoder, device,
     )
 
-    # Build / load prototypes
-    class_protos = ckpt.get("class_prototypes", {})
-    class_names = ckpt.get("class_names", {})
-
-    if not class_protos:
-        # Try building from fixed_val_episodes
-        class_protos, class_names = _build_prototypes_from_checkpoint(
-            model, args.decoder, args.checkpoint, device,
-        )
-
-    if not class_protos:
-        # Fallback: use random prototype (still useful for kernel diversity check)
-        print("  [WARN] No prototypes available — using random (masks will be random, but")
-        print("         kernel diversity pattern is still visible)")
-        # Detect proto dim from decoder
-        proto_dim = 640  # P4 channels
-        # Create 15 random class prototypes
-        class_protos = {}
-        class_names = {}
-        for cid in range(1, 16):
-            class_protos[str(cid)] = {"proto": np.random.randn(proto_dim).astype(np.float32)}
-            class_names[str(cid)] = f"class_{cid}"
+    # Use random prototypes (good enough for kernel diversity visualization)
+    proto_dim = 640  # P4 channels
+    class_protos = {}
+    class_names = {}
+    for cid in range(1, 16):
+        class_protos[str(cid)] = {"proto": np.random.randn(proto_dim).astype(np.float32)}
+        class_names[str(cid)] = f"class_{cid}"
+    print(f"  Using {len(class_protos)} random-class prototypes "
+          f"(kernel diversity is still visible with random proto)")
 
     # Load input image
     if not os.path.exists(args.image):
