@@ -1562,17 +1562,38 @@ def _process_image_group(args, model, decoder, device, img_paths: list[str],
     if not valid_images:
         return [None] * len(img_paths)
 
-    # ── Step 2: Stack ALL tiles from ALL images → one batch ──
+    # ── Step 2: Batched backbone forward (sub-batch if too many tiles) ──
+    # 批量 backbone forward (tile 过多时分 sub-batch 防 OOM)
     total_B = len(all_tiles)
-    batch_imgs = []
-    for t in all_tiles:
-        batch_imgs.append(torch.from_numpy(t["img"]).permute(2, 0, 1).float().div_(255.0))
-    batch_tensor = torch.stack(batch_imgs).to(device)  # [total_B, 3, 896, 896]
+    max_per_batch = getattr(args, "max_tiles_per_batch", 64)
+    all_p3, all_p4, all_p8, all_proto = [], [], [], []
 
-    with torch.no_grad():
-        batched_feats = _extract_features_batched(model, batch_tensor, device, no_grad=True)
+    for sub_start in range(0, total_B, max_per_batch):
+        sub_end = min(sub_start + max_per_batch, total_B)
+        sub_tiles = all_tiles[sub_start:sub_end]
+        sub_imgs = [torch.from_numpy(t["img"]).permute(2, 0, 1).float().div_(255.0)
+                     for t in sub_tiles]
+        sub_batch = torch.stack(sub_imgs).to(device)
+
+        with torch.no_grad():
+            sub_feats = _extract_features_batched(model, sub_batch, device, no_grad=True)
+        all_p3.append(sub_feats["p3"].cpu())
+        all_p4.append(sub_feats["p4"].cpu())
+        all_p8.append(sub_feats["p8"].cpu())
+        all_proto.append(sub_feats["proto"].cpu())
+        del sub_batch, sub_feats
+
+    # Concatenate all sub-batches (keep on CPU for memory efficiency)
+    batched_feats = {
+        "p3": torch.cat(all_p3, dim=0),
+        "p4": torch.cat(all_p4, dim=0),
+        "p8": torch.cat(all_p8, dim=0),
+        "proto": torch.cat(all_proto, dim=0),
+    }
+    del all_p3, all_p4, all_p8, all_proto
 
     # ── Step 3: Per-image decoder + stitch + metrics ──
+    # Keep batched feats on CPU, move tile-by-tile to GPU for decoder
     results = []
     tile_offset = 0
     for img_data in images_data:
@@ -1581,11 +1602,11 @@ def _process_image_group(args, model, decoder, device, img_paths: list[str],
             continue
 
         n_tiles = img_data["n_tiles"]
-        # Slice this image's features from batch
-        img_feats = {
-            "p3": batched_feats["p3"][tile_offset:tile_offset + n_tiles],
-            "p4": batched_feats["p4"][tile_offset:tile_offset + n_tiles],
-            "proto": batched_feats["proto"][tile_offset:tile_offset + n_tiles],
+        # Slice this image's features from batch (on CPU for memory efficiency)
+        img_feats_cpu = {
+            "p3": batched_feats["p3"][tile_offset:tile_offset + n_tiles].cpu(),
+            "p4": batched_feats["p4"][tile_offset:tile_offset + n_tiles].cpu(),
+            "proto": batched_feats["proto"][tile_offset:tile_offset + n_tiles].cpu(),
         }
 
         # Per-tile decoder
@@ -1594,10 +1615,11 @@ def _process_image_group(args, model, decoder, device, img_paths: list[str],
             for ti in range(n_tiles):
                 tile_info = img_data["tiles"][ti]
                 y0, x0, h, w = tile_info["y0"], tile_info["x0"], tile_info["h"], tile_info["w"]
+                # Move single tile features to GPU
                 feats = {
-                    "p3": img_feats["p3"][ti],
-                    "p4": img_feats["p4"][ti],
-                    "proto": img_feats["proto"][ti],
+                    "p3": img_feats_cpu["p3"][ti].to(device),
+                    "p4": img_feats_cpu["p4"][ti].to(device),
+                    "proto": img_feats_cpu["proto"][ti].to(device),
                 }
 
                 best_prob = np.zeros((tile_size, tile_size), dtype=np.float32)
@@ -1721,7 +1743,10 @@ def _process_image_group(args, model, decoder, device, img_paths: list[str],
                           for k, v in n_per_class.items()},
             "area_buckets": area_buckets,
         })
+        # Free per-image features to limit CPU memory growth
+        del img_feats_cpu
 
+    del batched_feats
     return results
 
 
@@ -1880,6 +1905,8 @@ def main():
     parser.add_argument("--batch-ext", type=str, default=".png", help="批量模式图片扩展名 | Image extension for batch")
     parser.add_argument("--batch-group", type=int, default=4,
                         help="每批处理的图片数 (tile 合并过 backbone) | Images per backbone forward group")
+    parser.add_argument("--max-tiles-per-batch", type=int, default=64,
+                        help="单次 backbone forward 最大 tile 数 (防 OOM) | Max tiles per forward pass")
 
     # Tile mode args
     parser.add_argument("--query-tile", type=str, help="Tile stem (e.g. P0089_t0001)")
