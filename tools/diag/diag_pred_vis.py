@@ -575,9 +575,11 @@ def run_full_image_mode(args, model, decoder, extract_features, ckpt, device):
         tile_img = tile_info["img"]
         y0, x0, h, w = tile_info["y0"], tile_info["x0"], tile_info["h"], tile_info["w"]
 
-        # Pad to multiple of 32
-        pad_h = (32 - h % 32) % 32
-        pad_w = (32 - w % 32) % 32
+        # Pad to multiple of 32 (use actual tile dims, not original content h/w)
+        # tile_full_image() pads to tile_size (896), but content h/w may differ
+        th, tw = tile_img.shape[:2]
+        pad_h = (32 - th % 32) % 32
+        pad_w = (32 - tw % 32) % 32
         if pad_h > 0 or pad_w > 0:
             img_pad = np.pad(tile_img, ((0, pad_h), (0, pad_w), (0, 0)), mode="reflect")
         else:
@@ -1247,7 +1249,9 @@ def _process_one_image_metrics(args, model, decoder, extract_features, device,
     for tile_info in tiles:
         tile_img = tile_info["img"]
         y0, x0, h, w = tile_info["y0"], tile_info["x0"], tile_info["h"], tile_info["w"]
-        pad_h = (32 - h % 32) % 32; pad_w = (32 - w % 32) % 32
+        # Use actual tile dims (tile_full_image pads to tile_size=896, not original h/w)
+        th, tw = tile_img.shape[:2]
+        pad_h = (32 - th % 32) % 32; pad_w = (32 - tw % 32) % 32
         img_pad = np.pad(tile_img, ((0, pad_h), (0, pad_w), (0, 0)), mode="reflect") if pad_h or pad_w else tile_img
 
         with torch.no_grad():
