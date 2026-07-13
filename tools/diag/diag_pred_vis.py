@@ -1460,8 +1460,228 @@ def _process_one_image_metrics(args, model, decoder, extract_features, device,
     }
 
 
+def _process_image_group(args, model, decoder, device, img_paths: list[str],
+                         class_protos: dict) -> list[dict | None]:
+    """一组多张图的所有 tile 堆成一个大 batch，一次 backbone forward | Group multiple images:
+    all tiles → one batched backbone forward → per-image decoder + stitch + metrics."""
+
+    # ── Step 1: Load all images, GT, and tile ──
+    tile_size = args.tile_size
+    stride_val = args.stride
+    images_data = []  # [{path, H, W, gt_anns_raw, tiles:[...]}]
+    all_tiles = []    # flat list of all tiles
+
+    for img_path in img_paths:
+        if not os.path.exists(img_path):
+            images_data.append(None); continue
+        try:
+            full_img = np.array(Image.open(img_path).convert("RGB"))
+        except Exception:
+            images_data.append(None); continue
+        H_full, W_full = full_img.shape[:2]
+        stem = os.path.splitext(os.path.basename(img_path))[0]
+
+        # Load GT
+        gt_anns_raw = []
+        gt_class_ids = set()
+        if args.full_gt and os.path.exists(args.full_gt):
+            full_coco = json.load(open(args.full_gt))
+            img_id_to_file = {img["id"]: img["file_name"] for img in full_coco["images"]}
+            file_to_id = {v: k for k, v in img_id_to_file.items()}
+            target_id = file_to_id.get(os.path.basename(img_path))
+            if target_id is None:
+                for fid, fname in img_id_to_file.items():
+                    if os.path.splitext(fname)[0] == stem:
+                        target_id = fid; break
+            if target_id is not None:
+                for ann in full_coco.get("annotations", []):
+                    if ann.get("image_id") != target_id: continue
+                    cat_id = ann.get("category_id", 0)
+                    if cat_id < 1 or cat_id > 15: continue
+                    bbox = ann.get("bbox", [0, 0, 0, 0])
+                    gt_anns_raw.append({
+                        "category_id": cat_id,
+                        "segmentation": ann.get("segmentation", []),
+                        "bbox": bbox, "area": float(ann.get("area", bbox[2] * bbox[3])),
+                    })
+                    gt_class_ids.add(cat_id)
+
+        tiles = tile_full_image(full_img, tile_size=tile_size, stride=stride_val)
+        images_data.append({
+            "path": img_path, "stem": stem, "H": H_full, "W": W_full,
+            "gt_anns_raw": gt_anns_raw, "gt_class_ids": gt_class_ids,
+            "tiles": tiles, "n_tiles": len(tiles),
+        })
+        all_tiles.extend(tiles)
+
+    valid_images = [d for d in images_data if d is not None]
+    if not valid_images:
+        return [None] * len(img_paths)
+
+    # ── Step 2: Stack ALL tiles from ALL images → one batch ──
+    total_B = len(all_tiles)
+    batch_imgs = []
+    for t in all_tiles:
+        batch_imgs.append(torch.from_numpy(t["img"]).permute(2, 0, 1).float().div_(255.0))
+    batch_tensor = torch.stack(batch_imgs).to(device)  # [total_B, 3, 896, 896]
+
+    with torch.no_grad():
+        batched_feats = _extract_features_batched(model, batch_tensor, device, no_grad=True)
+
+    # ── Step 3: Per-image decoder + stitch + metrics ──
+    results = []
+    tile_offset = 0
+    for img_data in images_data:
+        if img_data is None:
+            results.append(None)
+            continue
+
+        n_tiles = img_data["n_tiles"]
+        # Slice this image's features from batch
+        img_feats = {
+            "p3": batched_feats["p3"][tile_offset:tile_offset + n_tiles],
+            "p4": batched_feats["p4"][tile_offset:tile_offset + n_tiles],
+            "proto": batched_feats["proto"][tile_offset:tile_offset + n_tiles],
+        }
+
+        # Per-tile decoder
+        all_tile_results = []
+        with torch.no_grad():
+            for ti in range(n_tiles):
+                tile_info = img_data["tiles"][ti]
+                y0, x0, h, w = tile_info["y0"], tile_info["x0"], tile_info["h"], tile_info["w"]
+                feats = {
+                    "p3": img_feats["p3"][ti],
+                    "p4": img_feats["p4"][ti],
+                    "proto": img_feats["proto"][ti],
+                }
+
+                best_prob = np.zeros((tile_size, tile_size), dtype=np.float32)
+                center_np = None
+                if args.decoder == "center_affinity":
+                    first_pk = list(class_protos.values())[0]
+                    proto_vec = torch.from_numpy(first_pk["proto"]).float().to(device)
+                    center_hm, _, _ = decoder(
+                        feats["p3"].unsqueeze(0), feats["p4"].unsqueeze(0),
+                        feats["proto"].unsqueeze(0), proto_vec,
+                    )
+                    center_np = F.interpolate(
+                        center_hm.unsqueeze(0).unsqueeze(0) if center_hm.dim() == 2 else center_hm.unsqueeze(0),
+                        size=(tile_size, tile_size), mode="bilinear", align_corners=False,
+                    ).squeeze().cpu().numpy()
+                    for cls_id, pk in class_protos.items():
+                        proto_vec_c = torch.from_numpy(pk["proto"]).float().to(device)
+                        proto_mask = decoder.forward_proto_only(
+                            feats["proto"].unsqueeze(0), proto_vec_c,
+                        )
+                        pm = F.interpolate(proto_mask.unsqueeze(0).unsqueeze(0),
+                                          size=(tile_size, tile_size), mode="bilinear",
+                                          align_corners=False).squeeze().cpu().numpy()
+                        best_prob = np.maximum(best_prob, pm)
+                else:
+                    for cls_id, pk in class_protos.items():
+                        proto_vec = torch.from_numpy(pk["proto"]).float().to(device)
+                        if args.decoder == "adaptive":
+                            out = decoder(feats["p4"].unsqueeze(0), feats["proto"].unsqueeze(0), proto_vec)
+                        else:
+                            out = decoder(feats["p3"].unsqueeze(0), feats["p4"].unsqueeze(0),
+                                          feats["proto"].unsqueeze(0), proto_vec)
+                        if out.dim() == 2: out = out.unsqueeze(0).unsqueeze(0)
+                        elif out.dim() == 3: out = out.unsqueeze(0)
+                        pm = F.interpolate(out, size=(tile_size, tile_size),
+                                          mode="bilinear", align_corners=False).squeeze().cpu().numpy()
+                        best_prob = np.maximum(best_prob, pm)
+
+                all_tile_results.append({
+                    "y0": y0, "x0": x0, "h": h, "w": w, "prob": best_prob,
+                    "center": center_np,
+                })
+
+        tile_offset += n_tiles
+
+        # Stitch
+        full_prob = stitch_prob_maps(all_tile_results, img_data["H"], img_data["W"],
+                                     tile_size, stride_val)
+
+        # Generate instances + match
+        from adatile.metrics.instance_generation import generate_instances
+        pred_instances = generate_instances(
+            full_prob, method="connected_components",
+            score_thr=args.score_thr, min_area=args.min_area,
+        )
+
+        gt_anns_raw = img_data["gt_anns_raw"]
+        tp, fp_count, fn_count = 0, 0, 0
+        gt_matched = [False] * len(gt_anns_raw) if gt_anns_raw else []
+        if gt_anns_raw:
+            for pred in sorted(pred_instances, key=lambda x: x.get("score", 0), reverse=True):
+                pm = pred["mask"]
+                pm_ys, pm_xs = np.where(pm)
+                if len(pm_ys) == 0: fp_count += 1; continue
+                p_by, p_bx = int(pm_ys.min()), int(pm_xs.min())
+                p_ey, p_ex = int(pm_ys.max()) + 1, int(pm_xs.max()) + 1
+                best_iou, best_j = 0.0, -1
+                for j in range(len(gt_anns_raw)):
+                    if gt_matched[j]: continue
+                    gt_ann = gt_anns_raw[j]
+                    gx, gy, gw, gh = [int(v) for v in gt_ann["bbox"]]
+                    if p_ex <= gx or p_bx >= gx + gw or p_ey <= gy or p_by >= gy + gh:
+                        continue
+                    rx, ry = max(p_bx, gx), max(p_by, gy)
+                    rw, rh = min(p_ex, gx + gw) - rx, min(p_ey, gy + gh) - ry
+                    if rw <= 0 or rh <= 0: continue
+                    gt_roi = np.zeros((rh, rw), dtype=np.uint8)
+                    seg = gt_ann.get("segmentation", [])
+                    if seg:
+                        polys = seg if isinstance(seg[0], list) else [seg]
+                        for poly in polys:
+                            if len(poly) < 6: continue
+                            pts = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
+                            pts[:, :, 0] -= rx; pts[:, :, 1] -= ry
+                            cv2.fillPoly(gt_roi, [pts], 1)
+                    gt_roi = gt_roi.astype(bool)
+                    pred_roi = pm[ry:ry + rh, rx:rx + rw]
+                    inter = (pred_roi & gt_roi).sum()
+                    union = (pred_roi | gt_roi).sum()
+                    iou = inter / max(union, 1) if union > 0 else 0.0
+                    if iou > best_iou: best_iou, best_j = iou, j
+                if best_iou >= args.iou_thr:
+                    gt_matched[best_j] = True; tp += 1
+                else:
+                    fp_count += 1
+            fn_count = len(gt_anns_raw) - tp
+
+        precision = tp / max(tp + fp_count, 1)
+        recall = tp / max(tp + fn_count, 1)
+        f1 = 2 * precision * recall / max(precision + recall, 1e-9)
+
+        # Per-class
+        n_per_class = defaultdict(int)
+        n_matched_per_class = defaultdict(int)
+        for j, gt_ann in enumerate(gt_anns_raw):
+            n_per_class[gt_ann["category_id"]] += 1
+            if gt_matched[j]:
+                n_matched_per_class[gt_ann["category_id"]] += 1
+
+        results.append({
+            "image": img_data["stem"], "H": img_data["H"], "W": img_data["W"],
+            "n_gt": len(gt_anns_raw), "n_pred": len(pred_instances),
+            "n_classes_gt": len(img_data["gt_class_ids"]),
+            "tp": tp, "fp": fp_count, "fn": fn_count,
+            "precision": round(precision, 4), "recall": round(recall, 4), "f1": round(f1, 4),
+            "prob_max": float(full_prob.max()), "prob_mean": float(full_prob.mean()),
+            "fg_frac": float((full_prob > 0.3).mean()),
+            "per_class": {ISAID_CLASSES.get(k, f"c{k}"):
+                          {"matched": n_matched_per_class.get(k, 0), "gt": v}
+                          for k, v in n_per_class.items()},
+        })
+
+    return results
+
+
 def run_batch_mode(args, model, decoder, extract_features, device):
-    """批量处理整个目录 | Batch process all images in a directory."""
+    """批量处理整个目录 (多图 tile 合并 batched backbone) | Batch process all images in a directory
+    with batched backbone across images."""
     import csv as _csv_module
     batch_dir = args.batch_dir
     if not os.path.isdir(batch_dir):
@@ -1473,33 +1693,65 @@ def run_batch_mode(args, model, decoder, extract_features, device):
         if f.lower().endswith(args.batch_ext.lower())
     ])
     print(f"\n  Found {len(images)} images in {batch_dir}")
+    print(f"  Group size: {args.batch_group} images per backbone forward")
     print(f"  Processing...\n")
+
+    # Build class prototypes once (from first image's data_root)
+    class_protos = {}
+    if args.data_root:
+        data_root = Path(args.data_root)
+        if data_root.exists():
+            class_index = _build_class_index(data_root, args.split)
+            class_protos = build_class_prototypes_vis(
+                model, extract_features, class_index, images[0] if images else "",
+                args.split, data_root, args.k_shot, args.prototype_source, device,
+            )
+    if not class_protos:
+        # Load first image's GT to get class IDs
+        first_path = os.path.join(batch_dir, images[0])
+        first_img_name = os.path.basename(first_path)
+        gt_class_ids = set()
+        if args.full_gt and os.path.exists(args.full_gt):
+            full_coco = json.load(open(args.full_gt))
+            img_id_to_file = {img["id"]: img["file_name"] for img in full_coco["images"]}
+            file_to_id = {v: k for k, v in img_id_to_file.items()}
+            target_id = file_to_id.get(first_img_name)
+            if target_id is not None:
+                for ann in full_coco.get("annotations", []):
+                    if ann.get("image_id") == target_id and 1 <= ann.get("category_id", 0) <= 15:
+                        gt_class_ids.add(ann["category_id"])
+        for cid in (gt_class_ids or range(1, 16)):
+            class_protos[cid] = {"proto": np.random.randn(640).astype(np.float32)}
+    print(f"  Prototypes: {[ISAID_CLASSES.get(c, f'c{c}') for c in sorted(class_protos.keys())]}")
 
     all_metrics = []
     overall_tp, overall_fp_count, overall_fn = 0, 0, 0
     overall_n_gt = 0
+    group_size = args.batch_group
+    t_total_start = time.perf_counter()
 
-    for i, fname in enumerate(images):
-        img_path = os.path.join(batch_dir, fname)
-        print(f"  [{i + 1}/{len(images)}] {fname}...", end=" ", flush=True)
+    for group_start in range(0, len(images), group_size):
+        group_paths = [os.path.join(batch_dir, f) for f in images[group_start:group_start + group_size]]
+        group_names = images[group_start:group_start + group_size]
+        print(f"  ── Group [{group_start + 1}-{min(group_start + group_size, len(images))}/{len(images)}] "
+              f"({len(group_paths)} images) ──", flush=True)
 
-        t_start = time.perf_counter()
-        m = _process_one_image_metrics(args, model, decoder, extract_features, device, img_path)
-        elapsed = time.perf_counter() - t_start
+        t_group = time.perf_counter()
+        group_results = _process_image_group(args, model, decoder, device, group_paths, class_protos)
+        t_elapsed = time.perf_counter() - t_group
 
-        if m is None:
-            print(f"SKIP (failed to load)")
-            continue
-
-        all_metrics.append(m)
-        overall_tp += m["tp"]
-        overall_fp_count += m["fp"]
-        overall_fn += m["fn"]
-        overall_n_gt += m["n_gt"]
-
-        print(f"TP={m['tp']}/{m['n_gt']} "
-              f"P={m['precision']:.3f} R={m['recall']:.3f} F1={m['f1']:.3f} "
-              f"({elapsed:.1f}s)")
+        for j, (fname, m) in enumerate(zip(group_names, group_results)):
+            if m is None:
+                print(f"    {fname}: SKIP")
+                continue
+            all_metrics.append(m)
+            overall_tp += m["tp"]
+            overall_fp_count += m["fp"]
+            overall_fn += m["fn"]
+            overall_n_gt += m["n_gt"]
+            print(f"    {fname}: TP={m['tp']}/{m['n_gt']} "
+                  f"P={m['precision']:.3f} R={m['recall']:.3f} F1={m['f1']:.3f}")
+        print(f"    [Group done in {t_elapsed:.1f}s, {t_elapsed / max(len(group_paths), 1):.1f}s/image]\n")
 
     # ── Summary ──
     overall_precision = overall_tp / max(overall_tp + overall_fp_count, 1)
@@ -1553,6 +1805,8 @@ def main():
                         help="tile=单tile可视化 | full=单张全图 | batch=批量处理整个目录")
     parser.add_argument("--batch-dir", type=str, help="批量模式下图片目录 | Image directory for batch mode")
     parser.add_argument("--batch-ext", type=str, default=".png", help="批量模式图片扩展名 | Image extension for batch")
+    parser.add_argument("--batch-group", type=int, default=4,
+                        help="每批处理的图片数 (tile 合并过 backbone) | Images per backbone forward group")
 
     # Tile mode args
     parser.add_argument("--query-tile", type=str, help="Tile stem (e.g. P0089_t0001)")
