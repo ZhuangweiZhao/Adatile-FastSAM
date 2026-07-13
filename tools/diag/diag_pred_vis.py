@@ -547,12 +547,18 @@ def run_full_image_mode(args, model, decoder, extract_features, ckpt, device):
         first_tile_pad = first_tile
     with torch.no_grad():
         qf = extract_features(model, [first_tile_pad], device)[0]
-    query_vec = F.normalize(qf[args.prototype_source].mean(dim=(1, 2)), p=2, dim=0).cpu().numpy()
+    # mean over spatial dims (H,W) → [1, C] or [C]; handle both 3D and 4D
+    q_feat = qf[args.prototype_source]
+    if q_feat.dim() == 4:
+        q_spatial = q_feat.mean(dim=(2, 3))  # [1, C]
+    else:
+        q_spatial = q_feat.mean(dim=(1, 2))  # [C]
+    query_vec = F.normalize(q_spatial, p=2, dim=-1).cpu().numpy().squeeze()
     print(f"    {'Class':<22s} {'CosSim':>8s}")
     print(f"    {'-'*32}")
     proto_sims = {}
     for cls_id in sorted(class_protos.keys()):
-        pv = class_protos[cls_id]["proto"]
+        pv = np.asarray(class_protos[cls_id]["proto"]).squeeze()  # (C,)
         pv_norm = pv / (np.linalg.norm(pv) + 1e-8)
         sim = float(np.dot(pv_norm, query_vec))
         proto_sims[cls_id] = sim
