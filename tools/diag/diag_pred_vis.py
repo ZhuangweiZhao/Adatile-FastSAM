@@ -27,7 +27,7 @@ v3 改进 | v3 Improvements:
 
 from __future__ import annotations
 
-import argparse, json, os, sys, random
+import argparse, json, os, sys, random, time
 from collections import defaultdict
 from pathlib import Path
 
@@ -443,7 +443,8 @@ def run_full_image_mode(args, model, decoder, extract_features, ckpt, device):
     """全图模式: 原图 → 切 tile → 逐 tile 推理 → 拼接 → 可视化."""
     from tools.train.train_fewshot_allclass import extract_features as ef
 
-    # ── Load full image ──
+    # ── Load full image + GT ──
+    t0 = time.perf_counter()
     if not os.path.exists(args.image):
         print(f"  [FATAL] Image not found: {args.image}")
         sys.exit(1)
@@ -490,14 +491,18 @@ def run_full_image_mode(args, model, decoder, extract_features, ckpt, device):
             print(f"  [WARN] No GT found for {img_name} in {args.full_gt}")
     else:
         print(f"  [WARN] No full-image GT file (--full-gt). Showing predictions only.")
+    print(f"  [TIMING] Image + GT loading: {time.perf_counter() - t0:.2f}s")
 
     # ── Tile the image ──
+    t0 = time.perf_counter()
     tile_size = args.tile_size
     stride_val = args.stride
     tiles = tile_full_image(full_img, tile_size=tile_size, stride=stride_val)
     print(f"  Tiled into {len(tiles)} tiles ({tile_size}×{tile_size}, stride={stride_val})")
+    print(f"  [TIMING] Tiling: {time.perf_counter() - t0:.2f}s")
 
     # ── Build prototypes (from tile-level index if available) ──
+    t0 = time.perf_counter()
     class_protos = {}
     query_src = img_stem
     if args.data_root:
@@ -517,10 +522,12 @@ def run_full_image_mode(args, model, decoder, extract_features, ckpt, device):
             class_protos[1] = {"proto": np.random.randn(640).astype(np.float32)}
 
     print(f"  Prototypes: {[ISAID_CLASSES.get(c, f'c{c}') for c in sorted(class_protos.keys())]}")
+    print(f"  [TIMING] Prototype building: {time.perf_counter() - t0:.2f}s")
 
     # ── Per-tile inference ──
     print(f"\n  Running inference on {len(tiles)} tiles...")
     all_tile_results = []
+    t_infer_start = time.perf_counter()
 
     for ti, tile_info in enumerate(tiles):
         tile_img = tile_info["img"]
@@ -603,23 +610,32 @@ def run_full_image_mode(args, model, decoder, extract_features, ckpt, device):
         if (ti + 1) % max(1, len(tiles) // 5) == 0:
             print(f"    {ti + 1}/{len(tiles)} tiles done")
 
+    t_infer = time.perf_counter() - t_infer_start
+    print(f"  [TIMING] Per-tile inference: {t_infer:.1f}s total, "
+          f"{t_infer / len(tiles):.2f}s/tile ({len(tiles)} tiles)")
+
     # ── Stitch to full image ──
+    t0 = time.perf_counter()
     print(f"\n  Stitching {len(all_tile_results)} tile predictions...")
     full_prob = stitch_prob_maps(all_tile_results, H_full, W_full, tile_size, stride_val)
     full_binary = full_prob > args.score_thr
+    print(f"  [TIMING] Stitching: {time.perf_counter() - t0:.2f}s")
 
     # ── Generate instances from stitched prob map ──
     # 全图尺寸大, 用 connected_components 避免 watershed 卡死
     # Full-image scale: use connected_components to avoid watershed hang on large maps
     from adatile.metrics.instance_generation import generate_instances
+    t0 = time.perf_counter()
     print(f"  Generating instances (method=connected_components, thr={args.score_thr})...")
     pred_instances = generate_instances(
         full_prob, method="connected_components",
         score_thr=args.score_thr, min_area=args.min_area,
     )
     print(f"  Generated {len(pred_instances)} instance predictions")
+    print(f"  [TIMING] Instance generation: {time.perf_counter() - t0:.2f}s")
 
     # ── Compute metrics ──
+    t0 = time.perf_counter()
     tp, fp_count, fn_count = 0, 0, 0
     if gt_full["instances"]:
         # Build TP/FP/FN masks
@@ -655,6 +671,7 @@ def run_full_image_mode(args, model, decoder, extract_features, ckpt, device):
         precision = tp / max(tp + fp_count, 1)
         recall = tp / max(tp + fn_count, 1)
         f1 = 2 * precision * recall / max(precision + recall, 1e-9)
+        print(f"  [TIMING] Metrics computation: {time.perf_counter() - t0:.2f}s")
         print(f"\n  Full-Image Metrics (IoU≥{args.iou_thr}):")
         print(f"    TP={tp}, FP={fp_count}, FN={fn_count}")
         print(f"    Precision={precision:.3f}, Recall={recall:.3f}, F1={f1:.3f}")
@@ -669,6 +686,7 @@ def run_full_image_mode(args, model, decoder, extract_features, ckpt, device):
             print(f"    {cname} (id={cls_id}): matched={cls_tp}/{cls_gt}")
 
     # ── Generate full-image visualization ──
+    t0 = time.perf_counter()
     out_path = os.path.join(args.output, f"{img_stem}_full_summary.png")
     _plot_full_image_summary(
         full_img, img_stem, gt_full, pred_instances, full_prob, full_binary,
@@ -678,6 +696,7 @@ def run_full_image_mode(args, model, decoder, extract_features, ckpt, device):
         H_full, W_full, out_path,
     )
     print(f"\n  [SAVED] {out_path}")
+    print(f"  [TIMING] Visualization rendering: {time.perf_counter() - t0:.2f}s")
 
 
 def _plot_full_image_summary(full_img, stem, gt, pred_insts, prob, binary,
@@ -999,11 +1018,16 @@ def main():
     print(f"  Decoder Visualization v3 — {args.decoder} ({args.mode} mode)")
     print("=" * 70)
 
+    t_total = time.perf_counter()
+
     # Load model
+    t0 = time.perf_counter()
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     unfreeze_layers = ckpt.get("unfreeze_layers", ckpt.get("config", {}).get("unfreeze_layers", 8))
     model, decoder, extract_features, ckpt_meta = _load_model_and_decoder(
         args.checkpoint, unfreeze_layers, args.decoder, device)
+    t_load = time.perf_counter() - t0
+    print(f"  [TIMING] Model loading: {t_load:.1f}s")
 
     if args.mode == "full":
         if not args.image:
@@ -1019,7 +1043,9 @@ def main():
             sys.exit(1)
         run_tile_mode(args, model, decoder, extract_features, ckpt, device)
 
-    print(f"\n  Done → {args.output}/")
+    t_total = time.perf_counter() - t_total
+    print(f"\n  [TIMING] Total wall time: {t_total:.1f}s")
+    print(f"  Done → {args.output}/")
 
 
 if __name__ == "__main__":
