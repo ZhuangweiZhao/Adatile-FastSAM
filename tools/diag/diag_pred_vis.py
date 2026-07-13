@@ -566,39 +566,43 @@ def run_full_image_mode(args, model, decoder, extract_features, ckpt, device):
         bar = "█" * max(0, int(sim * 20)) + "░" * max(0, 20 - int(sim * 20))
         print(f"    {cname:<22s} {sim:>8.4f}  {bar}")
 
-    # ── Per-tile inference ──
-    print(f"\n  Running inference on {len(tiles)} tiles...")
+    # ── Per-tile inference (batched backbone forward) ──
+    # 每 tile 推理（批量 backbone forward）
+    print(f"\n  Running inference on {len(tiles)} tiles (batched backbone)...")
     all_tile_results = []
     t_infer_start = time.perf_counter()
 
+    # Stack all tiles → single batch for backbone
+    B = len(tiles)
+    batch_imgs = []
+    for ti in tiles:
+        t_img = ti["img"]  # already tile_size×tile_size (896=28×32)
+        batch_imgs.append(torch.from_numpy(t_img).permute(2, 0, 1).float().div_(255.0))
+    batch_tensor = torch.stack(batch_imgs).to(device)  # [B, 3, 896, 896]
+
+    with torch.no_grad():
+        batched_feats = _extract_features_batched(model, batch_tensor, device, no_grad=True)
+
+    # Per-tile decoder processing
     for ti, tile_info in enumerate(tiles):
         tile_img = tile_info["img"]
         y0, x0, h, w = tile_info["y0"], tile_info["x0"], tile_info["h"], tile_info["w"]
-
-        # Pad to multiple of 32 (use actual tile dims, not original content h/w)
-        # tile_full_image() pads to tile_size (896), but content h/w may differ
-        th, tw = tile_img.shape[:2]
-        pad_h = (32 - th % 32) % 32
-        pad_w = (32 - tw % 32) % 32
-        if pad_h > 0 or pad_w > 0:
-            img_pad = np.pad(tile_img, ((0, pad_h), (0, pad_w), (0, 0)), mode="reflect")
-        else:
-            img_pad = tile_img
+        # Extract single-tile features from batch
+        feats = {
+            "p3": batched_feats["p3"][ti],     # [C, H/8, W/8]
+            "p4": batched_feats["p4"][ti],     # [C, H/16, W/16]
+            "proto": batched_feats["proto"][ti],  # [32, H/4, W/4]
+        }
 
         with torch.no_grad():
-            feats = extract_features(model, [img_pad], device)[0]
-
             if args.decoder == "center_affinity":
                 # Class-agnostic center + offset
                 first_pk = list(class_protos.values())[0]
                 proto_vec = torch.from_numpy(first_pk["proto"]).float().to(device)
                 center_hm, offset_field, _ = decoder(
-                    feats["p3"].unsqueeze(0) if feats["p3"].dim() == 3 else feats["p3"],
-                    feats["p4"].unsqueeze(0) if feats["p4"].dim() == 3 else feats["p4"],
-                    feats["proto"].unsqueeze(0) if feats["proto"].dim() == 3 else feats["proto"],
-                    proto_vec,
+                    feats["p3"].unsqueeze(0), feats["p4"].unsqueeze(0),
+                    feats["proto"].unsqueeze(0), proto_vec,
                 )
-                # Save center_hm for stitching (diagnostic: GT center vs pred center)
                 center_np = F.interpolate(
                     center_hm.unsqueeze(0).unsqueeze(0) if center_hm.dim() == 2 else center_hm.unsqueeze(0),
                     size=(tile_size, tile_size), mode="bilinear", align_corners=False,
@@ -608,8 +612,7 @@ def run_full_image_mode(args, model, decoder, extract_features, ckpt, device):
                 for cls_id, pk in class_protos.items():
                     proto_vec_c = torch.from_numpy(pk["proto"]).float().to(device)
                     proto_mask = decoder.forward_proto_only(
-                        feats["proto"].unsqueeze(0) if feats["proto"].dim() == 3 else feats["proto"],
-                        proto_vec_c,
+                        feats["proto"].unsqueeze(0), proto_vec_c,
                     )
                     pm = F.interpolate(
                         proto_mask.unsqueeze(0).unsqueeze(0),
@@ -622,10 +625,8 @@ def run_full_image_mode(args, model, decoder, extract_features, ckpt, device):
                 for cls_id, pk in class_protos.items():
                     proto_vec = torch.from_numpy(pk["proto"]).float().to(device)
                     masks_s8, proto_mask = decoder(
-                        feats["p3"].unsqueeze(0) if feats["p3"].dim() == 3 else feats["p3"],
-                        feats["p4"].unsqueeze(0) if feats["p4"].dim() == 3 else feats["p4"],
-                        feats["proto"].unsqueeze(0) if feats["proto"].dim() == 3 else feats["proto"],
-                        proto_vec,
+                        feats["p3"].unsqueeze(0), feats["p4"].unsqueeze(0),
+                        feats["proto"].unsqueeze(0), proto_vec,
                     )
                     kernel_max = masks_s8.max(dim=0)[0]
                     pm = F.interpolate(
@@ -639,9 +640,10 @@ def run_full_image_mode(args, model, decoder, extract_features, ckpt, device):
                 for cls_id, pk in class_protos.items():
                     proto_vec = torch.from_numpy(pk["proto"]).float().to(device)
                     if args.decoder == "adaptive":
-                        out = decoder(feats["p4"], feats["proto"], proto_vec)
+                        out = decoder(feats["p4"].unsqueeze(0), feats["proto"].unsqueeze(0), proto_vec)
                     else:  # adaptive-p3p4
-                        out = decoder(feats["p3"], feats["p4"], feats["proto"], proto_vec)
+                        out = decoder(feats["p3"].unsqueeze(0), feats["p4"].unsqueeze(0),
+                                      feats["proto"].unsqueeze(0), proto_vec)
                     if out.dim() == 2:
                         out = out.unsqueeze(0).unsqueeze(0)
                     elif out.dim() == 3:
@@ -662,7 +664,7 @@ def run_full_image_mode(args, model, decoder, extract_features, ckpt, device):
 
     t_infer = time.perf_counter() - t_infer_start
     print(f"  [TIMING] Per-tile inference: {t_infer:.1f}s total, "
-          f"{t_infer / len(tiles):.2f}s/tile ({len(tiles)} tiles)")
+          f"{t_infer / len(tiles):.2f}s/tile ({len(tiles)} tiles, batched backbone)")
 
     # ── Stitch to full image ──
     t0 = time.perf_counter()
@@ -1170,6 +1172,73 @@ def _plot_tile_summary(img, stem, gt, pred_insts, prob, tp, fp_count, fn,
 
 
 # ═══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+# Batched Feature Extraction | 批量特征提取
+# ═══════════════════════════════════════════════════════════════════
+
+def _extract_features_batched(model, batch_tensor: "torch.Tensor",
+                               device: str = "cuda", no_grad: bool = True) -> dict:
+    """
+    批量提取 FastSAM backbone 特征 (所有 tile 一次 forward).
+    Batched feature extraction — all tiles in one forward pass.
+
+    与 extract_features 不同, 此函数接受 [B, 3, H, W] 的 batch tensor,
+    一次 forward 捕获 P3/P4/P8/Proto, 大幅提升 GPU 利用率.
+
+    :param model: FastSAM model.
+    :param batch_tensor: [B, 3, H, W] float32 tensor on device.
+    :param device: "cuda" or "cpu".
+    :param no_grad: If True, use torch.no_grad().
+    :return: {p3: [B,C,H/8,W/8], p4: [B,C,H/16,W/16], p8: [B,C,H/32,W/32], proto: [B,32,H/4,W/4]}
+    """
+    seg = model.model          # SegmentationModel
+    seq = seg.model            # Sequential[23]
+    save_set = set(seg.save)   # {4, 6, 9, 12, 15, 18, 21}
+    segment = seq[22]          # Segment head
+
+    # Hooks
+    hooked = {}
+
+    def _hook(name):
+        def _fn(m, inp, outp):
+            hooked[name] = outp.detach() if no_grad else outp
+        return _fn
+
+    handles = [
+        seq[15].register_forward_hook(_hook("p3")),
+        seq[18].register_forward_hook(_hook("p4")),
+        seq[21].register_forward_hook(_hook("p8")),
+    ]
+
+    ctx = torch.no_grad() if no_grad else torch.enable_grad()
+    with ctx:
+        x = batch_tensor
+        y = []
+        for i, m in enumerate(seq):
+            if hasattr(m, 'f') and m.f != -1:
+                if isinstance(m.f, int):
+                    x = y[m.f]
+                else:
+                    x = [x if j == -1 else y[j] for j in m.f]
+            x = m(x)
+            y.append(x if i in save_set else None)
+
+    for h in handles:
+        h.remove()
+
+    p3 = hooked.get("p3")
+    p4 = hooked.get("p4")
+    p8 = hooked.get("p8")
+    if p3 is None or p4 is None:
+        raise RuntimeError(f"Hook failed: p3={p3 is not None}, p4={p4 is not None}")
+
+    # Proto masks from P3 (same ctx as forward)
+    with ctx:
+        proto = segment.proto(p3)  # [B, 32, H/4, W/4]
+
+    return {"p3": p3, "p4": p4, "p8": p8, "proto": proto}
+
+
 # Main | 主流程
 # ═══════════════════════════════════════════════════════════════════
 
@@ -1244,28 +1313,41 @@ def _process_one_image_metrics(args, model, decoder, extract_features, device,
                 class_protos[1] = {"proto": np.random.randn(640).astype(np.float32)}
         _process_one_image_metrics._proto_cache = class_protos
 
-    # Per-tile inference
+    # ── Batched backbone forward: stack all tiles → single pass ──
+    # 批量 backbone forward：所有 tile 堆叠 → 一次前向
+    B = len(tiles)
+    batch_imgs = []
+    for ti in tiles:
+        # tile_full_image() already pads to tile_size (896=28×32), no extra pad needed
+        t_img = ti["img"]
+        batch_imgs.append(torch.from_numpy(t_img).permute(2, 0, 1).float().div_(255.0))
+    batch_tensor = torch.stack(batch_imgs).to(device)  # [B, 3, 896, 896]
+
+    with torch.no_grad():
+        batched_feats = _extract_features_batched(model, batch_tensor, device, no_grad=True)
+    # batched_feats: {p3:[B,C,H/8,W/8], p4:[B,C,H/16,W/16], proto:[B,32,H/4,W/4]}
+
+    # ── Per-tile decoder processing (lightweight, < 5ms per tile) ──
+    # 逐 tile decoder 处理（轻量, < 5ms/tile）
     all_tile_results = []
-    for tile_info in tiles:
-        tile_img = tile_info["img"]
+    for i, tile_info in enumerate(tiles):
         y0, x0, h, w = tile_info["y0"], tile_info["x0"], tile_info["h"], tile_info["w"]
-        # Use actual tile dims (tile_full_image pads to tile_size=896, not original h/w)
-        th, tw = tile_img.shape[:2]
-        pad_h = (32 - th % 32) % 32; pad_w = (32 - tw % 32) % 32
-        img_pad = np.pad(tile_img, ((0, pad_h), (0, pad_w), (0, 0)), mode="reflect") if pad_h or pad_w else tile_img
+        # Extract single-tile features from batch
+        feats = {
+            "p3": batched_feats["p3"][i],     # [C, H/8, W/8]
+            "p4": batched_feats["p4"][i],     # [C, H/16, W/16]
+            "proto": batched_feats["proto"][i],  # [32, H/4, W/4]
+        }
 
         with torch.no_grad():
-            feats = extract_features(model, [img_pad], device)[0]
             best_prob = np.zeros((tile_size, tile_size), dtype=np.float32)
             center_np = None
             if args.decoder == "center_affinity":
                 first_pk = list(class_protos.values())[0]
                 proto_vec = torch.from_numpy(first_pk["proto"]).float().to(device)
                 center_hm, _, _ = decoder(
-                    feats["p3"].unsqueeze(0) if feats["p3"].dim() == 3 else feats["p3"],
-                    feats["p4"].unsqueeze(0) if feats["p4"].dim() == 3 else feats["p4"],
-                    feats["proto"].unsqueeze(0) if feats["proto"].dim() == 3 else feats["proto"],
-                    proto_vec,
+                    feats["p3"].unsqueeze(0), feats["p4"].unsqueeze(0),
+                    feats["proto"].unsqueeze(0), proto_vec,
                 )
                 center_np = F.interpolate(
                     center_hm.unsqueeze(0).unsqueeze(0) if center_hm.dim() == 2 else center_hm.unsqueeze(0),
@@ -1274,8 +1356,7 @@ def _process_one_image_metrics(args, model, decoder, extract_features, device,
                 for cls_id, pk in class_protos.items():
                     proto_vec_c = torch.from_numpy(pk["proto"]).float().to(device)
                     proto_mask = decoder.forward_proto_only(
-                        feats["proto"].unsqueeze(0) if feats["proto"].dim() == 3 else feats["proto"],
-                        proto_vec_c,
+                        feats["proto"].unsqueeze(0), proto_vec_c,
                     )
                     pm = F.interpolate(proto_mask.unsqueeze(0).unsqueeze(0),
                                       size=(tile_size, tile_size), mode="bilinear",
@@ -1285,9 +1366,10 @@ def _process_one_image_metrics(args, model, decoder, extract_features, device,
                 for cls_id, pk in class_protos.items():
                     proto_vec = torch.from_numpy(pk["proto"]).float().to(device)
                     if args.decoder == "adaptive":
-                        out = decoder(feats["p4"], feats["proto"], proto_vec)
+                        out = decoder(feats["p4"].unsqueeze(0), feats["proto"].unsqueeze(0), proto_vec)
                     else:
-                        out = decoder(feats["p3"], feats["p4"], feats["proto"], proto_vec)
+                        out = decoder(feats["p3"].unsqueeze(0), feats["p4"].unsqueeze(0),
+                                      feats["proto"].unsqueeze(0), proto_vec)
                     if out.dim() == 2: out = out.unsqueeze(0).unsqueeze(0)
                     elif out.dim() == 3: out = out.unsqueeze(0)
                     pm = F.interpolate(out, size=(tile_size, tile_size),
