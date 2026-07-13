@@ -34,16 +34,19 @@ import matplotlib.pyplot as plt
 # ═══════════════════════════════════════════════════════════════════
 
 def _fastsam_weights_path():
-    """Locate FastSAM-x.pt."""
-    paths = [
-        os.path.join(_PROJECT_ROOT, "weights", "FastSAM-x.pt"),
-        os.path.join(_PROJECT_ROOT, "FastSAM-x.pt"),
-        os.path.join(os.path.expanduser("~"), ".cache", "torch", "hub", "checkpoints", "FastSAM-x.pt"),
-    ]
-    for p in paths:
-        if os.path.exists(p):
-            return p
-    raise FileNotFoundError("FastSAM-x.pt not found. Download from https://github.com/CASIA-IVA-Lab/FastSAM")
+    """Locate FastSAM-x.pt — same logic as evaluate_instance.py."""
+    # Standard location in project
+    p = os.path.join(_PROJECT_ROOT, "thirdLibrary", "FastSAM", "weights", "FastSAM-x.pt")
+    if os.path.exists(p):
+        return p
+    # Check environment variable
+    env_path = os.environ.get("FASTSAM_WEIGHTS", "")
+    if env_path and os.path.exists(env_path):
+        return env_path
+    raise FileNotFoundError(
+        f"FastSAM-x.pt not found at {p}. "
+        "Set FASTSAM_WEIGHTS env var or place weights in thirdLibrary/FastSAM/weights/"
+    )
 
 
 def _load_model(ckpt_path: str, unfreeze_layers: int, decoder_type: str, device: str):

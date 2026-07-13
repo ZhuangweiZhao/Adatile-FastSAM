@@ -941,7 +941,7 @@ def train_episode(model, decoder, optimizer, class_id: int,
         # offset_field: [2, H/8, W/8] (dx, dy)
         # proto_mask:   [H/4, W/4] ∈ [0, 1]
 
-        _, H_c, W_c = center_hm.shape  # H/8, W/8
+        H_c, W_c = center_hm.shape  # H/8, W/8 (2D, no batch dim)
         H_gt, W_gt = query_gt.shape
 
         # ── Common GT | 共享 GT ──
