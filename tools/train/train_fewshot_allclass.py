@@ -989,6 +989,7 @@ def train_episode(model, decoder, optimizer, class_id: int,
             loss_dict = {
                 "dice": proto_dice_val.item(), "bce": proto_bce.item(),
                 "kernel_dice": kernel_dice_val.item(),
+                "kernel_cos_sim": 0.0,
                 "n_matched": 0, "n_unmatched_pred": 0,
                 "n_unmatched_gt": 0, "n_gt": 0,
             }
@@ -1008,15 +1009,26 @@ def train_episode(model, decoder, optimizer, class_id: int,
             )
             inst_loss, loss_dict = multi_instance_loss(
                 masks_gt, gt_full, matched, unmatched_pred, unmatched_gt,
-                dice_weight=1.0, bce_weight=1.0, empty_weight=0.1,
+                dice_weight=1.0, bce_weight=1.0, empty_weight=0.5,
             )
             loss_dict["dice"] = proto_dice_val.item()
             loss_dict["bce"] = proto_bce.item()
             loss_dict["kernel_dice"] = kernel_dice_val.item()
             loss_dict["n_gt"] = len(gt_full_list)
 
-        # ── Total loss: proto auxiliary + kernel semantic + instance matching ──
-        loss = proto_loss + kernel_sem_loss + inst_loss
+        # ── Loss 4: Kernel diversity (prevents weight collapse) ──
+        # 所有 kernel 从同一个 prototype 生成, 容易坍缩为相同权重.
+        # All kernels share the same prototype input → prone to weight collapse.
+        # Diversity loss pushes kernel weight vectors apart via cosine similarity penalty.
+        kernels = getattr(decoder, "_last_kernels", None)
+        if kernels is not None:
+            div_loss = DynamicKernelDecoder.kernel_diversity_loss(kernels)
+            loss_dict["kernel_cos_sim"] = div_loss.item()
+        else:
+            div_loss = 0.0
+
+        # ── Total loss: proto auxiliary + kernel semantic + instance matching + diversity ──
+        loss = proto_loss + kernel_sem_loss + inst_loss + 0.1 * div_loss
 
         # IoU: kernel semantic output (max-pool of all kernels)
         with torch.no_grad():
@@ -1487,7 +1499,8 @@ def main():
         if spm is not None:
             epoch_losses["spm_mean"] = []
         if decoder_type == "dynamic_kernel":
-            for _k in ("n_matched", "n_unmatched_pred", "n_unmatched_gt", "n_gt"):
+            for _k in ("n_matched", "n_unmatched_pred", "n_unmatched_gt", "n_gt",
+                       "kernel_dice", "kernel_cos_sim"):
                 epoch_losses[_k] = []
         if getattr(decoder, "collect_stats", False):  # 前向统计键 (须与 result 键一致) | forward-stat keys
             for _k in ("proto_basis_l2", "coeff_l2", "pre_sigmoid_absmax", "sat_frac", "coeff_grad_norm"):
@@ -1565,6 +1578,9 @@ def main():
                 parts.append(f"kdice={np.mean(kdice_vals):.3f}")
             if matched_vals and gt_vals:
                 parts.append(f"match={np.mean(matched_vals):.1f}/{np.mean(gt_vals):.1f}")
+            cos_vals = [v for v in epoch_losses.get("kernel_cos_sim", []) if v is not None and v > 0]
+            if cos_vals:
+                parts.append(f"cossim={np.mean(cos_vals):.3f}")
             if parts:
                 dk_str = ", " + ", ".join(parts)
         print(f"  Epoch {epoch + 1}: loss={avg_loss:.4f}, iou={avg_iou:.4f}, "

@@ -185,8 +185,15 @@ class DynamicKernelDecoder(nn.Module):
             nn.Linear(512, n_kernels * kernel_dim),
         )
 
+        # ── Per-kernel learnable bias: 每个 kernel 有独特的偏置, 打破对称性 ──
+        # Each kernel gets a unique learnable bias to break symmetry.
+        # Without this, all 16 kernels converge to near-identical weights
+        # because they all receive the same prototype as input.
+        self.kernel_bias = nn.Parameter(torch.zeros(n_kernels, kernel_dim))
+
         # ═══════════════════════════════════════════════════════════════
         # 4. Proto Coefficient Predictor (保留, 用于 proto mask 生成)
+        #    Proto Coeff Predictor (retained for proto mask generation)
         #    Proto Coeff Predictor (retained for proto mask generation)
         # ═══════════════════════════════════════════════════════════════
         # 保留 proto 支路作为辅助信号 (提供全局形状先验)
@@ -226,6 +233,10 @@ class DynamicKernelDecoder(nn.Module):
                     nn.init.ones_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
+
+        # ── Per-kernel bias: 小随机初始化, 打破对称性 ──
+        # Small random init to break symmetry from the start.
+        nn.init.normal_(self.kernel_bias, std=0.01)
 
     def _normalize_proto(self, proto_masks: torch.Tensor) -> torch.Tensor:
         """归一化 proto basis 幅值 | Normalize proto basis magnitude.
@@ -280,12 +291,44 @@ class DynamicKernelDecoder(nn.Module):
 
         :param support_proto: [feat_dim] 或 [1, feat_dim] prototype.
         :return: [N, kernel_dim] 动态核权重 | dynamic kernel weights.
+
+        NOTE: Per-kernel bias (`self.kernel_bias`) is added to break symmetry.
+        Without it, all N kernels converge to identical weights since they
+        all share the same prototype input through a shared MLP.
+        添加 per-kernel bias 打破对称性, 防止所有 kernel 坍缩为相同权重.
         """
         if support_proto.dim() == 2:
             support_proto = support_proto.squeeze(0)
         kernels_flat = self.kernel_generator(support_proto)  # [N * kernel_dim]
         kernels = kernels_flat.view(self.n_kernels, self.kernel_dim)  # [N, kernel_dim]
+        # ── Per-kernel bias: unique learnable offset per kernel ──
+        kernels = kernels + self.kernel_bias
         return kernels
+
+    @staticmethod
+    def kernel_diversity_loss(kernels: torch.Tensor) -> torch.Tensor:
+        """
+        Kernel 多样性损失: 惩罚高余弦相似度的 kernel 对.
+        Kernel diversity loss: penalize high cosine similarity between kernel pairs.
+
+        防止所有 kernel 坍缩为相同权重 | Prevents kernel weight collapse.
+
+        :param kernels: [N, kernel_dim] kernel weight vectors.
+        :return: scalar loss ∈ [0, 1], 0 = orthogonal, 1 = identical.
+        """
+        N = kernels.shape[0]
+        if N <= 1:
+            return kernels.new_zeros(())
+        # L2-normalize each kernel weight vector
+        k_norm = F.normalize(kernels, dim=1)  # [N, D]
+        # Cosine similarity matrix: [N, N]
+        sim = k_norm @ k_norm.T
+        # Mask diagonal (self-similarity = 1, don't penalize)
+        mask = ~torch.eye(N, dtype=torch.bool, device=kernels.device)
+        off_diag = sim[mask]  # [N*(N-1)]
+        # Penalize positive cosine similarity (encourage diversity)
+        # Mean across all off-diagonal pairs
+        return off_diag.clamp(min=0).mean()
 
     def forward(
         self,
@@ -336,6 +379,9 @@ class DynamicKernelDecoder(nn.Module):
         # ═══════════════════════════════════════════════════════════════
         kernels = self._generate_kernels(support_proto)  # [N, kernel_dim]
 
+        # ── Store for diversity loss (training only) | 保存 kernel 权重供 diversity loss 使用 ──
+        self._last_kernels = kernels
+
         # ═══════════════════════════════════════════════════════════════
         # Step 5: 动态卷积 → N 个实例掩码 | Dynamic conv → N instance masks
         # ═══════════════════════════════════════════════════════════════
@@ -385,6 +431,7 @@ class DynamicKernelDecoder(nn.Module):
             "fpn": _count(self.lateral_p4) + _count(self.lateral_p3) + _count(self.fpn_fuse),
             "mask_feat": _count(self.mask_feat),
             "kernel_generator": _count(self.kernel_generator),
+            "kernel_bias": self.kernel_bias.numel(),
             "coeff_predictor": _count(self.coeff_predictor),
             "total": _count(self),
         }
