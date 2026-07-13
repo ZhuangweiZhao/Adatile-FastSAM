@@ -661,7 +661,8 @@ def run_full_image_mode(args, model, decoder, extract_features, ckpt, device):
 
         for pred in sorted(pred_instances, key=lambda x: x.get("score", 0), reverse=True):
             pm = pred["mask"]
-            pred_cat = pred.get("category_id", 1)
+            # 全图模式预测是 class-agnostic (聚合 prob map), 匹配时不检查类别
+            # Full-image preds are class-agnostic → no category check in matching
             # 获取 pred 的 bbox | Get prediction bbox
             pm_ys, pm_xs = np.where(pm)
             if len(pm_ys) == 0:
@@ -674,8 +675,7 @@ def run_full_image_mode(args, model, decoder, extract_features, ckpt, device):
                 if gt_matched[j]:
                     continue
                 gt_ann = gt_anns_raw[j]
-                if pred_cat != gt_ann["category_id"]:
-                    continue
+                # (no category check — predictions are class-agnostic)
                 # Bbox 预筛选: 不重叠 → IoU=0, 跳过昂贵的 mask 渲染
                 # Bbox pre-filter: no overlap → IoU=0, skip expensive mask render
                 gx, gy, gw, gh = [int(v) for v in gt_ann["bbox"]]
