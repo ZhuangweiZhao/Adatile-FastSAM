@@ -939,22 +939,29 @@ def train_episode(model, decoder, optimizer, class_id: int,
         # masks_s8: [N_kernels, H/8, W/8] sigmoid ∈ [0,1]
         # proto_mask: [H/4, W/4]
 
-        # Get output spatial dims for GT resizing
         _, H_s8, W_s8 = masks_s8.shape
         H_gt, W_gt = query_gt.shape
 
-        # Load per-instance GT masks (resized to stride-8 for matching)
-        gt_instance_masks = load_instance_masks_from_coco(
-            query_stem, split, data_root, class_id, target_size=(H_s8, W_s8),
+        # Load per-instance GT masks at FULL resolution (once, for both matching & loss)
+        gt_full_list = load_instance_masks_from_coco(
+            query_stem, split, data_root, class_id, target_size=None,
         )
 
-        if len(gt_instance_masks) == 0:
+        if len(gt_full_list) == 0:
             # 无 GT 实例: 所有预测拉向零 | No GT instances: pull all predictions to zero
-            loss = masks_s8.mean() * 0.1  # weak zero-pull
-            loss_dict = {"n_matched": 0, "n_gt": 0, "total": loss.item()}
+            loss = masks_s8.mean() * 0.1
+            loss_dict = {"dice": 0.0, "bce": 0.0,
+                         "n_matched": 0, "n_unmatched_pred": 0,
+                         "n_unmatched_gt": 0, "n_gt": 0}
         else:
-            gt_tensor = torch.from_numpy(np.stack(gt_instance_masks)).float().to(device)
-            # gt_tensor: [M, H/8, W/8]
+            gt_full = torch.from_numpy(np.stack(gt_full_list)).float().to(device)
+            # gt_full: [M, H_gt, W_gt]
+
+            # Resize GT to stride-8 for Hungarian matching (faster than full-res)
+            gt_s8 = F.interpolate(
+                gt_full.unsqueeze(1).float(), size=(H_s8, W_s8),
+                mode='nearest',
+            ).squeeze(1)  # [M, H_s8, W_s8]
 
             # Upsample predicted masks to GT resolution for loss
             masks_gt = F.interpolate(
@@ -962,41 +969,34 @@ def train_episode(model, decoder, optimizer, class_id: int,
                 mode='bilinear', align_corners=False,
             ).squeeze(0)  # [N, H_gt, W_gt]
 
-            # GT at original resolution for loss
-            gt_masks_full = [m for m in [
-                load_instance_masks_from_coco(query_stem, split, data_root, class_id,
-                                              target_size=None)
-            ] if m]
-            if gt_masks_full and gt_masks_full[0]:
-                gt_full_tensor = torch.from_numpy(
-                    np.stack(gt_masks_full[0])
-                ).float().to(device)  # [M, H_gt, W_gt]
-            else:
-                gt_full_tensor = gt_tensor  # fallback
-
-            # Hungarian matching at stride-8 (faster)
+            # Hungarian matching at stride-8 (faster than full-res)
             matched, unmatched_pred, unmatched_gt = hungarian_match_instances(
-                masks_s8, gt_tensor, min_dice=0.05,
+                masks_s8, gt_s8, min_dice=0.05,
             )
 
             # Multi-instance loss at original resolution
             loss, loss_dict = multi_instance_loss(
-                masks_gt, gt_full_tensor, matched, unmatched_pred, unmatched_gt,
+                masks_gt, gt_full, matched, unmatched_pred, unmatched_gt,
                 dice_weight=1.0, bce_weight=1.0, empty_weight=0.1,
             )
+            # Ensure epoch tracking has all required keys
+            loss_dict["dice"] = 0.0
+            loss_dict["bce"] = 0.0
+            loss_dict["n_gt"] = len(gt_full_list)
 
         # IoU: use proto_mask vs query_gt for a quick semantic-level metric
-        proto_up = F.interpolate(
-            proto_mask.unsqueeze(0).unsqueeze(0), size=(H_gt, W_gt),
-            mode='bilinear', align_corners=False,
-        ).squeeze()
-        pred_bin = (proto_up > 0.5).float()
-        gt_tensor_iou = torch.from_numpy(query_gt).float().to(device)
-        inter = (pred_bin * gt_tensor_iou).sum()
-        union = (pred_bin + gt_tensor_iou).clamp(0, 1).sum()
-        iou = (inter / max(union, 1)).item()
+        with torch.no_grad():
+            proto_up = F.interpolate(
+                proto_mask.unsqueeze(0).unsqueeze(0), size=(H_gt, W_gt),
+                mode='bilinear', align_corners=False,
+            ).squeeze()
+            pred_bin = (proto_up > 0.5).float()
+            gt_tensor_iou = torch.from_numpy(query_gt).float().to(device)
+            inter_iou = (pred_bin * gt_tensor_iou).sum()
+            union_iou = (pred_bin + gt_tensor_iou).clamp(0, 1).sum()
+            iou = (inter_iou / max(union_iou, 1)).item()
 
-        # ── 确保 loss 是标量 (multi_instance_loss 已归一化) ──
+        # Ensure loss is scalar
         if loss.dim() > 0:
             loss = loss.mean()
     elif decoder_type in ("pure", "pure-p3p4"):
@@ -1458,6 +1458,9 @@ def main():
         epoch_losses = {"loss": [], "iou": [], "dice": [], "bce": []}
         if spm is not None:
             epoch_losses["spm_mean"] = []
+        if decoder_type == "dynamic_kernel":
+            for _k in ("n_matched", "n_unmatched_pred", "n_unmatched_gt", "n_gt"):
+                epoch_losses[_k] = []
         if getattr(decoder, "collect_stats", False):  # 前向统计键 (须与 result 键一致) | forward-stat keys
             for _k in ("proto_basis_l2", "coeff_l2", "pre_sigmoid_absmax", "sat_frac", "coeff_grad_norm"):
                 epoch_losses[_k] = []
@@ -1523,8 +1526,15 @@ def main():
             spm_str = f", spm_mean={avg_spm_mean:.3f}"
         else:
             spm_str = ""
+        # Dynamic kernel: show matching stats
+        dk_str = ""
+        if decoder_type == "dynamic_kernel":
+            matched_vals = epoch_losses.get("n_matched", [])
+            gt_vals = epoch_losses.get("n_gt", [])
+            if matched_vals and gt_vals:
+                dk_str = f", match={np.mean(matched_vals):.1f}/{np.mean(gt_vals):.1f}"
         print(f"  Epoch {epoch + 1}: loss={avg_loss:.4f}, iou={avg_iou:.4f}, "
-              f"lr={scheduler.get_last_lr()[0]:.2e}{spm_str}{fwd_str}")
+              f"lr={scheduler.get_last_lr()[0]:.2e}{spm_str}{dk_str}{fwd_str}")
 
         scheduler.step()
 
