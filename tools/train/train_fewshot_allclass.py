@@ -1257,7 +1257,7 @@ def train_episode(model, decoder, optimizer, class_id: int,
 
     # IoU
     with torch.no_grad():
-        if decoder_type == "dynamic_kernel":
+        if decoder_type in ("dynamic_kernel", "center_affinity"):
             # IoU already computed in training branch (proto mask semantic)
             pass  # iou variable already set
         elif decoder_type in ("adaptive", "adaptive-p3p4", "pure", "pure-p3p4"):
