@@ -609,10 +609,13 @@ def run_full_image_mode(args, model, decoder, extract_features, ckpt, device):
     full_binary = full_prob > args.score_thr
 
     # ── Generate instances from stitched prob map ──
+    # 全图尺寸大, 用 connected_components 避免 watershed 卡死
+    # Full-image scale: use connected_components to avoid watershed hang on large maps
     from adatile.metrics.instance_generation import generate_instances
+    print(f"  Generating instances (method=connected_components, thr={args.score_thr})...")
     pred_instances = generate_instances(
-        full_prob, method="watershed_distance",
-        score_thr=args.score_thr, min_area=args.min_area, min_distance=args.min_distance,
+        full_prob, method="connected_components",
+        score_thr=args.score_thr, min_area=args.min_area,
     )
     print(f"  Generated {len(pred_instances)} instance predictions")
 
