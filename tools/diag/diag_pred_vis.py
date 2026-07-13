@@ -537,64 +537,64 @@ def run_full_image_mode(args, model, decoder, extract_features, ckpt, device):
         with torch.no_grad():
             feats = extract_features(model, [img_pad], device)[0]
 
-        if args.decoder == "center_affinity":
-            # Class-agnostic center + offset
-            first_pk = list(class_protos.values())[0]
-            proto_vec = torch.from_numpy(first_pk["proto"]).float().to(device)
-            center_hm, offset_field, _ = decoder(
-                feats["p3"].unsqueeze(0) if feats["p3"].dim() == 3 else feats["p3"],
-                feats["p4"].unsqueeze(0) if feats["p4"].dim() == 3 else feats["p4"],
-                feats["proto"].unsqueeze(0) if feats["proto"].dim() == 3 else feats["proto"],
-                proto_vec,
-            )
-            # Per-class proto mask → aggregate
-            best_prob = np.zeros((tile_size, tile_size), dtype=np.float32)
-            for cls_id, pk in class_protos.items():
-                proto_vec_c = torch.from_numpy(pk["proto"]).float().to(device)
-                proto_mask = decoder.forward_proto_only(
-                    feats["proto"].unsqueeze(0) if feats["proto"].dim() == 3 else feats["proto"],
-                    proto_vec_c,
-                )
-                pm = F.interpolate(
-                    proto_mask.unsqueeze(0).unsqueeze(0),
-                    size=(tile_size, tile_size), mode="bilinear", align_corners=False,
-                ).squeeze().cpu().numpy()
-                best_prob = np.maximum(best_prob, pm)
-            tile_prob = best_prob
-        elif args.decoder == "dynamic_kernel":
-            best_prob = np.zeros((tile_size, tile_size), dtype=np.float32)
-            for cls_id, pk in class_protos.items():
-                proto_vec = torch.from_numpy(pk["proto"]).float().to(device)
-                masks_s8, proto_mask = decoder(
+            if args.decoder == "center_affinity":
+                # Class-agnostic center + offset
+                first_pk = list(class_protos.values())[0]
+                proto_vec = torch.from_numpy(first_pk["proto"]).float().to(device)
+                center_hm, offset_field, _ = decoder(
                     feats["p3"].unsqueeze(0) if feats["p3"].dim() == 3 else feats["p3"],
                     feats["p4"].unsqueeze(0) if feats["p4"].dim() == 3 else feats["p4"],
                     feats["proto"].unsqueeze(0) if feats["proto"].dim() == 3 else feats["proto"],
                     proto_vec,
                 )
-                kernel_max = masks_s8.max(dim=0)[0]
-                pm = F.interpolate(
-                    kernel_max.unsqueeze(0).unsqueeze(0),
-                    size=(tile_size, tile_size), mode="bilinear", align_corners=False,
-                ).squeeze().cpu().numpy()
-                best_prob = np.maximum(best_prob, pm)
-            tile_prob = best_prob
-        else:
-            best_prob = np.zeros((tile_size, tile_size), dtype=np.float32)
-            for cls_id, pk in class_protos.items():
-                proto_vec = torch.from_numpy(pk["proto"]).float().to(device)
-                if args.decoder == "adaptive":
-                    out = decoder(feats["p4"], feats["proto"], proto_vec)
-                else:  # adaptive-p3p4
-                    out = decoder(feats["p3"], feats["p4"], feats["proto"], proto_vec)
-                if out.dim() == 2:
-                    out = out.unsqueeze(0).unsqueeze(0)
-                elif out.dim() == 3:
-                    out = out.unsqueeze(0)
-                pm = F.interpolate(
-                    out, size=(tile_size, tile_size), mode="bilinear", align_corners=False,
-                ).squeeze().cpu().numpy()
-                best_prob = np.maximum(best_prob, pm)
-            tile_prob = best_prob
+                # Per-class proto mask → aggregate
+                best_prob = np.zeros((tile_size, tile_size), dtype=np.float32)
+                for cls_id, pk in class_protos.items():
+                    proto_vec_c = torch.from_numpy(pk["proto"]).float().to(device)
+                    proto_mask = decoder.forward_proto_only(
+                        feats["proto"].unsqueeze(0) if feats["proto"].dim() == 3 else feats["proto"],
+                        proto_vec_c,
+                    )
+                    pm = F.interpolate(
+                        proto_mask.unsqueeze(0).unsqueeze(0),
+                        size=(tile_size, tile_size), mode="bilinear", align_corners=False,
+                    ).squeeze().cpu().numpy()
+                    best_prob = np.maximum(best_prob, pm)
+                tile_prob = best_prob
+            elif args.decoder == "dynamic_kernel":
+                best_prob = np.zeros((tile_size, tile_size), dtype=np.float32)
+                for cls_id, pk in class_protos.items():
+                    proto_vec = torch.from_numpy(pk["proto"]).float().to(device)
+                    masks_s8, proto_mask = decoder(
+                        feats["p3"].unsqueeze(0) if feats["p3"].dim() == 3 else feats["p3"],
+                        feats["p4"].unsqueeze(0) if feats["p4"].dim() == 3 else feats["p4"],
+                        feats["proto"].unsqueeze(0) if feats["proto"].dim() == 3 else feats["proto"],
+                        proto_vec,
+                    )
+                    kernel_max = masks_s8.max(dim=0)[0]
+                    pm = F.interpolate(
+                        kernel_max.unsqueeze(0).unsqueeze(0),
+                        size=(tile_size, tile_size), mode="bilinear", align_corners=False,
+                    ).squeeze().cpu().numpy()
+                    best_prob = np.maximum(best_prob, pm)
+                tile_prob = best_prob
+            else:
+                best_prob = np.zeros((tile_size, tile_size), dtype=np.float32)
+                for cls_id, pk in class_protos.items():
+                    proto_vec = torch.from_numpy(pk["proto"]).float().to(device)
+                    if args.decoder == "adaptive":
+                        out = decoder(feats["p4"], feats["proto"], proto_vec)
+                    else:  # adaptive-p3p4
+                        out = decoder(feats["p3"], feats["p4"], feats["proto"], proto_vec)
+                    if out.dim() == 2:
+                        out = out.unsqueeze(0).unsqueeze(0)
+                    elif out.dim() == 3:
+                        out = out.unsqueeze(0)
+                    pm = F.interpolate(
+                        out, size=(tile_size, tile_size), mode="bilinear", align_corners=False,
+                    ).squeeze().cpu().numpy()
+                    best_prob = np.maximum(best_prob, pm)
+                tile_prob = best_prob
 
         all_tile_results.append({
             "y0": y0, "x0": x0, "h": h, "w": w, "prob": tile_prob,
