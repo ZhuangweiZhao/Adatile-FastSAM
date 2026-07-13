@@ -41,6 +41,7 @@ InstanceMethod = Literal[
     "connected_components",
     "watershed_distance",
     "watershed_gradient",
+    "center_affinity",
 ]
 
 
@@ -289,3 +290,138 @@ def _label_connected_components(binary_mask: np.ndarray) -> tuple[np.ndarray, in
     num_labels, labels = cv2.connectedComponents(binary_mask.astype(np.uint8), connectivity=4)
     # labels[0] = 背景, labels[1..] = 前景种子 | labels[0]=bg, labels[1..]=seeds
     return labels.astype(np.int32), num_labels - 1
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 4. Center-Affinity Grouping (for CenterAffinityDecoder)
+# ═══════════════════════════════════════════════════════════════════
+
+def generate_instances_center_affinity(
+    center_heatmap: np.ndarray,
+    offset_field: np.ndarray,
+    fg_mask: np.ndarray,
+    score_thr: float = 0.2,
+    min_area: int = 16,
+    min_distance: int = 8,
+    max_instances: int = 100,
+) -> list[dict]:
+    """
+    从中心热力图 + 偏移场 + 前景掩码生成实例 | Generate instances from center heatmap + offset field + FG mask.
+
+    Algorithm | 算法:
+        1. 在 center_heatmap 中找到局部最大值 (实例中心候选) | Find local maxima in center heatmap.
+        2. 贪婪 NMS: 按 score 降序, 每个峰抑制 min_distance 范围内的其他峰 | Greedy NMS on peaks.
+        3. 对每个中心峰, 用偏移场进行像素到中心的指派 | Offset-based pixel-to-center assignment.
+           pixel (x,y) belongs to center (cx,cy) if ||offset[x,y] - (cx-x, cy-y)|| is minimal.
+
+    :param center_heatmap: [H, W] float32 ∈ [0, 1] center likelihood map.
+    :param offset_field:   [2, H, W] float32 displacement field (dx, dy).
+    :param fg_mask:        [H, W] bool foreground mask (from proto_mask > threshold).
+    :param score_thr:      Minimum center heatmap value for a valid peak.
+    :param min_area:       Minimum instance area (pixels).
+    :param min_distance:   Minimum distance between center peaks (in feature map pixels).
+    :param max_instances:  Maximum number of instances.
+    :return: list of {mask: bool[H,W], score: float}, sorted by score descending.
+    """
+    from scipy.ndimage import maximum_filter
+
+    H, W = center_heatmap.shape
+
+    # ═══════════════════════════════════════════════════════════════
+    # Step 1: Find center peaks
+    # ═══════════════════════════════════════════════════════════════
+    # Local maxima: pixel == max in (2*min_distance+1) neighborhood
+    local_max = (
+        center_heatmap == maximum_filter(center_heatmap, size=min_distance * 2 + 1)
+    )
+    # Filter: must be above threshold AND in FG region
+    candidate_mask = local_max & (center_heatmap > score_thr) & fg_mask
+
+    if not candidate_mask.any():
+        return []
+
+    py, px = np.where(candidate_mask)
+    scores = center_heatmap[py, px]
+
+    # Sort by score descending
+    order = np.argsort(-scores)
+    py = py[order]
+    px = px[order]
+    scores = scores[order]
+
+    # Greedy NMS: select highest-score peaks, suppress overlapping ones
+    selected = []
+    for i in range(len(py)):
+        too_close = False
+        for (cy, cx, _) in selected:
+            if max(abs(py[i] - cy), abs(px[i] - cx)) < min_distance:
+                too_close = True
+                break
+        if not too_close:
+            selected.append((py[i], px[i], scores[i]))
+            if len(selected) >= max_instances:
+                break
+
+    if not selected:
+        return []
+
+    n_selected = len(selected)
+    centers_yx = np.array([(cy, cx) for cy, cx, _ in selected], dtype=np.float32)  # [N, 2]
+
+    # ═══════════════════════════════════════════════════════════════
+    # Step 2: Offset-based pixel-to-center assignment
+    # ═══════════════════════════════════════════════════════════════
+    # For efficiency, only process FG pixels
+    fg_y, fg_x = np.where(fg_mask)
+    n_fg = len(fg_y)
+
+    if n_fg == 0:
+        return []
+
+    # Get offsets at FG pixel locations
+    offset_dx = offset_field[0, fg_y, fg_x]  # [n_fg]
+    offset_dy = offset_field[1, fg_y, fg_x]  # [n_fg]
+
+    # For each FG pixel, the "predicted center" is (x+dx, y+dy)
+    pred_cx = fg_x + offset_dx  # [n_fg]
+    pred_cy = fg_y + offset_dy  # [n_fg]
+
+    # Assignment: each FG pixel → nearest selected center (in "predicted center" space)
+    # Compute distance from each predicted center to each selected center
+    assignment = np.zeros(n_fg, dtype=np.int32)  # 0 = unassigned
+    best_cost = np.full(n_fg, np.inf, dtype=np.float32)
+
+    for idx, (cy, cx) in enumerate(centers_yx):
+        cost = (pred_cx - cx) ** 2 + (pred_cy - cy) ** 2  # [n_fg]
+        better = cost < best_cost
+        assignment[better] = idx + 1  # 1-indexed (0 = bg)
+        best_cost[better] = cost[better]
+
+    # ═══════════════════════════════════════════════════════════════
+    # Step 3: Build instance masks from assignments
+    # ═══════════════════════════════════════════════════════════════
+    instances = []
+    for idx, (cy, cx, peak_score) in enumerate(selected):
+        inst_mask_fg = (assignment == idx + 1)
+        n_pixels = inst_mask_fg.sum()
+
+        if n_pixels < min_area:
+            continue
+
+        # Build full-resolution mask
+        mask = np.zeros((H, W), dtype=bool)
+        mask[fg_y[inst_mask_fg], fg_x[inst_mask_fg]] = True
+
+        # Score: center confidence × offset consistency
+        # Lower assignment cost = more consistent offset = higher confidence
+        if n_pixels > 0:
+            offset_consistency = 1.0 / (1.0 + float(best_cost[inst_mask_fg].mean()))
+        else:
+            offset_consistency = 0.0
+        score = float(peak_score) * offset_consistency
+
+        instances.append({"mask": mask, "score": score})
+
+    # Sort by score descending
+    instances.sort(key=lambda x: x["score"], reverse=True)
+    return instances[:max_instances]

@@ -57,6 +57,7 @@ from adatile.decoder.adaptive_sparse_decoder import AdaptiveSparseDecoder
 from adatile.decoder.adaptive_decoder_p3p4 import AdaptiveDecoderP3P4
 from adatile.decoder.pure_cnn_decoder import PureDecoder, PureDecoderP3P4
 from adatile.decoder.dynamic_kernel_decoder import DynamicKernelDecoder
+from adatile.decoder.center_affinity_decoder import CenterAffinityDecoder
 from adatile.metrics.hungarian_matcher import (
     hungarian_match_instances, multi_instance_loss, mask_scores,
 )
@@ -928,6 +929,141 @@ def train_episode(model, decoder, optimizer, class_id: int,
         d_loss = 1.0 - dice
         loss = bce + d_loss
         loss_dict = {"dice": d_loss.item(), "bce": bce.item(), "total": loss.item()}
+    elif decoder_type == "center_affinity":
+        # ── CenterAffinityDecoder: Center Heatmap + Offset Field + Proto Mask ──
+        p3 = query_feats["p3"].to(device)            # [1, C, H/8, W/8]
+        p4 = query_feats["p4"].to(device)            # [1, C, H/16, W/16]
+        proto_masks = query_feats["proto"].to(device)  # [1, 32, H/4, W/4]
+
+        # Decoder forward: center heatmap + offset field + proto mask
+        center_hm, offset_field, proto_mask = decoder(p3, p4, proto_masks, support_proto)
+        # center_hm:    [H/8, W/8] ∈ [0, 1]
+        # offset_field: [2, H/8, W/8] (dx, dy)
+        # proto_mask:   [H/4, W/4] ∈ [0, 1]
+
+        _, H_c, W_c = center_hm.shape  # H/8, W/8
+        H_gt, W_gt = query_gt.shape
+
+        # ── Common GT | 共享 GT ──
+        gt_tensor = torch.from_numpy(query_gt).float().to(device)  # [H_gt, W_gt] merged
+
+        # ═══════════════════════════════════════════════════════════════
+        # Loss 1: Proto semantic FG (same as existing)
+        # ═══════════════════════════════════════════════════════════════
+        proto_up = F.interpolate(
+            proto_mask.unsqueeze(0).unsqueeze(0), size=(H_gt, W_gt),
+            mode="bilinear", align_corners=False,
+        ).squeeze(0).squeeze(0)
+        proto_bce = F.binary_cross_entropy(proto_up.clamp(1e-7, 1 - 1e-7), gt_tensor)
+        proto_inter = (proto_up * gt_tensor).sum()
+        proto_union = proto_up.sum() + gt_tensor.sum()
+        proto_dice_val = (2.0 * proto_inter + 1e-6) / (proto_union + 1e-6)
+        proto_loss = proto_bce + (1.0 - proto_dice_val)
+
+        # ═══════════════════════════════════════════════════════════════
+        # Loss 2: Center Heatmap — MSE vs Gaussian centers
+        # ═══════════════════════════════════════════════════════════════
+        center_gt = torch.zeros(H_c, W_c, device=device)
+        gt_full_list = load_instance_masks_from_coco(
+            query_stem, split, data_root, class_id, target_size=None,
+        )
+
+        for inst_mask in gt_full_list:
+            # Compute centroid of each instance mask at stride-8 resolution
+            inst = torch.from_numpy(inst_mask).float()
+            H_i, W_i = inst.shape
+            # Downsample mask to stride-8 for center computation
+            inst_s8 = F.interpolate(
+                inst.unsqueeze(0).unsqueeze(0), size=(H_c, W_c),
+                mode="nearest",
+            ).squeeze()
+            if inst_s8.sum() < 1:
+                continue
+            # Centroid (mass center of binary mask)
+            yy, xx = torch.meshgrid(
+                torch.arange(H_c, device=device, dtype=torch.float32),
+                torch.arange(W_c, device=device, dtype=torch.float32),
+                indexing="ij",
+            )
+            mass = inst_s8.sum()
+            cy = (yy * inst_s8).sum() / mass
+            cx = (xx * inst_s8).sum() / mass
+
+            # Gaussian kernel centered at (cx, cy), σ = 2.0 at stride-8
+            sigma = 2.0
+            gauss = torch.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * sigma ** 2))
+            center_gt = torch.maximum(center_gt, gauss)
+
+        center_gt = center_gt.clamp(0, 1)
+        center_loss = F.mse_loss(center_hm, center_gt)
+
+        # ═══════════════════════════════════════════════════════════════
+        # Loss 3: Offset Field — SmoothL1 on FG pixels
+        # ═══════════════════════════════════════════════════════════════
+        offset_gt = torch.zeros(2, H_c, W_c, device=device)  # [2, H/8, W/8]
+        fg_mask_s8 = torch.zeros(H_c, W_c, device=device)    # which pixels are FG
+
+        for inst_mask in gt_full_list:
+            inst = torch.from_numpy(inst_mask).float()
+            H_i, W_i = inst.shape
+            inst_s8 = F.interpolate(
+                inst.unsqueeze(0).unsqueeze(0), size=(H_c, W_c),
+                mode="nearest",
+            ).squeeze()
+            inst_bin = (inst_s8 > 0.5).float()
+            fg_mask_s8 = fg_mask_s8 + inst_bin
+            if inst_bin.sum() < 1:
+                continue
+
+            # Centroid
+            yy, xx = torch.meshgrid(
+                torch.arange(H_c, device=device, dtype=torch.float32),
+                torch.arange(W_c, device=device, dtype=torch.float32),
+                indexing="ij",
+            )
+            mass = inst_bin.sum()
+            cy = (yy * inst_bin).sum() / mass
+            cx = (xx * inst_bin).sum() / mass
+
+            # Offset: (center_x - x, center_y - y) for FG pixels
+            # Normalize by sigma_offset
+            sigma_off = 8.0
+            off_dx = (cx - xx) / sigma_off
+            off_dy = (cy - yy) / sigma_off
+
+            # Only set for pixels in this instance
+            inst_pixels = (inst_bin > 0.5)
+            offset_gt[0, inst_pixels] = off_dx[inst_pixels]
+            offset_gt[1, inst_pixels] = off_dy[inst_pixels]
+
+        fg_mask_s8 = (fg_mask_s8 > 0.5).float()  # binary
+        n_fg = fg_mask_s8.sum().clamp(min=1)
+
+        # SmoothL1 on FG pixels only
+        offset_diff = F.smooth_l1_loss(
+            offset_field * fg_mask_s8.unsqueeze(0),
+            offset_gt * fg_mask_s8.unsqueeze(0),
+            reduction="none",
+        )
+        offset_loss = offset_diff.sum() / n_fg
+
+        # ── Total loss ──
+        loss = proto_loss + 1.0 * center_loss + 0.5 * offset_loss
+
+        loss_dict = {
+            "dice": proto_dice_val.item(), "bce": proto_bce.item(),
+            "center_loss": center_loss.item(), "offset_loss": offset_loss.item(),
+        }
+
+        # IoU: proto mask semantic
+        with torch.no_grad():
+            pred_bin = (proto_up > 0.5).float()
+            inter_iou = (pred_bin * gt_tensor).sum()
+            union_iou = (pred_bin + gt_tensor).clamp(0, 1).sum()
+            iou = (inter_iou / max(union_iou, 1)).item()
+
+        if loss.dim() > 0:
+            loss = loss.mean()
     elif decoder_type == "dynamic_kernel":
         # ── DynamicKernelDecoder: Prototype → N Kernels → N Instance Masks ──
         p3 = query_feats["p3"].to(device)            # [1, C, H/8, W/8]
@@ -1161,13 +1297,14 @@ def main():
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--decoder", type=str, default="baseline",
                         choices=["baseline", "adaptive", "adaptive-p3p4", "pure", "pure-p3p4",
-                                 "dynamic_kernel"],
+                                 "dynamic_kernel", "center_affinity"],
                         help="Decoder 类型 | Decoder type: baseline (FewShotDecoder + template), "
                              "adaptive (AdaptiveSparseDecoder P4-only), "
                              "adaptive-p3p4 (P3+P4+P8), "
                              "pure (PureDecoder P4-only, no prototype), "
                              "pure-p3p4 (PureDecoderP3P4, no prototype), "
-                             "dynamic_kernel (DynamicKernelDecoder: Prototype→Kernels→N masks)")
+                             "dynamic_kernel (DynamicKernelDecoder: Prototype→Kernels→N masks), "
+                             "center_affinity (CenterAffinityDecoder: Center+Offset→Instances)")
     parser.add_argument("--use-spm", action="store_true",
                         help="启用 SPM tile routing (P8 → Importance → Top-K)")
     parser.add_argument("--unfreeze-layers", type=int, default=0,
@@ -1329,6 +1466,15 @@ def main():
         decoder.collect_stats = args.log_forward_stats
         decoder_type = "dynamic_kernel"
         print(f"    n_kernels={args.n_kernels}")
+    elif args.decoder == "center_affinity":
+        _p3_channels = _test_feats[0]["p3"].shape[1]
+        print(f"  Detected P3 channels: {_p3_channels}")
+        decoder = CenterAffinityDecoder(
+            p3_channels=_p3_channels, p4_channels=_p4_channels,
+            proto_dim=32, fpn_dim=64,
+            normalize_proto=args.normalize_proto,
+        )
+        decoder_type = "center_affinity"
     else:
         decoder = FewShotDecoder(feat_dim=_p4_channels, proto_dim=32, hidden_dim=256, use_template=True)
         decoder_type = "baseline"
@@ -1502,6 +1648,9 @@ def main():
             for _k in ("n_matched", "n_unmatched_pred", "n_unmatched_gt", "n_gt",
                        "kernel_dice", "kernel_cos_sim"):
                 epoch_losses[_k] = []
+        if decoder_type == "center_affinity":
+            for _k in ("center_loss", "offset_loss"):
+                epoch_losses[_k] = []
         if getattr(decoder, "collect_stats", False):  # 前向统计键 (须与 result 键一致) | forward-stat keys
             for _k in ("proto_basis_l2", "coeff_l2", "pre_sigmoid_absmax", "sat_frac", "coeff_grad_norm"):
                 epoch_losses[_k] = []
@@ -1583,6 +1732,16 @@ def main():
                 parts.append(f"cossim={np.mean(cos_vals):.3f}")
             if parts:
                 dk_str = ", " + ", ".join(parts)
+        if decoder_type == "center_affinity":
+            c_losses = [v for v in epoch_losses.get("center_loss", []) if v is not None]
+            o_losses = [v for v in epoch_losses.get("offset_loss", []) if v is not None]
+            parts = []
+            if c_losses:
+                parts.append(f"closs={np.mean(c_losses):.3f}")
+            if o_losses:
+                parts.append(f"oloss={np.mean(o_losses):.3f}")
+            if parts:
+                dk_str = ", " + ", ".join(parts)
         print(f"  Epoch {epoch + 1}: loss={avg_loss:.4f}, iou={avg_iou:.4f}, "
               f"lr={scheduler.get_last_lr()[0]:.2e}{spm_str}{dk_str}{fwd_str}")
 
@@ -1625,8 +1784,9 @@ def main():
                     support_proto = compute_support_prototype(support_feats,
                                                               source=args.prototype_source)
 
-                    if decoder_type in ("adaptive", "adaptive-p3p4", "pure", "pure-p3p4", "dynamic_kernel"):
-                        # Adaptive / P3P4: no template needed
+                    if decoder_type in ("adaptive", "adaptive-p3p4", "pure", "pure-p3p4",
+                                         "dynamic_kernel", "center_affinity"):
+                        # No template needed
                         support_tmpl = None
                     else:
                         support_tmpl = compute_support_mask_template(support_bmasks_v).to(device)
@@ -1682,6 +1842,18 @@ def main():
                             elif decoder_type == "dynamic_kernel":
                                 # Use proto_mask output (semantic) for validation IoU
                                 _, proto_mask = decoder(
+                                    q_feats["p3"], q_feats["p4"],
+                                    q_feats["proto"], support_proto,
+                                )
+                                mask_s4 = _normalize_mask_to_4d(proto_mask)
+                                mask_tile = F.interpolate(
+                                    mask_s4, size=(td["h"], td["w"]),
+                                    mode="bilinear", align_corners=False
+                                ).squeeze()
+                                pred_bin_np = (mask_tile > 0.5).float().cpu().numpy()
+                            elif decoder_type == "center_affinity":
+                                # Use proto_mask output (semantic) for validation IoU
+                                _, _, proto_mask = decoder(
                                     q_feats["p3"], q_feats["p4"],
                                     q_feats["proto"], support_proto,
                                 )
@@ -1785,6 +1957,23 @@ def main():
                         elif decoder_type == "dynamic_kernel":
                             # Use proto_mask for semantic validation IoU
                             _, proto_mask = decoder(
+                                q_feats["p3"], q_feats["p4"],
+                                q_feats["proto"], support_proto,
+                            )
+                            mask_s4 = _normalize_mask_to_4d(proto_mask)
+                            H_gt, W_gt = q_gt.shape
+                            mask_tile = F.interpolate(
+                                mask_s4, size=(H_gt, W_gt),
+                                mode="bilinear", align_corners=False
+                            ).squeeze()
+                            gt_t = torch.from_numpy(q_gt).float().to(device)
+                            pred_bin = (mask_tile > 0.5).float()
+                            inter = float((pred_bin * gt_t).sum().item())
+                            union = float((pred_bin + gt_t).clamp(0, 1).sum().item())
+                            iou_val = inter / max(union, 1)
+                        elif decoder_type == "center_affinity":
+                            # Use proto_mask for semantic validation IoU
+                            _, _, proto_mask = decoder(
                                 q_feats["p3"], q_feats["p4"],
                                 q_feats["proto"], support_proto,
                             )

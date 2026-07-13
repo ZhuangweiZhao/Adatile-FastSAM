@@ -71,7 +71,7 @@ from adatile.metrics.coco_eval import (
     mask_to_bbox,
 )
 from adatile.metrics.instance_match import greedy_match, instance_miou
-from adatile.metrics.instance_generation import generate_instances, InstanceMethod
+from adatile.metrics.instance_generation import generate_instances, InstanceMethod, generate_instances_center_affinity
 
 # ── 复用训练脚本中的数据/特征/原型工具 | Reuse data/feature/prototype helpers ──
 from tools.train.train_fewshot_allclass import (
@@ -92,9 +92,10 @@ from adatile.decoder.adaptive_sparse_decoder import AdaptiveSparseDecoder
 from adatile.decoder.adaptive_decoder_p3p4 import AdaptiveDecoderP3P4
 from adatile.decoder.pure_cnn_decoder import PureDecoder, PureDecoderP3P4
 from adatile.decoder.dynamic_kernel_decoder import DynamicKernelDecoder
+from adatile.decoder.center_affinity_decoder import CenterAffinityDecoder
 
 # 类别是否具备条件化能力 (需要 prototype) | Whether a decoder is class-conditioned
-_CLASS_CONDITIONED = {"adaptive", "adaptive-p3p4", "baseline", "dynamic_kernel"}
+_CLASS_CONDITIONED = {"adaptive", "adaptive-p3p4", "baseline", "dynamic_kernel", "center_affinity"}
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -221,6 +222,15 @@ def build_model_and_decoder(args, device: str, logger):
             normalize_proto=normalize_proto,
         ).to(device)
         logger.log_info("decoder", f"  n_kernels={n_kernels} normalize_proto={normalize_proto}")
+    elif args.decoder == "center_affinity":
+        p3_channels = test_feats[0]["p3"].shape[1]
+        normalize_proto = ckpt.get("normalize_proto", "none")
+        decoder = CenterAffinityDecoder(
+            p3_channels=p3_channels, p4_channels=p4_channels,
+            proto_dim=32, fpn_dim=64,
+            normalize_proto=normalize_proto,
+        ).to(device)
+        logger.log_info("decoder", f"  normalize_proto={normalize_proto} fpn_dim=64")
     else:  # baseline — FewShotDecoder 定义在训练脚本中 | defined in the training script
         from tools.train.train_fewshot_allclass import FewShotDecoder
         decoder = FewShotDecoder(feat_dim=p4_channels).to(device)
@@ -467,7 +477,7 @@ def parse_args():
     p.add_argument("--output-dir", type=str, default=None)
     p.add_argument("--decoder", type=str, default="adaptive",
                    choices=["baseline", "adaptive", "adaptive-p3p4", "pure", "pure-p3p4",
-                            "dynamic_kernel"])
+                            "dynamic_kernel", "center_affinity"])
     p.add_argument("--n-kernels", type=int, default=16,
                    help="DynamicKernelDecoder: 每类动态核数 (需与训练一致) | "
                         "Kernels per class (must match training checkpoint)")
@@ -626,6 +636,56 @@ def main():
                         "score": score,
                         "category_id": cls_id,
                     })
+        elif args.decoder == "center_affinity":
+            # CenterAffinityDecoder: Center Heatmap + Offset Field → Voronoi Grouping
+            # Generate center+offset ONCE (class-agnostic), proto PER CLASS
+            with torch.no_grad():
+                # First forward (any prototype) to get class-agnostic center+offset
+                # Use first class prototype for the initial forward
+                first_pk = list(class_protos.values())[0]
+                center_hm, offset_field, _ = decoder(
+                    feats["p3"], feats["p4"], feats["proto"],
+                    torch.from_numpy(first_pk["proto"]).float().to(device),
+                )
+                # center_hm:    [H/8, W/8] ∈ [0,1]
+                # offset_field: [2, H/8, W/8]
+
+            # Upsample center+offset to tile resolution
+            center_full = F.interpolate(
+                center_hm.unsqueeze(0).unsqueeze(0),
+                size=(H, W), mode="bilinear", align_corners=False,
+            ).squeeze().float().cpu().numpy()
+            offset_full = F.interpolate(
+                offset_field.unsqueeze(0),
+                size=(H, W), mode="bilinear", align_corners=False,
+            ).squeeze().float().cpu().numpy()
+
+            for cls_id, pk in class_protos.items():
+                # Class-conditioned proto_mask
+                with torch.no_grad():
+                    proto_mask = decoder.forward_proto_only(
+                        feats["proto"],
+                        torch.from_numpy(pk["proto"]).float().to(device),
+                    )
+                # proto_mask: [H/4, W/4] → upsample to tile resolution
+                proto_full = F.interpolate(
+                    proto_mask.unsqueeze(0).unsqueeze(0),
+                    size=(H, W), mode="bilinear", align_corners=False,
+                ).squeeze().float().cpu().numpy()
+
+                fg_mask = proto_full > args.score_thr
+
+                # Center-affinity grouping
+                insts = generate_instances_center_affinity(
+                    center_full, offset_full, fg_mask,
+                    score_thr=0.2,  # center peak threshold (lower than FG threshold)
+                    min_area=args.min_area,
+                    min_distance=8,  # at tile resolution (~64px at stride-8)
+                    max_instances=100,
+                )
+                for it in insts:
+                    it["category_id"] = cls_id
+                pred_by_class[cls_id].extend(insts)
         elif is_conditioned:
             for cls_id, pk in class_protos.items():
                 prob = decoder_prob_map(decoder, feats, pk["proto"], pk["support_tmpl"],
