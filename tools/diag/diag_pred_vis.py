@@ -1437,6 +1437,9 @@ def _process_one_image_metrics(args, model, decoder, extract_features, device,
     # Per-class
     n_per_class = defaultdict(int)
     n_matched_per_class = defaultdict(int)
+    # Per-class + area-bucket stats
+    n_per_class = defaultdict(int)
+    n_matched_per_class = defaultdict(int)
     for j, gt_ann in enumerate(gt_anns_raw):
         n_per_class[gt_ann["category_id"]] += 1
         if gt_matched[j]:
@@ -1445,6 +1448,7 @@ def _process_one_image_metrics(args, model, decoder, extract_features, device,
     precision = tp / max(tp + fp_count, 1)
     recall = tp / max(tp + fn_count, 1)
     f1 = 2 * precision * recall / max(precision + recall, 1e-9)
+    area_buckets = _compute_area_bucket_stats(gt_anns_raw, gt_matched)
 
     return {
         "image": stem, "H": H_full, "W": W_full,
@@ -1457,8 +1461,48 @@ def _process_one_image_metrics(args, model, decoder, extract_features, device,
         "per_class": {ISAID_CLASSES.get(k, f"c{k}"):
                       {"matched": n_matched_per_class.get(k, 0), "gt": v}
                       for k, v in n_per_class.items()},
+        "area_buckets": area_buckets,
     }
 
+
+# ═══════════════════════════════════════════════════════════════════
+# Area-Bucket Recall | 按实例面积分桶 Recall
+# ═══════════════════════════════════════════════════════════════════
+
+AREA_BUCKETS = [
+    (0, 32, "<32"),
+    (32, 64, "32–64"),
+    (64, 128, "64–128"),
+    (128, 256, "128–256"),
+    (256, 512, "256–512"),
+    (512, float("inf"), ">512"),
+]
+
+
+def _compute_area_bucket_stats(gt_anns_raw: list[dict], gt_matched: list[bool]) -> dict:
+    """按实例面积分桶统计 matched/total | Bucket matched/total by instance area."""
+    buckets = {label: {"matched": 0, "total": 0} for _, _, label in AREA_BUCKETS}
+    for j, gt_ann in enumerate(gt_anns_raw):
+        area = gt_ann.get("area", 0)
+        for lo, hi, label in AREA_BUCKETS:
+            if lo <= area < hi:
+                buckets[label]["total"] += 1
+                if gt_matched[j]:
+                    buckets[label]["matched"] += 1
+                break
+    return buckets
+
+
+def _merge_area_bucket_stats(acc: dict, new_stats: dict) -> None:
+    """合并面积分桶统计 | Merge area-bucket stats."""
+    for label in acc:
+        acc[label]["matched"] += new_stats[label]["matched"]
+        acc[label]["total"] += new_stats[label]["total"]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Group Processing | 多图合并批量处理
+# ═══════════════════════════════════════════════════════════════════
 
 def _process_image_group(args, model, decoder, device, img_paths: list[str],
                          class_protos: dict) -> list[dict | None]:
@@ -1655,13 +1699,14 @@ def _process_image_group(args, model, decoder, device, img_paths: list[str],
         recall = tp / max(tp + fn_count, 1)
         f1 = 2 * precision * recall / max(precision + recall, 1e-9)
 
-        # Per-class
+        # Per-class + area-bucket stats
         n_per_class = defaultdict(int)
         n_matched_per_class = defaultdict(int)
         for j, gt_ann in enumerate(gt_anns_raw):
             n_per_class[gt_ann["category_id"]] += 1
             if gt_matched[j]:
                 n_matched_per_class[gt_ann["category_id"]] += 1
+        area_buckets = _compute_area_bucket_stats(gt_anns_raw, gt_matched)
 
         results.append({
             "image": img_data["stem"], "H": img_data["H"], "W": img_data["W"],
@@ -1674,6 +1719,7 @@ def _process_image_group(args, model, decoder, device, img_paths: list[str],
             "per_class": {ISAID_CLASSES.get(k, f"c{k}"):
                           {"matched": n_matched_per_class.get(k, 0), "gt": v}
                           for k, v in n_per_class.items()},
+            "area_buckets": area_buckets,
         })
 
     return results
@@ -1781,18 +1827,45 @@ def run_batch_mode(args, model, decoder, extract_features, device):
         r = pc["matched"] / max(pc["gt"], 1)
         print(f"    {cls_name:<22s} R={r:.3f}  ({pc['matched']}/{pc['gt']})")
 
-    # Save CSV
+    # ── Area-Bucket Recall (按实例面积分桶) ──
+    agg_buckets = {label: {"matched": 0, "total": 0} for _, _, label in AREA_BUCKETS}
+    for m in all_metrics:
+        if "area_buckets" in m:
+            _merge_area_bucket_stats(agg_buckets, m["area_buckets"])
+    print(f"\n  Area-Bucket Recall (按实例面积分桶 Recall):")
+    print(f"    {'Bucket':>12s}  {'Recall':>8s}  {'Matched':>8s}  {'Total':>8s}  {'Histogram'}")
+    print(f"    {'-'*12}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*20}")
+    max_total = max(b["total"] for b in agg_buckets.values()) or 1
+    for _, _, label in AREA_BUCKETS:
+        b = agg_buckets[label]
+        r = b["matched"] / max(b["total"], 1)
+        bar_len = int(b["total"] / max_total * 20)
+        bar = "█" * bar_len + "░" * (20 - bar_len)
+        print(f"    {label:>12s}  {r:>8.4f}  {b['matched']:>8d}  {b['total']:>8d}  {bar}")
+
+    # Save CSV (with area-bucket columns)
     csv_path = os.path.join(args.output, "batch_metrics.csv")
+    bucket_labels = [label for _, _, label in AREA_BUCKETS]
     with open(csv_path, "w", newline="") as f:
         writer = _csv_module.writer(f)
         writer.writerow(["image", "H", "W", "n_gt", "n_pred", "n_classes_gt",
                         "tp", "fp", "fn", "precision", "recall", "f1",
-                        "prob_max", "prob_mean", "fg_frac"])
+                        "prob_max", "prob_mean", "fg_frac"]
+                       + [f"R_{b}" for b in bucket_labels]
+                       + [f"gt_{b}" for b in bucket_labels])
         for m in all_metrics:
-            writer.writerow([m["image"], m["H"], m["W"], m["n_gt"], m["n_pred"],
-                           m["n_classes_gt"], m["tp"], m["fp"], m["fn"],
-                           m["precision"], m["recall"], m["f1"],
-                           m["prob_max"], m["prob_mean"], m["fg_frac"]])
+            row = [m["image"], m["H"], m["W"], m["n_gt"], m["n_pred"],
+                   m["n_classes_gt"], m["tp"], m["fp"], m["fn"],
+                   m["precision"], m["recall"], m["f1"],
+                   m["prob_max"], m["prob_mean"], m["fg_frac"]]
+            ab = m.get("area_buckets", {})
+            for b in bucket_labels:
+                bd = ab.get(b, {"matched": 0, "total": 1})
+                row.append(round(bd["matched"] / max(bd["total"], 1), 4))
+            for b in bucket_labels:
+                bd = ab.get(b, {"matched": 0, "total": 0})
+                row.append(bd["total"])
+            writer.writerow(row)
     print(f"\n  [SAVED] Metrics CSV → {csv_path}")
 
 
