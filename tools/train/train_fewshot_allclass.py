@@ -414,6 +414,49 @@ def load_instance_masks_from_coco(stem: str, split: str, data_root: Path,
     return instances
 
 
+def _compute_area_weight_map(
+    gt_instance_masks: list[np.ndarray],
+    target_h: int, target_w: int,
+    min_weight: float = 1.0,
+    max_weight: float = 10.0,
+    area_threshold: float = 128.0,
+) -> np.ndarray:
+    """计算逐像素面积感知权重 | Compute per-pixel scale-aware weight map.
+
+    对每个 GT 实例, 权重 = clamp(area_threshold / max(area, 1), min_weight, max_weight).
+    小目标 (area < area_threshold) 获得 >1x 权重, 大目标获得 1x.
+    背景像素权重 = 1.0.
+
+    Small objects (area < area_threshold) get >1x weight, large objects get 1x.
+    Background pixels get weight = 1.0.
+
+    :param gt_instance_masks: [mask_0, mask_1, ...] 每元素 [H, W] uint8 binary.
+    :param target_h: 目标高度 | Target height for weight map.
+    :param target_w: 目标宽度 | Target width for weight map.
+    :param min_weight: 最小权重 (大目标) | Minimum weight (large objects).
+    :param max_weight: 最大权重 (极小目标) | Maximum weight (very small objects).
+    :param area_threshold: 面积阈值 (px²), 低于此值开始加权 | Area threshold (px²), below which weighting starts.
+    :return: [target_h, target_w] float32 weight map.
+    """
+    weight_map = np.ones((target_h, target_w), dtype=np.float32)
+    for inst_mask in gt_instance_masks:
+        area = float(inst_mask.sum())
+        if area < 1:
+            continue
+        # w = clamp(threshold / area, min, max)
+        w = np.clip(area_threshold / area, min_weight, max_weight)
+        # Resize instance mask to target resolution if needed
+        if inst_mask.shape[0] != target_h or inst_mask.shape[1] != target_w:
+            inst_resized = cv2.resize(
+                inst_mask.astype(np.uint8), (target_w, target_h),
+                interpolation=cv2.INTER_NEAREST,
+            ).astype(bool)
+        else:
+            inst_resized = inst_mask.astype(bool)
+        weight_map[inst_resized] = w
+    return weight_map
+
+
 # ═══════════════════════════════════════════════════════════════════
 # 全图 Query 支持 | Full-Image Query Support
 # ═══════════════════════════════════════════════════════════════════
@@ -834,7 +877,8 @@ def train_episode(model, decoder, optimizer, class_id: int,
                   split: str, device: str, data_format: str = "isaid5i",
                   data_root: Path = None, decoder_type: str = "baseline",
                   spm=None, backbone_trainable: bool = False,
-                  proto_source: str = "p4") -> dict:
+                  proto_source: str = "p4",
+                  scale_aware: bool = False) -> dict:
     """单次 episodic 训练步 | Single episodic training step."""
     is_tile = data_format in ("isaid_tiles", "isaid_instance")
     is_instance = (data_format == "isaid_instance")
@@ -895,14 +939,30 @@ def train_episode(model, decoder, optimizer, class_id: int,
             mask_s4, size=(H_gt, W_gt), mode="bilinear", align_corners=False
         ).squeeze(0).squeeze(0)  # [H_gt, W_gt]
 
-        # Loss: BCE on sigmoid mask (use clamp for stability)
         gt_tensor = torch.from_numpy(query_gt).float().to(device)
-        bce = F.binary_cross_entropy(mask_pred.clamp(1e-7, 1 - 1e-7), gt_tensor)
-        # Dice on sigmoid mask
-        inter = (mask_pred * gt_tensor).sum()
-        union = mask_pred.sum() + gt_tensor.sum()
+
+        # ── Scale-aware weighting | 面积感知权重 ──
+        if scale_aware:
+            gt_instance_masks = load_instance_masks_from_coco(
+                query_stem, split, data_root, class_id, target_size=None,
+            )
+            weight_np = _compute_area_weight_map(gt_instance_masks, H_gt, W_gt)
+            weight_tensor = torch.from_numpy(weight_np).float().to(device)
+        else:
+            weight_tensor = torch.ones(H_gt, W_gt, device=device)
+
+        # Weighted BCE on sigmoid mask
+        bce_per_pixel = F.binary_cross_entropy(
+            mask_pred.clamp(1e-7, 1 - 1e-7), gt_tensor, reduction="none",
+        )
+        bce = (bce_per_pixel * weight_tensor).sum() / weight_tensor.sum().clamp(min=1)
+
+        # Weighted Dice on sigmoid mask
+        inter = (mask_pred * gt_tensor * weight_tensor).sum()
+        union = (mask_pred * weight_tensor).sum() + (gt_tensor * weight_tensor).sum()
         dice = (2.0 * inter + 1e-6) / (union + 1e-6)
         d_loss = 1.0 - dice
+
         loss = bce + d_loss
         loss_dict = {"dice": d_loss.item(), "bce": bce.item(), "total": loss.item()}
     elif decoder_type == "adaptive-p3p4":
@@ -919,14 +979,30 @@ def train_episode(model, decoder, optimizer, class_id: int,
             mask_s4, size=(H_gt, W_gt), mode="bilinear", align_corners=False
         ).squeeze(0).squeeze(0)  # [H_gt, W_gt]
 
-        # Loss: BCE on sigmoid mask
         gt_tensor = torch.from_numpy(query_gt).float().to(device)
-        bce = F.binary_cross_entropy(mask_pred.clamp(1e-7, 1 - 1e-7), gt_tensor)
-        # Dice on sigmoid mask
-        inter = (mask_pred * gt_tensor).sum()
-        union = mask_pred.sum() + gt_tensor.sum()
+
+        # ── Scale-aware weighting | 面积感知权重 ──
+        if scale_aware:
+            gt_instance_masks = load_instance_masks_from_coco(
+                query_stem, split, data_root, class_id, target_size=None,
+            )
+            weight_np = _compute_area_weight_map(gt_instance_masks, H_gt, W_gt)
+            weight_tensor = torch.from_numpy(weight_np).float().to(device)
+        else:
+            weight_tensor = torch.ones(H_gt, W_gt, device=device)
+
+        # Weighted BCE on sigmoid mask
+        bce_per_pixel = F.binary_cross_entropy(
+            mask_pred.clamp(1e-7, 1 - 1e-7), gt_tensor, reduction="none",
+        )
+        bce = (bce_per_pixel * weight_tensor).sum() / weight_tensor.sum().clamp(min=1)
+
+        # Weighted Dice on sigmoid mask
+        inter = (mask_pred * gt_tensor * weight_tensor).sum()
+        union = (mask_pred * weight_tensor).sum() + (gt_tensor * weight_tensor).sum()
         dice = (2.0 * inter + 1e-6) / (union + 1e-6)
         d_loss = 1.0 - dice
+
         loss = bce + d_loss
         loss_dict = {"dice": d_loss.item(), "bce": bce.item(), "total": loss.item()}
     elif decoder_type == "center_affinity":
@@ -948,15 +1024,29 @@ def train_episode(model, decoder, optimizer, class_id: int,
         gt_tensor = torch.from_numpy(query_gt).float().to(device)  # [H_gt, W_gt] merged
 
         # ═══════════════════════════════════════════════════════════════
-        # Loss 1: Proto semantic FG (same as existing)
+        # Loss 1: Proto semantic FG (with optional scale-aware weighting)
         # ═══════════════════════════════════════════════════════════════
         proto_up = F.interpolate(
             proto_mask.unsqueeze(0).unsqueeze(0), size=(H_gt, W_gt),
             mode="bilinear", align_corners=False,
         ).squeeze(0).squeeze(0)
-        proto_bce = F.binary_cross_entropy(proto_up.clamp(1e-7, 1 - 1e-7), gt_tensor)
-        proto_inter = (proto_up * gt_tensor).sum()
-        proto_union = proto_up.sum() + gt_tensor.sum()
+
+        # ── Scale-aware weighting for proto loss | 面积感知权重 ──
+        gt_full_list = load_instance_masks_from_coco(
+            query_stem, split, data_root, class_id, target_size=None,
+        )
+        if scale_aware:
+            proto_weight_np = _compute_area_weight_map(gt_full_list, H_gt, W_gt)
+            proto_wt = torch.from_numpy(proto_weight_np).float().to(device)
+        else:
+            proto_wt = torch.ones(H_gt, W_gt, device=device)
+
+        proto_bce_per_pixel = F.binary_cross_entropy(
+            proto_up.clamp(1e-7, 1 - 1e-7), gt_tensor, reduction="none",
+        )
+        proto_bce = (proto_bce_per_pixel * proto_wt).sum() / proto_wt.sum().clamp(min=1)
+        proto_inter = (proto_up * gt_tensor * proto_wt).sum()
+        proto_union = (proto_up * proto_wt).sum() + (gt_tensor * proto_wt).sum()
         proto_dice_val = (2.0 * proto_inter + 1e-6) / (proto_union + 1e-6)
         proto_loss = proto_bce + (1.0 - proto_dice_val)
 
@@ -964,9 +1054,6 @@ def train_episode(model, decoder, optimizer, class_id: int,
         # Loss 2: Center Heatmap — MSE vs Gaussian centers
         # ═══════════════════════════════════════════════════════════════
         center_gt = torch.zeros(H_c, W_c, device=device)
-        gt_full_list = load_instance_masks_from_coco(
-            query_stem, split, data_root, class_id, target_size=None,
-        )
 
         for inst_mask in gt_full_list:
             # Compute centroid of each instance mask at stride-8 resolution
@@ -1320,6 +1407,10 @@ def main():
                         choices=["none", "l2", "layernorm", "scale"],
                         help="proto basis 归一化 (修复饱和; 仅 adaptive) | proto-basis normalization "
                              "(fixes saturation; adaptive decoder only): none/l2/layernorm/scale")
+    parser.add_argument("--scale-aware-loss", action="store_true",
+                        help="启用面积感知损失: 小目标 (area<128px2) 获得 up to 10x 权重 | "
+                             "Enable scale-aware loss: small objects get up to 10x weight. "
+                             "w(area)=clamp(128/max(area,1), 1, 10)")
     parser.add_argument("--n-kernels", type=int, default=16,
                         help="DynamicKernelDecoder 每类核数 (max instances per class) | "
                              "Number of kernels per class (only for dynamic_kernel decoder)")
@@ -1692,7 +1783,8 @@ def main():
                                        train_split, device, data_format, data_root,
                                        decoder_type=decoder_type, spm=spm,
                                        backbone_trainable=backbone_trainable,
-                                       proto_source=args.prototype_source)
+                                       proto_source=args.prototype_source,
+                                       scale_aware=args.scale_aware_loss)
                 for k in epoch_losses:
                     epoch_losses[k].append(result[k])
                 pbar.set_postfix(loss=f"{result['loss']:.4f}", iou=f"{result['iou']:.4f}")
