@@ -287,6 +287,34 @@ def aggregate_by_bucket(results: list[dict]) -> dict:
     return dict(buckets)
 
 
+def _tile_full_image(image: np.ndarray, tile_size: int = 896,
+                      overlap: int = 32) -> list[dict]:
+    """将全图切分为 tile | Split full image into tiles.
+
+    :return: list of {y0, x0, h, w, img: [H,W,3] uint8}
+    """
+    import cv2
+    H, W = image.shape[:2]
+    stride = tile_size - overlap
+    tiles = []
+
+    for y0 in list(range(0, H - tile_size + 1, stride)) if H >= tile_size else [0]:
+        for x0 in list(range(0, W - tile_size + 1, stride)) if W >= tile_size else [0]:
+            _y0 = max(0, min(y0, H - tile_size)) if H - y0 < tile_size else y0
+            _x0 = max(0, min(x0, W - tile_size)) if W - x0 < tile_size else x0
+
+            tile_img = image[_y0:_y0 + tile_size, _x0:_x0 + tile_size]
+            th, tw = tile_img.shape[:2]
+            if th < tile_size or tw < tile_size:
+                tile_img = cv2.copyMakeBorder(
+                    tile_img, 0, tile_size - th, 0, tile_size - tw,
+                    cv2.BORDER_CONSTANT, value=(0, 0, 0),
+                )
+            tiles.append({"y0": _y0, "x0": _x0, "h": th, "w": tw, "img": tile_img})
+
+    return tiles
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Main | 主流程
 # ═══════════════════════════════════════════════════════════════════
@@ -418,8 +446,7 @@ def main():
             continue
 
         # ── Tile-based feature extraction ──
-        from adatile.datasets.isaid_tiles import tile_full_image
-        tiles_info = tile_full_image(img, tile_size=896, overlap=32)
+        tiles_info = _tile_full_image(img, tile_size=896, overlap=32)
 
         # Stack tiles for batched backbone forward
         all_tensors = []
@@ -458,7 +485,7 @@ def main():
             best_tile_idx = None
             best_overlap = 0
             for ti_idx, ti in enumerate(tiles_info):
-                tx, ty = ti["x"], ti["y"]
+                tx, ty = ti["x0"], ti["y0"]
                 tw, th = ti["w"], ti["h"]
                 # Check bbox-tile overlap
                 ox = max(0, min(bx + bw, tx + tw) - max(bx, tx))
@@ -472,7 +499,7 @@ def main():
                 continue
 
             ti = tiles_info[best_tile_idx]
-            tx, ty = ti["x"], ti["y"]
+            tx, ty = ti["x0"], ti["y0"]
 
             # Compute instance energy relative to tile features
             # Adjust ann coordinates to tile-local
