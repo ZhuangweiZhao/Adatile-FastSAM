@@ -327,7 +327,6 @@ def main():
     set_seed(42)
 
     from ultralytics import FastSAM
-    from adatile.backbone.fastsam_backbone import FastSAMBackbone
 
     # 使用与训练脚本一致的本地权重路径 | Use same local weight path as training script
     model_path = _project_root / "thirdLibrary" / "FastSAM" / "weights" / "FastSAM-x.pt"
@@ -337,7 +336,7 @@ def main():
 
     print(f"  Loading FastSAM backbone (from {model_path})...")
     model = FastSAM(str(model_path))
-    backbone = FastSAMBackbone(model)
+    model = model.cuda() if args.device == "cuda" else model
 
     # Load checkpoint just for reference (features are frozen backbone, independent of decoder)
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
