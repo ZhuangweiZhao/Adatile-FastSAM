@@ -1444,6 +1444,8 @@ def main():
             tag += f"_proto{args.prototype_source}"
         if args.normalize_proto != "none":
             tag += f"_norm{args.normalize_proto}"
+        if args.scale_aware_loss:
+            tag += "_scaleAw"
         args.output_dir = f"runs/train_fewshot_allcls_K{args.k_shot}_{tag}_{ts}"
     out_dir = Path(args.output_dir).resolve()  # 绝对路径 (ultralytics torch_save wrapper 需要)
     out_dir.mkdir(parents=True, exist_ok=True)
