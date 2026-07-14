@@ -311,6 +311,9 @@ def main():
                         help="Output directory")
     parser.add_argument("--max-tiles-per-batch", type=int, default=64,
                         help="Max tiles per backbone forward pass")
+    parser.add_argument("--full-gt", type=str, default=None,
+                        help="Full-image COCO JSON path (e.g., .../val/annotations/instances_val.json). "
+                             "If not provided, uses {data_root}/annotations/instances_{split}.json")
     args = parser.parse_args()
 
     data_root = Path(args.data_root)
@@ -348,7 +351,21 @@ def main():
     # 2. Load COCO annotations | 加载 COCO 标注
     # ═══════════════════════════════════════════════════════════════
     print("  Loading COCO annotations...")
-    coco = _load_coco(data_root, args.split)
+    if args.full_gt:
+        gt_path = Path(args.full_gt)
+        if not gt_path.exists():
+            raise FileNotFoundError(f"GT file not found: {gt_path}")
+        with open(gt_path) as f:
+            coco = json.load(f)
+        # Infer split from path: .../val/annotations/instances_val.json → val
+        _gt_split = gt_path.parent.parent.name if gt_path.parent.name == "annotations" else args.split
+    else:
+        ann_file = data_root / "annotations" / f"instances_{args.split}.json"
+        if not ann_file.exists():
+            raise FileNotFoundError(f"Annotation file not found: {ann_file}")
+        with open(ann_file) as f:
+            coco = json.load(f)
+        _gt_split = args.split
     img_id_to_file = {img["id"]: img["file_name"] for img in coco["images"]}
     img_id_to_size = {img["id"]: (img["height"], img["width"]) for img in coco["images"]}
     file_to_anns = defaultdict(list)
@@ -357,12 +374,17 @@ def main():
         if fname:
             file_to_anns[fname].append(ann)
 
-    # Find all images
-    img_dir = data_root / args.split / "images"
+    # Find all images (try multiple path conventions)
+    img_dir = data_root / _gt_split / "images"
     if not img_dir.exists():
-        img_dir = data_root / "images" / args.split
+        img_dir = data_root / "images" / _gt_split
     if not img_dir.exists():
-        raise FileNotFoundError(f"Image directory not found: {img_dir}")
+        img_dir = data_root / "images"
+    if not img_dir.exists():
+        raise FileNotFoundError(f"Image directory not found (tried: "
+                                f"{data_root / _gt_split / 'images'}, "
+                                f"{data_root / 'images' / _gt_split}, "
+                                f"{data_root / 'images'})")
 
     all_images = sorted([f for f in os.listdir(str(img_dir))
                          if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
