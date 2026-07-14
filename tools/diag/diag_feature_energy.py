@@ -231,11 +231,26 @@ def compute_instance_feature_energy(
     if mask_p3 is None or mask_p3.sum() < 1:
         return None
 
-    # P3 energy: mean L2 norm over mask region
+    # P3 energy: per-channel normalized L2 norm over mask region
+    # 除以 sqrt(C) 消除 channel 数量偏差 | Divide by sqrt(C) to remove channel count bias
+    C3 = feats_p3.shape[0]
     feats_p3_masked = feats_p3[:, mask_p3]  # [C3, n_pixels]
-    p3_l2 = feats_p3_masked.norm(dim=0)     # [n_pixels]
-    p3_energy = float(p3_l2.mean().item())
+    p3_l2_normed = feats_p3_masked.norm(dim=0) / (C3 ** 0.5)  # [n_pixels] per-channel normalized
+    p3_energy = float(p3_l2_normed.mean().item())
     p3_n = int(mask_p3.sum())
+
+    # Spatial contrast: std(L2) / mean(L2) within mask — higher = more structured
+    p3_contrast = float(p3_l2_normed.std().item() / max(p3_l2_normed.mean().item(), 1e-8))
+
+    # FG/BG ratio: compute mean L2 in a background ring around the mask
+    from scipy.ndimage import binary_dilation
+    mask_p3_dilated = binary_dilation(mask_p3, iterations=3)
+    bg_ring_p3 = mask_p3_dilated & ~mask_p3
+    if bg_ring_p3.sum() > 0:
+        p3_bg_l2 = feats_p3[:, bg_ring_p3].norm(dim=0) / (C3 ** 0.5)
+        p3_fg_bg_ratio = float(p3_l2_normed.mean().item() / max(p3_bg_l2.mean().item(), 1e-8))
+    else:
+        p3_fg_bg_ratio = 1.0
 
     # ── P4 mask (stride-16) ──
     H4, W4 = feats_p4.shape[1], feats_p4.shape[2]
@@ -245,11 +260,26 @@ def compute_instance_feature_energy(
         # P4 分辨率不足以渲染此实例的 mask | P4 resolution insufficient
         p4_energy = 0.0
         p4_n = 0
+        p4_contrast = 0.0
+        p4_fg_bg_ratio = 1.0
     else:
+        C4 = feats_p4.shape[0]
         feats_p4_masked = feats_p4[:, mask_p4]
-        p4_l2 = feats_p4_masked.norm(dim=0)
-        p4_energy = float(p4_l2.mean().item())
+        p4_l2_normed = feats_p4_masked.norm(dim=0) / (C4 ** 0.5)  # per-channel normalized
+        p4_energy = float(p4_l2_normed.mean().item())
         p4_n = int(mask_p4.sum())
+
+        # Spatial contrast
+        p4_contrast = float(p4_l2_normed.std().item() / max(p4_l2_normed.mean().item(), 1e-8))
+
+        # FG/BG ratio
+        mask_p4_dilated = binary_dilation(mask_p4, iterations=3)
+        bg_ring_p4 = mask_p4_dilated & ~mask_p4
+        if bg_ring_p4.sum() > 0:
+            p4_bg_l2 = feats_p4[:, bg_ring_p4].norm(dim=0) / (C4 ** 0.5)
+            p4_fg_bg_ratio = float(p4_l2_normed.mean().item() / max(p4_bg_l2.mean().item(), 1e-8))
+        else:
+            p4_fg_bg_ratio = 1.0
 
     return {
         "area": area,
@@ -257,6 +287,10 @@ def compute_instance_feature_energy(
         "p4_energy": p4_energy,
         "p3_n_pixels": p3_n,
         "p4_n_pixels": p4_n,
+        "p3_contrast": p3_contrast,
+        "p4_contrast": p4_contrast,
+        "p3_fg_bg_ratio": p3_fg_bg_ratio,
+        "p4_fg_bg_ratio": p4_fg_bg_ratio,
         "category_id": cat_id,
     }
 
@@ -271,7 +305,9 @@ def aggregate_by_bucket(results: list[dict]) -> dict:
 
     :return: {bucket_label: {p3_energies: [...], p4_energies: [...], counts: [...]}}
     """
-    buckets = defaultdict(lambda: {"p3": [], "p4": [], "p3_n": [], "p4_n": [], "count": 0})
+    buckets = defaultdict(lambda: {"p3": [], "p4": [], "p3_n": [], "p4_n": [],
+                                     "p3_contrast": [], "p4_contrast": [],
+                                     "p3_fg_bg": [], "p4_fg_bg": [], "count": 0})
 
     for r in results:
         area = r["area"]
@@ -281,6 +317,10 @@ def aggregate_by_bucket(results: list[dict]) -> dict:
                 buckets[label]["p4"].append(r["p4_energy"])
                 buckets[label]["p3_n"].append(r["p3_n_pixels"])
                 buckets[label]["p4_n"].append(r["p4_n_pixels"])
+                buckets[label]["p3_contrast"].append(r.get("p3_contrast", 0))
+                buckets[label]["p4_contrast"].append(r.get("p4_contrast", 0))
+                buckets[label]["p3_fg_bg"].append(r.get("p3_fg_bg_ratio", 1))
+                buckets[label]["p4_fg_bg"].append(r.get("p4_fg_bg_ratio", 1))
                 buckets[label]["count"] += 1
                 break
 
@@ -565,32 +605,35 @@ def main():
     buckets = aggregate_by_bucket(all_results)
 
     print("=" * 65)
-    print("  FEATURE ENERGY BY AREA BUCKET")
+    print("  FEATURE ENERGY BY AREA BUCKET (per-channel normalized)")
     print("=" * 65)
-    print(f"  {'Bucket':<12} {'Count':>6} {'P3 Energy':>10} {'P4 Energy':>10} "
-          f"{'P3/P4':>8} {'P3 px':>7} {'P4 px':>7} {'P4 Lost%':>8}")
-    print(f"  {'-'*70}")
+    print(f"  {'Bucket':<12} {'Count':>6} {'P3 E':>9} {'P4 E':>9} {'P3/P4':>7} "
+          f"{'P3 Ctr':>7} {'P4 Ctr':>7} {'P3 FG/BG':>8} {'P4 FG/BG':>8}")
+    print(f"  {'-'*75}")
 
     for lo, hi, label in AREA_BUCKETS:
-        b = buckets.get(label, {"p3": [], "p4": [], "p3_n": [], "p4_n": [], "count": 0})
-        if b["count"] == 0:
-            print(f"  {label:<12} {'0':>6} {'N/A':>10} {'N/A':>10} {'N/A':>8}")
+        b = buckets.get(label)
+        if not b or b["count"] == 0:
+            print(f"  {label:<12} {'0':>6} {'N/A':>9} {'N/A':>9} {'N/A':>7}")
             continue
         p3_e = np.mean(b["p3"])
         p4_e = np.mean(b["p4"])
-        p3_n = np.mean(b["p3_n"])
-        p4_n = np.mean(b["p4_n"])
         ratio = p3_e / max(p4_e, 1e-8)
-        p4_lost = max(0, (1 - p4_n / max(p3_n, 1))) * 100
-        print(f"  {label:<12} {b['count']:>6} {p3_e:>10.4f} {p4_e:>10.4f} "
-              f"{ratio:>8.2f} {p3_n:>7.1f} {p4_n:>7.1f} {p4_lost:>7.1f}%")
+        p3_ctr = np.mean(b["p3_contrast"]) if b["p3_contrast"] else 0
+        p4_ctr = np.mean(b["p4_contrast"]) if b["p4_contrast"] else 0
+        p3_fb = np.mean(b["p3_fg_bg"]) if b["p3_fg_bg"] else 1
+        p4_fb = np.mean(b["p4_fg_bg"]) if b["p4_fg_bg"] else 1
+        print(f"  {label:<12} {b['count']:>6} {p3_e:>9.4f} {p4_e:>9.4f} {ratio:>7.3f} "
+              f"{p3_ctr:>7.4f} {p4_ctr:>7.4f} {p3_fb:>8.4f} {p4_fb:>8.4f}")
 
     print()
     print("  Key metrics | 关键指标:")
+    b_32 = buckets.get("<32", {})
     print(f"    P3/P4 energy ratio at <32 px²: "
-          f"{np.mean(buckets.get('<32', {}).get('p3', [0])) / max(np.mean(buckets.get('<32', {}).get('p4', [0])), 1e-8):.2f}")
-    print(f"    P4 feature pixel loss at <32 px²: "
-          f"{max(0, (1 - np.mean(buckets.get('<32', {}).get('p4_n', [1])) / max(np.mean(buckets.get('<32', {}).get('p3_n', [1])), 1)) * 100):.1f}%")
+          f"{np.mean(b_32.get('p3', [0])) / max(np.mean(b_32.get('p4', [0.001])), 1e-8):.3f}")
+    print(f"    P3 FG/BG at <32 px²: {np.mean(b_32.get('p3_fg_bg', [1,1])):.4f}  "
+          f"(>1 means FG brighter than BG)")
+    print(f"    P4 FG/BG at >512 px²: {np.mean(buckets.get('>512', {}).get('p4_fg_bg', [1,1])):.4f}")
 
     # ═══════════════════════════════════════════════════════════════
     # 5. Per-class analysis | 按类别分析
