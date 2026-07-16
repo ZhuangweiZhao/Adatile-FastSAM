@@ -84,6 +84,10 @@ class AdaptiveSparseDecoder(nn.Module):
         系数预测器隐藏层维度 | Coefficient predictor hidden dimension.
     use_fdr : bool
         是否启用 FDR 引导的注意力 | Whether to enable FDR-guided attention.
+    out_channels : int
+        输出通道数: 1=二值分割(sigmoid), C=多类别(softmax) | Output channels: 1=binary, C=multi-class.
+        Note: 多类别模式下 proto mask 融合被跳过 (proto 输出为标量，无法按类分离).
+        Note: in multi-class mode, proto mask fusion is skipped (proto output is scalar).
     """
 
     def __init__(
@@ -93,12 +97,14 @@ class AdaptiveSparseDecoder(nn.Module):
         hidden_dim: int = 256,
         use_fdr: bool = True,
         normalize_proto: str = "none",
+        out_channels: int = 1,
     ):
         super().__init__()
 
         self.in_channels = in_channels
         self.proto_dim = proto_dim
         self.use_fdr = use_fdr
+        self.out_channels = out_channels
         # ── proto basis 归一化 (修复未约束 basis 幅值导致的 sigmoid 饱和) | proto-basis normalization ──
         #    none=identity(默认,零影响); l2=逐 basis 单位 L2; layernorm=逐 basis 标准化; scale=固定缩放
         self.normalize_proto = normalize_proto
@@ -152,13 +158,13 @@ class AdaptiveSparseDecoder(nn.Module):
         # ═══════════════════════════════════════════════════════════
         # 4. 掩码头 | Mask Head
         # ═══════════════════════════════════════════════════════════
-        # 将精炼特征映射为逐像素 FG logit
-        # Map refined features to per-pixel FG logit
+        # 将精炼特征映射为逐像素 logits (out_channels=1 → FG, C → per-class)
+        # Map refined features to per-pixel logits (out_channels=1 → FG, C → per-class)
         self.mask_head = nn.Sequential(
             nn.Conv2d(64, 32, kernel_size=3, padding=1, bias=False),
             nn.InstanceNorm2d(32, affine=True),
             nn.ReLU(inplace=True),
-            nn.Conv2d(32, 1, kernel_size=1),
+            nn.Conv2d(32, out_channels, kernel_size=1),
         )
 
         # ── proto basis 归一化模块 (仅 layernorm 模式需可学习参数) | learnable norm (layernorm only) ──
@@ -228,7 +234,8 @@ class AdaptiveSparseDecoder(nn.Module):
         :param support_proto: [in_channels] 或 [1, in_channels] L2-normalized support prototype.
         :param fdr_map: [1, 1, H/32, W/32] 或 None. FDR 密度图 (可选).
             FDR density map (optional). When None, FDR gating is skipped.
-        :return: [H, W] 实例掩码 in [0, 1] | Instance mask in [0, 1].
+        :return: out_channels=1 → [H/4,W/4] sigmoid mask.
+                 out_channels=C → [C, H/4, W/4] softmax probs.
         """
         # ── 输入标准化 | Input normalization ──
         if proto_masks.dim() == 4:
@@ -285,25 +292,24 @@ class AdaptiveSparseDecoder(nn.Module):
         # ═══════════════════════════════════════════════════════════
         # Step 4: 生成精细掩码 | Generate Refined Mask
         # ═══════════════════════════════════════════════════════════
-        refined_logit = self.mask_head(feat_refined)  # [B, 1, H/16, W/16]
+        refined_logit = self.mask_head(feat_refined)  # [B, out_channels, H/16, W/16]
 
         # 上采样到 proto mask 分辨率 (stride 4)
         # Upsample to proto mask resolution (stride 4)
         refined_logit_up = F.interpolate(
             refined_logit, size=proto_mask.shape[1:],
-            mode='bilinear', align_corners=False,
-        )  # [B, 1, H/4, W/4]
+            mode="bilinear", align_corners=False,
+        )  # [B, out_channels, H/4, W/4]
 
-        # ═══════════════════════════════════════════════════════════
-        # Step 5: 融合 Proto Mask + Refined Features
-        # Fuse Proto Mask + Refined Features
-        # ═══════════════════════════════════════════════════════════
-        # Proto mask 提供全局形状先验（来自预训练基函数）
-        # Refined logit 提供局部细节（来自 P4 特征）
-        # Proto mask provides global shape prior (from pretrained basis)
-        # Refined logit provides local details (from P4 features)
-        final_logit = refined_logit_up.squeeze(1) + proto_mask.squeeze(0)  # [H/4, W/4]
-        final_mask = torch.sigmoid(final_logit)  # [H/4, W/4]
+        # ============================================================
+        # Step 5: Proto Mask + Refined Features Fusion
+        # ============================================================
+        # Binary: proto mask + refined -> sigmoid. Multi-class: refined only -> softmax
+        if self.out_channels == 1:
+            final_logit = refined_logit_up.squeeze(1) + proto_mask.squeeze(0)  # [H/4, W/4]
+            final_mask = torch.sigmoid(final_logit)  # [H/4, W/4]
+        else:
+            final_mask = torch.softmax(refined_logit_up.squeeze(0), dim=0)  # [C, H/4, W/4]
 
         return final_mask
 
@@ -400,3 +406,48 @@ class ProtoOnlyDecoder(nn.Module):
 
     def __repr__(self) -> str:
         return repr(self.predictor).replace("ProtoCoeffPredictor", "ProtoOnlyDecoder")
+
+
+class ProtoOnlyDecoderP3P4(nn.Module):
+    """
+    P3+P4 双源 ProtoOnly 解码器 | P3+P4 Dual-Source ProtoOnly Decoder.
+
+    从 P3 和 P4 分别池化 FG prototype，拼接后预测 32 维 mask 系数。
+    Pool FG prototypes from P3 and P4 separately, concatenate, predict 32 coeffs.
+
+    参数量: ~550K | Parameter count: ~550K.
+    """
+
+    def __init__(
+        self,
+        proto_dim: int = 32,
+        p3_dim: int = 960,
+        p4_dim: int = 1280,
+        hidden_dim: int = 256,
+    ):
+        super().__init__()
+        self.predictor = ProtoCoeffPredictor(
+            proto_dim=proto_dim,
+            feat_dim=p3_dim + p4_dim,  # 2240
+            hidden_dim=hidden_dim,
+        )
+
+    def forward(
+        self,
+        proto_masks: torch.Tensor,
+        support_proto_p3: torch.Tensor,  # [960]
+        support_proto_p4: torch.Tensor,  # [1280]
+    ) -> torch.Tensor:
+        """
+        :param proto_masks: [proto_dim, H, W] proto basis masks.
+        :param support_proto_p3: [p3_dim] P3 support prototype.
+        :param support_proto_p4: [p4_dim] P4 support prototype.
+        :return: [H, W] instance mask in [0, 1].
+        """
+        support_proto = torch.cat([support_proto_p3, support_proto_p4], dim=0)  # [2240]
+        return self.predictor.predict_mask(
+            support_proto.unsqueeze(0), proto_masks
+        ).squeeze(0)
+
+    def __repr__(self) -> str:
+        return repr(self.predictor).replace("ProtoCoeffPredictor", "ProtoOnlyDecoderP3P4")

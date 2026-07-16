@@ -1,0 +1,3 @@
+split,images,masks,paired,height_mean,height_min,height_max,width_mean,width_min,width_max
+train,3630,3630,True,200.0,200,200,200.0,200,200
+test,840,840,True,200.0,200,200,200.0,200,200

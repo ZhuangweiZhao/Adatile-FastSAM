@@ -15,11 +15,13 @@ AdaTile is instance-seg-first. All datasets prioritize instance segmentation mod
 from adatile.datasets.base import BaseSegDataset
 from adatile.datasets.isaid import ISAIDDataset, ISAID_CATEGORIES
 from adatile.datasets.mass_buildings import MassachusettsBuildingsDataset
+from adatile.datasets.neu_seg import NEUSegDataset
 
 __all__ = [
     "BaseSegDataset",
     "ISAIDDataset",
     "MassachusettsBuildingsDataset",
+    "NEUSegDataset",
     "ISAID_CATEGORIES",
 ]
 

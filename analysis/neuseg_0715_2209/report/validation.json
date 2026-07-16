@@ -1,0 +1,15 @@
+{
+  "timestamp": "2026-07-15T22:09:41.678362",
+  "dataset": "NEU_Seg",
+  "mode": "multi-class",
+  "checks": {
+    "pixel_sum_consistency": true,
+    "fg_ratio_consistency": true,
+    "area_consistency": true,
+    "circularity_range": true,
+    "convexity_range": true,
+    "empty_mask_consistency": true
+  },
+  "all_passed": true,
+  "n_issues": 0
+}

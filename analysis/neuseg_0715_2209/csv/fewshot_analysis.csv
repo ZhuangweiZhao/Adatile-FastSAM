@@ -1,0 +1,4 @@
+k,n_support_available,possible_episodes,support_coverage_pct
+K=1,3630,3630,100.0
+K=5,3630,726,100.0
+K=10,3630,363,100.0

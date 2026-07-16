@@ -67,6 +67,7 @@ class FastSAMBackbone(nn.Module):
     """
 
     # ── 候选步长范围 | Candidate stride ranges ──
+    TARGET_STRIDE_4  = (3, 5)     # stride 4 的容许范围 | tolerance for stride 4
     TARGET_STRIDE_8  = (7, 9)     # stride 8 的容许范围 | tolerance for stride 8
     TARGET_STRIDE_16 = (14, 18)   # stride 16 的容许范围 | tolerance for stride 16
     TARGET_STRIDE_32 = (28, 36)   # stride 32 的容许范围 | tolerance for stride 32
@@ -86,6 +87,7 @@ class FastSAMBackbone(nn.Module):
         self._features: dict[str, torch.Tensor] = {}
 
         # 钩子层索引（首次 forward 时自动探测）| Hooked layer indices (auto-detected on first forward)
+        self._hook_p2_idx: int | None = None
         self._hook_p3_idx: int | None = None
         self._hook_p4_idx: int | None = None
         self._hook_p8_idx: int | None = None
@@ -216,6 +218,7 @@ class FastSAMBackbone(nn.Module):
             self._forward_features(x)
 
         # 分析各层输出的步长 | Analyze strides of each layer's output
+        candidates_4  = []  # stride-4 candidates
         candidates_8  = []  # stride-8 candidates
         candidates_16 = []  # stride-16 candidates
         candidates_32 = []  # stride-32 candidates
@@ -226,6 +229,8 @@ class FastSAMBackbone(nn.Module):
             stride_w = w_in / w_out
             avg_stride = (stride_h + stride_w) / 2
 
+            if self.TARGET_STRIDE_4[0] <= avg_stride <= self.TARGET_STRIDE_4[1]:
+                candidates_4.append((int(key), avg_stride, feat.shape[1]))
             if self.TARGET_STRIDE_8[0] <= avg_stride <= self.TARGET_STRIDE_8[1]:
                 candidates_8.append((int(key), avg_stride, feat.shape[1]))
             if self.TARGET_STRIDE_16[0] <= avg_stride <= self.TARGET_STRIDE_16[1]:
@@ -233,10 +238,23 @@ class FastSAMBackbone(nn.Module):
             if self.TARGET_STRIDE_32[0] <= avg_stride <= self.TARGET_STRIDE_32[1]:
                 candidates_32.append((int(key), avg_stride, feat.shape[1]))
 
+        # P2 (stride≈4) — 按通道数降序选择最佳匹配 | pick best by channel count
+        if candidates_4:
+            candidates_4.sort(key=lambda t: -t[2])
+            self._hook_p2_idx = candidates_4[0][0]
+            self._p2_channels = candidates_4[0][2]
+            self.logger.log_info(
+                "backbone/probe",
+                f"P2 hook: layer {self._hook_p2_idx}, "
+                f"stride={candidates_4[0][1]:.1f}, "
+                f"channels={candidates_4[0][2]}",
+            )
+
         # P3 (stride≈8) — 按通道数降序选择最佳匹配 | pick best by channel count
         if candidates_8:
             candidates_8.sort(key=lambda t: -t[2])
             self._hook_p3_idx = candidates_8[0][0]
+            self._p3_channels = candidates_8[0][2]
             self.logger.log_info(
                 "backbone/probe",
                 f"P3 hook: layer {self._hook_p3_idx}, "
@@ -249,6 +267,7 @@ class FastSAMBackbone(nn.Module):
         if candidates_16:
             candidates_16.sort(key=lambda t: -t[2])  # 按通道数降序 | sort by channels desc
             self._hook_p4_idx = candidates_16[0][0]
+            self._p4_channels = candidates_16[0][2]
             self.logger.log_info(
                 "backbone/probe",
                 f"P4 hook: layer {self._hook_p4_idx}, "
@@ -266,6 +285,7 @@ class FastSAMBackbone(nn.Module):
         if candidates_32:
             candidates_32.sort(key=lambda t: -t[2])  # 按通道数降序 | sort by channels desc
             self._hook_p8_idx = candidates_32[0][0]
+            self._p8_channels = candidates_32[0][2]
             self.logger.log_info(
                 "backbone/probe",
                 f"P8 hook: layer {self._hook_p8_idx}, "
@@ -289,6 +309,13 @@ class FastSAMBackbone(nn.Module):
         仅在探测完成后调用。| Only called after probing is complete.
         """
         sequential = self.model.model.model
+
+        # P2 钩子 | P2 hook (stride≈4)
+        if self._hook_p2_idx is not None:
+            handle = sequential[self._hook_p2_idx].register_forward_hook(
+                self._make_feature_hook("p2")
+            )
+            self._hook_handles.append(handle)
 
         # P3 钩子 | P3 hook (stride≈8)
         if self._hook_p3_idx is not None:
@@ -486,6 +513,21 @@ class FastSAMBackbone(nn.Module):
         """安全冻结：设置 requires_grad=False | Safe freeze: requires_grad=False."""
         self._apply_freeze()
 
+    @property
+    def channels(self) -> dict[str, int]:
+        """
+        探测到的各层通道数 | Detected channel counts for each feature level.
+
+        首次 forward 后可用 | Available after first forward.
+        返回 | Returns: {"p2": int, "p3": int, "p4": int, "p8": int}
+        """
+        return {
+            "p2": getattr(self, "_p2_channels", 0),
+            "p3": getattr(self, "_p3_channels", 0),
+            "p4": getattr(self, "_p4_channels", 0),
+            "p8": getattr(self, "_p8_channels", 0),
+        }
+
     def __del__(self) -> None:
         """清理钩子 | Clean up hooks."""
         self._remove_all_hooks()
@@ -573,9 +615,32 @@ class FastSAMBackbone(nn.Module):
             x = m(x)
             y.append(x if m.i in getattr(detection_model, 'save', []) else None)
 
+    @staticmethod
+    def _pad_to_32(x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, int, int, int]]:
+        """
+        将输入填充到 32 的倍数（FastSAM 要求）| Pad input to multiple of 32 (FastSAM requirement).
+
+        YOLOv8/FastSAM 的 neck 在 Concat 时要求所有特征图尺寸一致，
+        非 32 倍数的输入会导致 stride 取整不一致 → 尺寸不匹配 → crash。
+        YOLOv8/FastSAM's neck requires consistent feature map sizes at Concat;
+        non-32-multiple input causes stride rounding mismatch → size mismatch → crash.
+
+        :param x: 输入张量 [B, C, H, W] | Input tensor.
+        :return: (padded_tensor, (pad_h, pad_w, orig_h, orig_w))
+        """
+        B, C, H, W = x.shape
+        pad_h = (32 - H % 32) % 32
+        pad_w = (32 - W % 32) % 32
+        if pad_h > 0 or pad_w > 0:
+            x = nn.functional.pad(x, (0, pad_w, 0, pad_h))
+        return x, (pad_h, pad_w, H, W)
+
     def forward(self, x: torch.Tensor, extract_proto: bool = False) -> dict[str, torch.Tensor]:
         """
         前向传播，返回多尺度特征图 | Forward pass, returns multi-scale feature maps.
+
+        自动将输入填充到 32 的倍数（FastSAM 的 Concat 层要求）。
+        Auto-pads input to multiple of 32 (required by FastSAM's Concat layers).
 
         :param x: 输入图像张量 [B, 3, H, W] | Input image tensor.
         :param extract_proto: 是否提取 FastSAM proto masks [B, 32, H/4, W/4]。
@@ -583,9 +648,12 @@ class FastSAMBackbone(nn.Module):
             mask = sigmoid(coefficients @ proto_masks)。
             Whether to extract FastSAM proto masks. These are pretrained basis functions
             that generate instance masks via linear combination.
-        :return: dict with keys "p3", "p4", "p8", and optionally "proto".
+        :return: dict with keys "p2", "p3", "p4", "p8", and optionally "proto".
         """
-        if self._hook_p4_idx is None or self._hook_p8_idx is None or self._hook_p3_idx is None:
+        # ── 自动填充到 32 的倍数 | Auto-pad to 32× multiple ──
+        x, self._pad_info = self._pad_to_32(x)
+
+        if self._hook_p4_idx is None or self._hook_p8_idx is None or self._hook_p3_idx is None or self._hook_p2_idx is None:
             self._probe_strides(x)
             self._register_final_hooks()
 
@@ -598,6 +666,8 @@ class FastSAMBackbone(nn.Module):
             self._forward_features(x)
 
         result: dict[str, torch.Tensor] = {}
+        if "p2" in self._features:
+            result["p2"] = self._features["p2"]
         if "p3" in self._features:
             f = self._features["p3"]
             if getattr(self, '_has_lora', False):
@@ -708,8 +778,8 @@ def build_backbone(name: str = "FastSAM-x", **kwargs) -> FastSAMBackbone:
     根据名称构建骨干网络 | Build backbone by name.
 
     当前支持的骨干 | Currently supported backbones:
-        - "FastSAM-x": FastSAM 基于 YOLOv8-x | FastSAM on YOLOv8-x
-        - "FastSAM-s": FastSAM 基于 YOLOv8-s (TODO) | FastSAM on YOLOv8-s (TODO)
+        - "FastSAM-x": YOLOv8x-based, 68M params, P2(160)/P3(960)/P4(1280)/P8(1280)
+        - "FastSAM-s": YOLOv8s-based, ~14M params, P2(64)/P3(128)/P4(256)/P8(512)
 
     :param name: 骨干名称 | Backbone name. **kwargs: 传递给 FastSAMBackbone 的参数 | Args forwarded to FastSAMBackbone.
     :type name: str

@@ -1,0 +1,308 @@
+{
+  "m01": {
+    "dataset_name": "NEU_Seg",
+    "splits": {
+      "train": {
+        "images": 3630,
+        "masks": 3630,
+        "paired": true,
+        "height_mean": 200.0,
+        "height_min": 200,
+        "height_max": 200,
+        "width_mean": 200.0,
+        "width_min": 200,
+        "width_max": 200
+      },
+      "test": {
+        "images": 840,
+        "masks": 840,
+        "paired": true,
+        "height_mean": 200.0,
+        "height_min": 200,
+        "height_max": 200,
+        "width_mean": 200.0,
+        "width_min": 200,
+        "width_max": 200
+      }
+    },
+    "total_images": 4470,
+    "total_masks": 4470,
+    "channels": 3,
+    "image_size_mode": "200x200",
+    "mask_dtype": "uint8",
+    "mask_unique_values": [
+      0,
+      1
+    ]
+  },
+  "m02": {
+    "background": {
+      "pixels": 157100783,
+      "pixel_pct": 87.864,
+      "images": 4170,
+      "image_pct": 100.0
+    },
+    "Inclusion": {
+      "pixels": 3950417,
+      "pixel_pct": 2.2094,
+      "images": 1824,
+      "image_pct": 43.74
+    },
+    "Patch": {
+      "pixels": 13094021,
+      "pixel_pct": 7.3233,
+      "images": 1808,
+      "image_pct": 43.36
+    },
+    "Scratch": {
+      "pixels": 4654779,
+      "pixel_pct": 2.6033,
+      "images": 1762,
+      "image_pct": 42.25
+    },
+    "fg_bg_ratio": "1:7.2",
+    "balanced": "Imbalanced (max/min FG class ratio 3.3x)",
+    "mode": "multi-class (3 defect types)",
+    "fg_class_distribution": {
+      "Inclusion": 2.2094,
+      "Patch": 7.3233,
+      "Scratch": 2.6033
+    }
+  },
+  "m03": {
+    "brightness": {
+      "mean": 112.59717416613961,
+      "std": 37.449062345453434,
+      "min": 34.31195068359375,
+      "max": 233.43392944335938
+    },
+    "contrast": {
+      "mean": 0.2753728718315595,
+      "std": 0.14660467273144678
+    },
+    "overexposed_pct": 52.93064876957494,
+    "overexposed_definition": "max_pixel > 250/255",
+    "underexposed_pct": 14.13870246085011,
+    "underexposed_definition": "min_pixel < 5/255"
+  },
+  "m04": {
+    "laplacian_mean": 439.33839824749396,
+    "laplacian_std": 587.4883584071928,
+    "laplacian_min": 3.652070899375,
+    "laplacian_max": 2761.52579639,
+    "blurry_count": 2271,
+    "blurry_pct": 50.81,
+    "threshold": 100.0
+  },
+  "m05": {
+    "fg_ratio": {
+      "mean": 0.121360274049217,
+      "median": 0.096325,
+      "min": 0.000825,
+      "max": 0.6958,
+      "std": 0.10354916504436251
+    },
+    "n_components": {
+      "mean": 2.9798657718120807,
+      "median": 2.0,
+      "max": 21,
+      "empty_pct": 0.0
+    },
+    "object_area": {
+      "mean": 1629.0703453453455,
+      "median": 670.5,
+      "min": 1,
+      "max": 27832
+    }
+  },
+  "m06": {
+    "total_objects": 13320,
+    "small": {
+      "count": 7965,
+      "pct": 59.8
+    },
+    "medium": {
+      "count": 5056,
+      "pct": 38.0
+    },
+    "large": {
+      "count": 299,
+      "pct": 2.2
+    },
+    "area_min": 1,
+    "area_max": 27832,
+    "area_mean": 1629.0703453453455,
+    "area_median": 670.5,
+    "area_percentiles": {
+      "p25": 199.0,
+      "p50": 670.5,
+      "p75": 2030.25,
+      "p90": 4267.0,
+      "p95": 6438.0,
+      "p99": 11830.0
+    },
+    "thresholds": {
+      "small": "< 1024px",
+      "medium": "1024-9216px",
+      "large": "> 9216px"
+    }
+  },
+  "m07": {
+    "n_objects": 13320,
+    "center_x_mean": 0.49870538842334966,
+    "center_y_mean": 0.49907907765483506,
+    "center_x_std": 0.24857822370541235,
+    "center_y_std": 0.24882499261941568,
+    "mean_dist_from_center": 0.3240229429186982,
+    "edge_bias_pct": 15.1,
+    "bias": "uniform"
+  },
+  "m08": {
+    "total_checked": 4470,
+    "errors": 0,
+    "warnings": 0,
+    "error_pct": 0.0,
+    "duplicate_images": 4,
+    "duplicate_masks": 0,
+    "issue_breakdown": {}
+  },
+  "m09": {
+    "comparisons": {},
+    "ks_test": {
+      "FG Ratio": {
+        "statistic": 0.051377,
+        "p_value": 0.052445,
+        "significant": "No (p>=0.05)",
+        "cohens_d": 0.037,
+        "effect_size": "small"
+      },
+      "Brightness": {
+        "statistic": 0.068497,
+        "p_value": 0.003139,
+        "significant": "Yes (p<0.05)",
+        "cohens_d": 0.144,
+        "effect_size": "small"
+      },
+      "Laplacian Var": {
+        "statistic": 0.111236,
+        "p_value": 0.0,
+        "significant": "Yes (p<0.05)",
+        "cohens_d": 0.212,
+        "effect_size": "small"
+      }
+    }
+  },
+  "m10": {
+    "total_samples": 3630,
+    "fg_samples": 3630,
+    "bg_samples": 0,
+    "fg_ratio_mean": 0.12064484848484848,
+    "fg_ratio_std": 0.1047309634189837,
+    "classes": 1,
+    "class_balanced": "N/A (binary)",
+    "K=1": {
+      "n_support_available": 3630,
+      "possible_episodes": 3630,
+      "support_coverage_pct": 100.0
+    },
+    "K=5": {
+      "n_support_available": 3630,
+      "possible_episodes": 726,
+      "support_coverage_pct": 100.0
+    },
+    "K=10": {
+      "n_support_available": 3630,
+      "possible_episodes": 363,
+      "support_coverage_pct": 100.0
+    },
+    "prototype_stability": 0.039421,
+    "prototype_stability_formula": "PS = std(mean(FG_ratio of K=5 random support)), 100 bootstrap iterations. Lower = more stable support prototype."
+  },
+  "m13": {
+    "contrast": {
+      "mean": 6.91786455094316,
+      "std": 11.325343022476233,
+      "min": 0.31444242149835483,
+      "max": 41.5890513799963
+    },
+    "correlation": {
+      "mean": 0.9390400169724845,
+      "std": 0.03325943103765715,
+      "min": 0.7636111425066031,
+      "max": 0.9951898851090543
+    },
+    "energy": {
+      "mean": 0.1625369137850325,
+      "std": 0.06252546002330014,
+      "min": 0.036734310819068944,
+      "max": 0.3328497988384214
+    },
+    "homogeneity": {
+      "mean": 0.6149223340626601,
+      "std": 0.1874911025635591,
+      "min": 0.2264310204948734,
+      "max": 0.8523883156826235
+    }
+  },
+  "m14": {
+    "circularity": {
+      "mean": 0.384198476548488,
+      "std": 0.2341983141688979,
+      "median": 0.3353510812611802,
+      "min": 0.017274133337248667,
+      "max": 1.0
+    },
+    "eccentricity": {
+      "mean": 0.9077818391302664,
+      "std": 0.19063541725887614,
+      "median": 0.9827157158032498,
+      "min": 0.0,
+      "max": 0.9999578828813045
+    },
+    "convexity": {
+      "mean": 0.9187714326242988,
+      "std": 0.11080657390731688,
+      "median": 0.976008800880088,
+      "min": 0.27532555386436663,
+      "max": 1.0
+    },
+    "rectangularity": {
+      "mean": 0.764734413981558,
+      "std": 0.15275421054789787,
+      "median": 0.7647522020778375,
+      "min": 0.1632095986255972,
+      "max": 1.0
+    },
+    "elongation": {
+      "mean": 5.785033958097417,
+      "std": 5.426390824770638,
+      "median": 4.166666666666667,
+      "min": 1.0,
+      "max": 57.0
+    },
+    "defect_size_distribution": {
+      "Tiny (<0.5%)": {
+        "count": 42,
+        "pct": 0.9
+      },
+      "Small (0.5-2%)": {
+        "count": 374,
+        "pct": 8.4
+      },
+      "Medium (2-5%)": {
+        "count": 859,
+        "pct": 19.2
+      },
+      "Large (>5%)": {
+        "count": 3195,
+        "pct": 71.5
+      }
+    }
+  },
+  "m15": {
+    "passed": true,
+    "n_issues": 0,
+    "issues": []
+  },
+  "m12": "# NEU_Seg — Comprehensive Dataset Analysis Report\n\n**Generated:** 2026-07-15 22:09:41\n\n---\n\n## 1. Dataset Overview\n\n| Property | Value |\n|----------|-------|\n| Dataset | NEU_Seg |\n| Total Images | 4470 |\n| Total Masks | 4470 |\n| Image Size | 200x200 px |\n| Channels | 3 (RGB) |\n| Mask Encoding | Original: uint8 {0,1,2,3} (0=BG, 1=Inclusion, 2=Patch, 3=Scratch); Binary: FG>0→1 |\n| train Split | 3630 images, 3630 masks, 200x200 |\n| test Split | 840 images, 840 masks, 200x200 |\n\n## 2. Class Statistics\n\n| Class | Encoding | Images | Pixel % |\n|-------|----------|--------|---------|\n| background | 0 | 4170 | 87.9% |\n| Inclusion | 1 | 1824 | 2.2% |\n| Patch | 2 | 1808 | 7.3% |\n| Scratch | 3 | 1762 | 2.6% |\n\n- **Class Balance:** Imbalanced (max/min FG class ratio 3.3x)\n- **Global FG Ratio:** 12.1% pixels are defect (non-BG)\n\n## 3. Image Quality Analysis\n\n### 3.1 Brightness & Contrast\n\n- **Brightness:** mean=112.6/255, std=37.4\n- **Dynamic Range:** min-max spread\n- **Overexposed:** 52.9% (definition: max_pixel > 250/255)\n- **Underexposed:** 14.1% (definition: min_pixel < 5/255)\n\n### 3.2 Image Sharpness\n\n- **Blur Detection:** Laplacian Variance < 100.0\n- **Blurry Images:** 2271/4470 (50.81%)\n- **Laplacian Var:** mean=439.3 (±587.5)\n\n## 4. Annotation Quality Analysis\n\n- **FG Ratio (all):** mean=0.1214, median=0.0963\n- **FG Ratio (non-empty):** see Defect Size Distribution (M06)\n- **Components/Image:** mean=3.0, max=21\n- **Empty Masks (no FG):** 0.0%\n- **Object Area:** mean=1629 px, median=670 px\n- **Object Area Range:** 1–27832 px\n\n## 5. Defect Size Distribution\n\n- **Total Objects:** 13320\n- **Small (<1024px):** 7965 (59.8%)\n- **Medium (1024–9216px):** 5056 (38.0%)\n- **Large (>9216px):** 299 (2.2%)\n\n**Area Percentiles:** p25=199px, p50=670px, p75=2030px, p95=6438px, p99=11830px\n\n### 5.1 Defect Size by FG Ratio\n\n| Category | Count | % |\n|----------|-------|---|\n| Tiny (<0.5%) | 42 | 0.9% |\n| Small (0.5-2%) | 374 | 8.4% |\n| Medium (2-5%) | 859 | 19.2% |\n| Large (>5%) | 3195 | 71.5% |\n\n## 6. Distribution Shift (Train vs Test)\n\n| Metric | KS D | p-value | Significant? |\n|--------|------|---------|--------------|\n| FG Ratio | 0.0514 | 0.0524 | No (p>=0.05) |\n| Brightness | 0.0685 | 0.0031 | Yes (p<0.05) |\n| Laplacian Var | 0.1112 | 0.0000 | Yes (p<0.05) |\n\n**Interpretation:** Significant shifts in brightness (p=0.0031) and blur (p=0.0000) indicate train/test domain gap. FG ratio distribution (p=0.0524) is consistent between splits.\n\n## 7. Few-shot Adaptation Analysis\n\n- **FG Samples Available:** 3630/3630\n- **Support Sampling Stability (PS):** 0.039421\n  - Definition: PS = std(bootstrap mean of FG ratio from K=5 random support), 100 iterations.\n  - Lower PS → support set choice has less impact on FG ratio estimation.\n  - Note: This measures pixel-level FG ratio stability, NOT feature-space prototype similarity.\n\n**Episode definition:** For K-shot, a support set of K FG images is drawn without replacement. Episodes = floor(FG_samples / K). Coverage = fraction of FG samples used across all episodes.\n\n| K | FG Samples | Possible Episodes | Support Coverage |\n|---|-----------|-------------------|-----------------|\n| K=1 | 3630 | 3630 | 100.0% |\n| K=5 | 3630 | 726 | 100.0% |\n| K=10 | 3630 | 363 | 100.0% |\n\n## 8. Texture & Shape Characteristics\n\n### 8.1 GLCM Texture\n\n| Property | Mean ± Std | Description |\n|----------|-----------|-------------|\n| Contrast | 6.918 ± 11.325 | Local intensity variation |\n| Energy | 0.1625 ± 0.0625 | Texture uniformity (higher=more uniform) |\n| Homogeneity | 0.615 ± 0.187 | Similarity of neighboring pixels |\n| Correlation | 0.939 ± 0.033 | Linear dependency of neighboring pixels |\n\n### 8.2 Shape Metrics\n\n| Metric | Mean | Median | Description |\n|--------|------|--------|-------------|\n| Circularity | 0.384 | 0.335 | 4πA/P² (1=circle) |\n| Eccentricity | 0.908 | 0.983 | 0=circle, 1=line |\n| Convexity | 0.919 | 0.976 | Area/HullArea (1=convex) |\n| Elongation | 5.8 | 4.2 | Max(W,H)/Min(W,H) |\n\n## 9. Data Quality Issues\n\n- **Quality Errors:** 0\n- **Quality Warnings:** 0\n- **Duplicate Images:** 4 (0.09%)\n- **Duplicate Masks:** 0\n- **Spatial Bias:** uniform (center mean=(0.499,0.499))\n\n## 10. Recommended Data Augmentation Strategies\n\n| Augmentation | Rationale |\n|-------------|-----------|\n| RandomFlip (H+V), RandomRotate90 | Objects have no canonical orientation |\n| RandomBrightnessContrast | Significant brightness distribution shift between train/test (KS p<0.01) |\n| GaussianNoise | Improve robustness to blur variation (50.8% blurry, KS p<0.001) |\n| FG-Weighted Sampling | FG pixels=12.1% of total; weighted sampling reduces background dominance |\n| RandomCrop (larger context) | 200x200 is small; expanding receptive field helps capture context |\n\n## 11. Task Suitability Assessment\n\n| Task | Suitable? | Notes |\n|------|-----------|-------|\n| Semantic Segmentation | ✅ Yes | Binary FG/BG masks, well-defined |\n| Instance Segmentation | ⚠️ Partial | Connected components separable but no instance IDs |\n| Few-shot Segmentation | ✅ Yes | 3630 FG support candidates, K=1 viable |\n| Anomaly Detection | ✅ Yes | Binary normal/defect framing |\n| Foundation Model Fine-tuning | ✅ Yes | Compatible with SAM/FastSAM binary mask format |\n\n## 12. Key Metrics Summary\n\n| Metric | Value | Paper-Ready? |\n|--------|-------|-------------|\n| Samples (Train/Test) | 3630/840 | ✅ |\n| Image Size | 200x200 | ✅ |\n| FG/BG Pixel Ratio | 1:7.2 | ✅ |\n| Object Area Median | 670 px | ✅ |\n| Object Size Split | S=59.8%/M=38.0%/L=2.2% | ✅ |\n| Brightness Shift | KS p=0.0031 | ✅ |\n| Blur Shift | KS p=0.0000 | ✅ |\n| Prototype Stability | 0.039421 | ✅ |\n| Duplicate Rate | 0.09% | ✅ |\n| Spatial Bias | uniform | ✅ |"
+}
