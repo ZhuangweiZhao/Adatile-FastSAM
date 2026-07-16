@@ -356,7 +356,11 @@ class MSCAN(nn.Module):
         mmseg checkpoint format: state_dict under "state_dict" key,
         backbone params prefixed with "backbone." — need to strip.
         """
-        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        # weights_only=False: 官方 checkpoint 含 argparse.Namespace 等非张量对象
+        # (torch>=2.6 默认 weights_only=True 会拒绝加载, 该权重来源可信)
+        # Official ckpt contains argparse.Namespace; trusted source, so opt out
+        # of the torch>=2.6 weights_only default.
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         state = ckpt.get("state_dict", ckpt)
 
         # 剥离 "backbone." 前缀 | Strip "backbone." prefix
