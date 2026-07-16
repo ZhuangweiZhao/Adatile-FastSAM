@@ -383,7 +383,6 @@ def main():
     backbone.eval()
 
     # ── 自动探测通道数 | Auto-detect channel counts ──
-    import torch
     dummy = torch.randn(1, 3, 224, 224, device=device)
     with torch.no_grad():
         backbone(dummy, extract_proto=False)
