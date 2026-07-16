@@ -949,7 +949,7 @@ def main():
         f"Starting training: {args.epochs} epochs × {args.steps_per_epoch} steps")
     logger.log_info("train", f"{'='*60}")
 
-    best_dice = 0.0
+    best_miou = 0.0
     best_epoch = 0
     global_step = 0
     nan_skip_count = 0
@@ -1124,16 +1124,17 @@ def main():
             logger.log_info("eval",
                 f"  mIoU={miou:.4f}  dice={dice:.4f}  "
                 f"n={eval_result['n_evaluated']}  "
-                f"best_dice={best_dice:.4f} (epoch {best_epoch})"
+                f"best_mIoU={best_miou:.4f} (epoch {best_epoch})"
             )
             for cls_name, iou_c in eval_result.get("per_class_IoU", {}).items():
                 logger.log_info("eval", f"    {cls_name}: IoU={iou_c:.4f}")
             logger.log_metric("mIoU", miou, step=epoch, tags=["neuseg_eval"])
             logger.log_metric("Dice", dice, step=epoch, tags=["neuseg_eval"])
 
-            # ── 按 Val Dice 保存最佳 | Save best by Val Dice ──
-            if dice > best_dice:
-                best_dice = dice
+            # ── 按 Val mIoU 保存最佳 (与 SegNeXt 基线选择准则一致) ──
+            # Save best by Val mIoU (same model-selection criterion as SegNeXt baseline)
+            if miou > best_miou:
+                best_miou = miou
                 best_epoch = epoch
                 checkpoint = {
                     "epoch": epoch,
@@ -1163,7 +1164,7 @@ def main():
                         if isinstance(support_cache, torch.Tensor) else support_cache
                 torch.save(checkpoint, str(out_dir / "best_model.pt"))
                 logger.log_info("eval",
-                    f"  ✓ New best: Dice={best_dice:.4f} @ epoch {best_epoch}")
+                    f"  ✓ New best: mIoU={best_miou:.4f} @ epoch {best_epoch}")
 
     # ── 最终保存 | Final Save ──
     final_checkpoint = {
@@ -1172,7 +1173,7 @@ def main():
         "decoder_state_dict": {k: v.clone() for k, v
                                in decoder.state_dict().items()},
         "optimizer_state_dict": optimizer.state_dict(),
-        "best_Dice": best_dice,
+        "best_mIoU": best_miou,
         "best_epoch": best_epoch,
         "args": vars(args),
         "num_classes": NUM_CLASSES,
@@ -1203,7 +1204,7 @@ def main():
         "epochs": args.epochs,
         "steps_per_epoch": args.steps_per_epoch,
         "k_support": args.k_support,
-        "best_Dice": round(best_dice, 6),
+        "best_mIoU": round(best_miou, 6),
         "best_epoch": best_epoch,
         "nan_skip_count": nan_skip_count,
         "trainable_params": trainable_params,
@@ -1219,13 +1220,13 @@ def main():
     print(f"  Neu_seg Multi-class Training — Complete")
     print(f"  Decoder: {args.decoder_type}")
     print(f"  Epochs: {args.epochs}, Steps: {global_step}")
-    print(f"  Best Dice: {best_dice:.4f} @ epoch {best_epoch}")
+    print(f"  Best mIoU: {best_miou:.4f} @ epoch {best_epoch}")
     print(f"  NaN skips: {nan_skip_count}")
     print(f"  Output: {out_dir}")
     print(f"{'='*60}")
 
     logger.log_info("done", f"Output: {out_dir}")
-    logger.log_info("done", f"Best Dice: {best_dice:.4f} @ epoch {best_epoch}")
+    logger.log_info("done", f"Best mIoU: {best_miou:.4f} @ epoch {best_epoch}")
 
 
 if __name__ == "__main__":

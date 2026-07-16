@@ -367,6 +367,10 @@ def main():
     print(f"  Backbone: {backbone_name}")
     print(f"  Decoder: {decoder_type}, proto_source: {proto_source}")
     print(f"  Epoch: {ckpt.get('epoch', '?')}")
+    # 新 ckpt 记录 best_mIoU；旧 ckpt 仅有 best_Dice/Dice (向后兼容)
+    # New ckpts record best_mIoU; old ones only best_Dice/Dice (backward compat)
+    print(f"  Best mIoU (train-time): "
+          f"{ckpt.get('best_mIoU', ckpt.get('mIoU', 'N/A'))}")
     print(f"  Best Dice (train-time): {ckpt.get('best_Dice', ckpt.get('Dice', 'N/A'))}")
 
     # ── 加载数据集 (始终多类别) | Load Dataset (always multi-class) ──

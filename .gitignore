@@ -69,6 +69,7 @@ Thumbs.db
 *.local.yml
 
 # ── Misc ────────────────────────────────────────────────────────────
+/thirdLibrary.zip
 *.tmp
 *.temp
 /tmp/
