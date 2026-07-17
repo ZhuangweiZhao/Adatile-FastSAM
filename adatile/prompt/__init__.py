@@ -190,3 +190,4 @@ class PromptFusion(nn.Module):
 
 
 from adatile.prompt.defect_prompt import DefectPromptGenerator, prompt_global_conditioning, prompt_diversity_loss  # noqa: E402
+from adatile.prompt.defect_prompts import DefectPromptExtractor, DefectHeatmaps, extract_defect_boxes  # noqa: E402
