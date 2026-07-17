@@ -320,7 +320,7 @@ def lovasz_softmax(
 
     # 展平空间维度 | Flatten spatial dims
     prob = prob.permute(0, 2, 3, 1).contiguous().view(-1, C)  # [B*H*W, C]
-    label = label.view(-1)                                      # [B*H*W]
+    label = label.reshape(-1)                                   # [B*H*W]
 
     if classes == "present":
         active = label.unique().long().tolist()
