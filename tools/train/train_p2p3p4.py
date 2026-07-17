@@ -278,7 +278,7 @@ def main():
         ).to(device)
 
     dec_p = sum(p.numel() for p in decoder.parameters())
-    lora_p = sum(p.numel() for p in lora_modules) if lora_modules else 0
+    lora_p = sum(p.numel() for m in lora_modules for p in m.parameters()) if lora_modules else 0
     total_p = dec_p + lora_p
     logger.log_info("model", f"Decoder: {dec_p/1e3:.1f}K | LoRA: {lora_p/1e3:.1f}K | Total: {total_p/1e3:.1f}K ({total_p:,})")
     logger.log_info("model", f"Backbone P2: {ch['p2']}ch, P3: {ch['p3']}ch, P4: {ch['p4']}ch")
