@@ -896,8 +896,9 @@ def _inject_conv_lora(module: nn.Module, rank: int = 4, alpha: float = 1.0,
             # 跳过 1×1 Conv (已低秩) 和 depthwise Conv | Skip 1×1 and depthwise
             if child.kernel_size == (1, 1) or child.groups > 1:
                 continue
-            # 替换为 ConvLoRA | Replace with ConvLoRA
+            # 替换为 ConvLoRA (继承原 Conv 的设备) | Replace with ConvLoRA (inherit device from original Conv)
             lora_conv = ConvLoRA(child, rank=rank, alpha=alpha)
+            lora_conv = lora_conv.to(child.weight.device)
             setattr(module, name, lora_conv)
             n_added += lora_conv.lora_params
         elif isinstance(child, ConvLoRA):
