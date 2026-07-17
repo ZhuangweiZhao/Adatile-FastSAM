@@ -534,3 +534,231 @@ def spectral_combined_loss(
 
     total = ce_alpha * ce + dice_alpha * dice + spectral_alpha * spectral
     return total, {"ce": ce.item(), "dice": dice.item(), "spectral": spectral.item()}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 6. Frequency Feature Enhancer — 频域特征增强器 (Encoder-side)
+# ═══════════════════════════════════════════════════════════════════
+
+class FrequencyFeatureEnhancer(nn.Module):
+    """
+    频域特征增强器 — 在 Encoder 特征上直接做频域滤波 | Frequency-Domain Feature Enhancer.
+
+    原理 | Principle:
+        对 backbone 特征图做 FFT → 分解为 N 个频段 → 学习每频段增益因子
+        → 加权重组频谱 → IFFT 重建 → 残差连接。
+        Apply FFT to backbone features → decompose into N frequency bands
+        → learn per-band gain → weighted spectral reconstruction → IFFT → residual.
+
+    与 MultiScaleSpectralAttention 的区别 | vs MultiScaleSpectralAttention:
+        MSSA: DCT 仅用于通道注意力的空间压缩 (不改变特征值结构)
+        FFEnhancer: 在频域直接操作特征值, 增强纹理相关频率, 抑制无关频率
+
+        MSSA: DCT used only for spatial compression in channel attention (doesn't change feature structure)
+        FFEnhancer: directly operates on feature values in frequency domain,
+        enhancing texture-relevant frequencies, suppressing irrelevant ones
+
+    为什么有效 | Why It Works:
+        - Inclusion (夹杂物): 中频纹理特征 → 中频段增益 > 1
+        - Scratch (划痕): 高频边缘特征 → 高频段增益 > 1
+        - Patch (斑块): 低频平滑特征 → 不需要额外增强
+        - Inclusion: mid-frequency texture → mid-band gain > 1
+        - Scratch: high-frequency edge → high-band gain > 1
+        - Patch: low-frequency smooth → no extra enhancement needed
+
+    Parameters
+    ----------
+    channels : int
+        输入通道数 | Input channels.
+    n_bands : int
+        频段数量 (建议 4) | Number of frequency bands (recommend 4).
+    reduction : int
+        频段增益预测的压缩比 | Reduction ratio for band gain prediction.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        n_bands: int = 4,
+        reduction: int = 4,
+    ) -> None:
+        super().__init__()
+        self.channels = channels
+        self.n_bands = n_bands
+
+        # 频段增益预测器 | Band gain predictor
+        # 输入: 每频段的平均能量 [B, C, n_bands]
+        # 输出: 每频段的增益因子 [B, C, n_bands]
+        mid = max(channels // reduction, 8)
+        self.gain_predictor = nn.Sequential(
+            nn.Linear(n_bands, mid),
+            nn.ReLU(inplace=True),
+            nn.Linear(mid, n_bands),
+            nn.Tanh(),  # gain in [-1, 1] → final gain = 1 + gain ∈ [0, 2]
+        )
+
+        # 通道混合 (频段间交互) | Channel mixing (cross-band interaction)
+        self.channel_mix = nn.Sequential(
+            nn.Conv2d(channels, mid, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid, channels, 1, bias=False),
+        )
+        nn.init.zeros_(self.channel_mix[-1].weight)
+
+        self._initialized = False
+
+    def _compute_band_energy(
+        self,
+        fft_magnitude: torch.Tensor,  # [B, C, H, W//2+1]
+    ) -> torch.Tensor:
+        """
+        将 FFT 幅度按径向频率分为 n_bands 个频段，计算每段平均能量。
+        Split FFT magnitude into n_bands by radial frequency, compute per-band mean energy.
+
+        :param fft_magnitude: [B, C, H, W_fft] FFT magnitude spectrum.
+        :return: [B, C, n_bands] per-band mean energy.
+        """
+        B, C, H, W_fft = fft_magnitude.shape
+
+        # 创建频率半径图 | Create frequency radius map
+        h_idx = torch.arange(H, device=fft_magnitude.device, dtype=torch.float32)
+        w_idx = torch.arange(W_fft, device=fft_magnitude.device, dtype=torch.float32)
+        # 归一化半径 [0, 1] | Normalized radius
+        h_center, w_center = H / 2, W_fft / 2
+        h_dist = (h_idx.view(-1, 1) - h_center).abs() / max(h_center, 1.0)
+        w_dist = (w_idx.view(1, -1) - w_center).abs() / max(w_center, 1.0)
+        radius = torch.sqrt(h_dist ** 2 + w_dist ** 2)  # [H, W_fft], range [0, ~1.4]
+
+        # 分频段 | Assign frequency bands
+        band_energy = torch.zeros(B, C, self.n_bands, device=fft_magnitude.device)
+        for b in range(self.n_bands):
+            r_start = b / self.n_bands
+            r_end = (b + 1) / self.n_bands
+            mask = ((radius >= r_start) & (radius < r_end)).float()  # [H, W_fft]
+            mask_area = mask.sum() + 1e-6
+            # 该频段的平均能量 | Mean energy in this band
+            band_energy[:, :, b] = (fft_magnitude * mask.unsqueeze(0).unsqueeze(0)).sum(dim=[-2, -1]) / mask_area
+
+        return band_energy  # [B, C, n_bands]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        前向传播: FFT → 频段增益 → 频谱加权 → IFFT → 残差。
+        Forward: FFT → band gain → spectral weighting → IFFT → residual.
+
+        :param x: [B, C, H, W] 输入特征 | Input features.
+        :return: [B, C, H, W] 频域增强特征 | Frequency-enhanced features.
+        """
+        B, C, H, W = x.shape
+
+        # 1. FFT → 幅度 + 相位 | FFT → magnitude + phase
+        x_fft = torch.fft.rfft2(x.float(), norm='ortho')  # [B, C, H, W//2+1]
+        magnitude = torch.abs(x_fft)  # [B, C, H, W//2+1]
+        phase = torch.angle(x_fft)
+
+        # 2. 计算各频段平均能量 | Compute per-band mean energy
+        band_energy = self._compute_band_energy(magnitude)  # [B, C, n_bands]
+
+        # 3. 预测每频段增益 | Predict per-band gain
+        # band_energy: [B, C, n_bands] → gain_predictor per C
+        # Reshape: [B*C, n_bands]
+        band_energy_flat = band_energy.permute(0, 2, 1).reshape(B * self.n_bands, C)
+        # Actually: [B, C, n_bands] → [B, n_bands, C] doesn't work for Linear
+        # Reshape to [B*C, n_bands]
+        band_energy_flat = band_energy.reshape(B * C, self.n_bands)
+        gain_flat = self.gain_predictor(band_energy_flat)  # [B*C, n_bands]
+        gain = gain_flat.reshape(B, C, self.n_bands)  # [B, C, n_bands]
+        # gain ∈ [-1, 1] → final_gain = 1 + gain ∈ [0, 2]
+
+        # 4. 构建频域增益图 | Build frequency-domain gain map
+        H_fft = magnitude.shape[-2]
+        W_fft = magnitude.shape[-1]
+        h_idx = torch.arange(H_fft, device=x.device, dtype=torch.float32)
+        w_idx = torch.arange(W_fft, device=x.device, dtype=torch.float32)
+        h_center, w_center = H_fft / 2, W_fft / 2
+        h_dist = (h_idx.view(-1, 1) - h_center).abs() / max(h_center, 1.0)
+        w_dist = (w_idx.view(1, -1) - w_center).abs() / max(w_center, 1.0)
+        radius = torch.sqrt(h_dist ** 2 + w_dist ** 2)  # [H_fft, W_fft]
+
+        # 为每个频段分配增益 | Assign gain per band
+        gain_map = torch.ones(B, C, H_fft, W_fft, device=x.device)
+        for b in range(self.n_bands):
+            r_start = b / self.n_bands
+            r_end = (b + 1) / self.n_bands
+            mask = ((radius >= r_start) & (radius < r_end)).float()  # [H_fft, W_fft]
+            # Apply band gain: 1 + gain for this band
+            band_gain = 1.0 + gain[:, :, b]  # [B, C]
+            # factor = 1 + (gain-1) * mask → [B, C, H_fft, W_fft] via broadcasting
+            factor = 1.0 + (band_gain.unsqueeze(-1).unsqueeze(-1) - 1.0) * mask.unsqueeze(0).unsqueeze(0)
+            gain_map = gain_map * factor
+
+        # 5. 应用增益 → IFFT | Apply gain → IFFT
+        magnitude_enhanced = magnitude * gain_map
+        x_fft_enhanced = magnitude_enhanced * torch.exp(1j * phase)
+        x_freq = torch.fft.irfft2(x_fft_enhanced, s=(H, W), norm='ortho')
+
+        # 6. 通道混合 + 残差 | Channel mixing + residual
+        x_freq = self.channel_mix(x_freq)  # [B, C, H, W]
+        return x + x_freq
+
+
+class MultiScaleFrequencyEnhancer(nn.Module):
+    """
+    多尺度频域特征增强器 (P2/P3/P4 各一个) | Multi-Scale Frequency Feature Enhancer.
+
+    每个尺度有独立的 FrequencyFeatureEnhancer, 因为不同分辨率的频域需求不同:
+    - P2 (H/4): 高频纹理为主, n_bands=8 (更细粒度高频分割)
+    - P3 (H/8): 中频结构, n_bands=6
+    - P4 (H/16): 低频语义, n_bands=4
+
+    Each scale has independent FrequencyFeatureEnhancer with different n_bands
+    to match the resolution-dependent frequency content.
+
+    Parameters
+    ----------
+    p2_channels, p3_channels, p4_channels : int
+        各层通道数 | Per-layer channel counts.
+    reduction : int
+        增益预测的压缩比 | Reduction ratio for gain prediction.
+    """
+
+    def __init__(
+        self,
+        p2_channels: int = 160,
+        p3_channels: int = 960,
+        p4_channels: int = 1280,
+        reduction: int = 4,
+    ) -> None:
+        super().__init__()
+        # P2 高频为主 → 更多频段 | P2 high-freq dominant → more bands
+        self.p2_enhancer = FrequencyFeatureEnhancer(p2_channels, n_bands=8, reduction=reduction) if p2_channels else None
+        self.p3_enhancer = FrequencyFeatureEnhancer(p3_channels, n_bands=6, reduction=reduction) if p3_channels else None
+        self.p4_enhancer = FrequencyFeatureEnhancer(p4_channels, n_bands=4, reduction=reduction) if p4_channels else None
+
+        n_total = sum(
+            sum(p.numel() for p in e.parameters())
+            for e in [self.p2_enhancer, self.p3_enhancer, self.p4_enhancer] if e is not None
+        )
+        import logging
+        _log = logging.getLogger("adatile.frequency")
+        _log.info(
+            f"MultiScaleFrequencyEnhancer: P2({p2_channels})@8bands, "
+            f"P3({p3_channels})@6bands, P4({p4_channels})@4bands, "
+            f"total={n_total:,} params"
+        )
+
+    def forward(
+        self,
+        p2: torch.Tensor | None = None,
+        p3: torch.Tensor | None = None,
+        p4: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """对每个输入尺度分别应用频域增强."""
+        result = {}
+        if p2 is not None and self.p2_enhancer is not None:
+            result["p2"] = self.p2_enhancer(p2)
+        if p3 is not None and self.p3_enhancer is not None:
+            result["p3"] = self.p3_enhancer(p3)
+        if p4 is not None and self.p4_enhancer is not None:
+            result["p4"] = self.p4_enhancer(p4)
+        return result

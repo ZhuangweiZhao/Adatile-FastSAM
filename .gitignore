@@ -70,6 +70,10 @@ Thumbs.db
 
 # ── Misc ────────────────────────────────────────────────────────────
 /thirdLibrary.zip
+thirdLibrary/*.zip
+# 效率测量的运行日志 (结果 JSON/CSV 保留入库) | efficiency run log (results stay tracked)
+analysis/efficiency_log.jsonl
+analysis/efficiency_smoke.json
 *.tmp
 *.temp
 /tmp/

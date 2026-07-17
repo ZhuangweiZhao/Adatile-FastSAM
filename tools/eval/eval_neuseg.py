@@ -37,7 +37,10 @@ from adatile.decoder.adaptive_sparse_decoder import (
 )
 from adatile.decoder.pure_cnn_decoder import PureDecoder, PureDecoderP3P4, PureDecoderP2P3P4
 from adatile.adapter import MultiScaleAdapter
-from adatile.frequency import MultiScaleSpectralAttention, FrequencyGuidedFusion
+from adatile.frequency import (
+    MultiScaleSpectralAttention, FrequencyGuidedFusion,
+    MultiScaleFrequencyEnhancer,
+)
 from adatile.datasets.neu_seg import NEUSegDataset
 
 # 类别名称 | Class Names
@@ -109,6 +112,7 @@ def evaluate_neuseg(
     adapter: torch.nn.Module | None = None,
     spectral_attn: torch.nn.Module | None = None,
     freq_fusion: torch.nn.Module | None = None,
+    freq_enhancer: torch.nn.Module | None = None,
 ) -> dict:
     """
     在 Neu_seg 数据集上评估多类别分割 | Evaluate multi-class segmentation on Neu_seg dataset.
@@ -152,6 +156,13 @@ def evaluate_neuseg(
                 p2=feats.get("p2"), p3=feats.get("p3"), p4=feats.get("p4"),
             )
             feats.update(spec_feats)
+
+        # ── Encoder-side Frequency Enhancer | FFT 频域滤波 ──
+        if freq_enhancer is not None:
+            freq_feats = freq_enhancer(
+                p2=feats.get("p2"), p3=feats.get("p3"), p4=feats.get("p4"),
+            )
+            feats.update(freq_feats)
 
         # ── Decoder ──
         pred_prob = _decoder_forward(decoder, feats, support_cache,
@@ -237,6 +248,7 @@ def save_visualizations(
     adapter: torch.nn.Module | None = None,
     spectral_attn: torch.nn.Module | None = None,
     freq_fusion: torch.nn.Module | None = None,
+    freq_enhancer: torch.nn.Module | None = None,
 ):
     """
     保存验证集图像的多类别可视化结果 | Save multi-class visualization for val images.
@@ -282,6 +294,13 @@ def save_visualizations(
                 p2=feats.get("p2"), p3=feats.get("p3"), p4=feats.get("p4"),
             )
             feats.update(spec_feats)
+
+        # ── Encoder-side Frequency Enhancer | FFT 频域滤波 ──
+        if freq_enhancer is not None:
+            freq_feats = freq_enhancer(
+                p2=feats.get("p2"), p3=feats.get("p3"), p4=feats.get("p4"),
+            )
+            feats.update(freq_feats)
 
         pred_prob = _decoder_forward(decoder, feats, support_cache,
                                      freq_fusion=freq_fusion)
@@ -384,6 +403,19 @@ def main():
     backbone = FastSAMBackbone(freeze_backbone=True, checkpoint=checkpoint_path).to(device)
     backbone.eval()
 
+    # ── ConvLoRA 权重恢复 (如果 checkpoint 包含 LoRA) | Restore ConvLoRA weights if present ──
+    lora_state = ckpt.get("lora_state_dict")
+    lora_rank = args_ckpt.get("lora_rank", 0)
+    if lora_state is not None and lora_rank > 0:
+        from adatile.backbone.fastsam_backbone import ConvLoRA
+        backbone.apply_conv_lora(rank=lora_rank)
+        # 加载 LoRA 权重到 backbone 内部的 ConvLoRA 模块
+        backbone.model.model.load_state_dict(lora_state, strict=False)
+        n_lora = sum(1 for m in backbone.model.model.modules()
+                    if isinstance(m, ConvLoRA))
+        print(f"  Restored ConvLoRA: rank={lora_rank}, {n_lora} modules, "
+              f"{len(lora_state)} keys")
+
     # ── 自动探测通道数 | Auto-detect channel counts ──
     dummy = torch.randn(1, 3, 224, 224, device=device)
     with torch.no_grad():
@@ -446,6 +478,18 @@ def main():
         spectral_attn.eval()
         print(f"  Loaded MultiScaleSpectralAttention: {len(spectral_state)} keys")
 
+    # ── Encoder-side Frequency Enhancer | FFT 频域滤波 ──
+    freq_enhancer = None
+    fe_state = ckpt.get("freq_enhancer_state_dict")
+    if fe_state is not None:
+        freq_enhancer = MultiScaleFrequencyEnhancer(
+            p2_channels=ch["p2"], p3_channels=ch["p3"], p4_channels=ch["p4"],
+            reduction=4,
+        ).to(device)
+        freq_enhancer.load_state_dict(fe_state)
+        freq_enhancer.eval()
+        print(f"  Loaded MultiScaleFrequencyEnhancer: {len(fe_state)} keys")
+
     # ── Frequency Guided Fusion | 频率引导融合 ──
     freq_fusion = None
     ff_state = ckpt.get("freq_fusion_state_dict")
@@ -485,6 +529,7 @@ def main():
         decoder, backbone, support_cache, val_ds, device,
         num_classes=NUM_CLASSES, adapter=adapter,
         spectral_attn=spectral_attn, freq_fusion=freq_fusion,
+        freq_enhancer=freq_enhancer,
     )
 
     # ── 打印结果 | Print Results ──
@@ -523,6 +568,7 @@ def main():
             adapter=adapter,
             spectral_attn=spectral_attn,
             freq_fusion=freq_fusion,
+            freq_enhancer=freq_enhancer,
         )
 
     print(f"\n[Done] Evaluation complete.")

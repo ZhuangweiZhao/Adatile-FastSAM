@@ -56,6 +56,7 @@ from adatile.adapter import MultiScaleAdapter
 from adatile.frequency import (
     MultiScaleSpectralAttention,
     FrequencyGuidedFusion,
+    MultiScaleFrequencyEnhancer,
     spectral_combined_loss,
 )
 from adatile.datasets.neu_seg import NEUSegDataset
@@ -214,24 +215,67 @@ def multiclass_dice_loss(
     return 1.0 - dice_sum / count
 
 
+def boundary_weighted_nll_loss(
+    log_pred: torch.Tensor,      # [B, C, H, W] log-softmax
+    target: torch.Tensor,        # [B, H, W] int64 class labels
+    class_weight: torch.Tensor | None = None,  # [C] class weights
+    boundary_weight: torch.Tensor | None = None,  # [B, H, W] spatial weights
+) -> torch.Tensor:
+    """
+    边界加权的 NLL Loss | Boundary-weighted NLL Loss.
+
+    标签边界附近像素获得更高权重, 强调边缘区域的学习。
+    Pixels near label boundaries get higher weight, emphasizing edge regions.
+
+    CE = -Σ boundary_weight[h,w] * class_weight[c] * log(pred[c,h,w])
+
+    :param log_pred: [B, C, H, W] log-softmax probabilities.
+    :param target: [B, H, W] int64 class labels.
+    :param class_weight: [C] per-class weights.
+    :param boundary_weight: [B, H, W] spatial boundary weights.
+    :return: scalar weighted NLL loss.
+    """
+    B, C, H, W = log_pred.shape
+
+    # Gather NLL per pixel: nll[b, h, w] = -log_pred[b, target[b,h,w], h, w]
+    nll = -log_pred.gather(1, target.unsqueeze(1)).squeeze(1)  # [B, H, W]
+
+    # 应用类别权重 | Apply class weights
+    if class_weight is not None:
+        cw = class_weight.to(log_pred.device)
+        nll = nll * cw[target]
+
+    # 应用边界空间权重 | Apply boundary spatial weights
+    if boundary_weight is not None:
+        nll = nll * boundary_weight.to(log_pred.device)
+
+    return nll.mean()
+
+
 def multiclass_combined_loss(
     pred: torch.Tensor,          # [B, C, H, W] softmax probs
     target: torch.Tensor,        # [B, H, W] int64 class labels
     ce_weight: torch.Tensor | None = None,  # [C] class weights for CE
     ce_alpha: float = 0.5,
+    boundary_weight: torch.Tensor | None = None,  # [B, H, W] spatial weights
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """
     多类别组合损失: ce_alpha * CE + (1 - ce_alpha) * multi-Dice.
     Multi-class combined loss: ce_alpha * CE + (1 - ce_alpha) * multi-Dice.
 
+    支持边界空间加权 (boundary_weight) 强调缺陷边缘学习。
+    Supports boundary spatial weighting to emphasize defect edge learning.
+
     :param pred: [B, C, H, W] softmax probabilities.
     :param target: [B, H, W] int64 class labels.
     :param ce_weight: [C] per-class weights for cross-entropy.
     :param ce_alpha: CE vs Dice weight.
+    :param boundary_weight: [B, H, W] optional spatial boundary weight map.
     :return: (total_loss, {"ce": float, "dice": float}).
     """
     log_pred = torch.log(pred + 1e-7)
-    ce = F.nll_loss(log_pred, target, weight=ce_weight)
+    ce = boundary_weighted_nll_loss(log_pred, target, class_weight=ce_weight,
+                                    boundary_weight=boundary_weight)
     md = multiclass_dice_loss(pred, target)
     return ce_alpha * ce + (1 - ce_alpha) * md, {"ce": ce.item(), "dice": md.item()}
 
@@ -360,12 +404,13 @@ def lovasz_combined_loss(
     ce_alpha: float = 0.3,      # CE weight
     dice_alpha: float = 0.3,    # Dice weight
     lovasz_alpha: float = 0.4,  # Lovász weight
+    boundary_weight: torch.Tensor | None = None,  # [B, H, W] spatial weights
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """
-    组合损失 (Focal CE + Dice + Lovász) | Combined loss (Focal CE + Dice + Lovász).
+    组合损失 (Boundary CE + Dice + Lovász) | Combined loss (Boundary CE + Dice + Lovász).
 
-    CE 保证像素级正确, Dice 处理类别不平衡, Lovász 优化边界 mIoU。
-    CE ensures per-pixel correctness, Dice handles class imbalance,
+    CE 保证像素级正确 (边界加权), Dice 处理类别不平衡, Lovász 优化边界 mIoU。
+    CE ensures per-pixel correctness (boundary-weighted), Dice handles class imbalance,
     Lovász optimizes boundary mIoU.
 
     :param pred: [B, C, H, W] softmax probabilities.
@@ -374,10 +419,12 @@ def lovasz_combined_loss(
     :param ce_alpha: CE loss weight.
     :param dice_alpha: Dice loss weight.
     :param lovasz_alpha: Lovász-Softmax loss weight.
+    :param boundary_weight: [B, H, W] optional spatial boundary weight map.
     :return: (total_loss, {"ce": float, "dice": float, "lovasz": float}).
     """
     log_pred = torch.log(pred + 1e-7)
-    ce = F.nll_loss(log_pred, target, weight=ce_weight)
+    ce = boundary_weighted_nll_loss(log_pred, target, class_weight=ce_weight,
+                                    boundary_weight=boundary_weight)
     dice = multiclass_dice_loss(pred, target)
     lovasz = lovasz_softmax(pred, target, classes="present", ignore=None)
     total = ce_alpha * ce + dice_alpha * dice + lovasz_alpha * lovasz
@@ -390,24 +437,139 @@ def lovasz_combined_loss(
 
 class NEUSegAugmentation:
     """
-    基于数据集分析的增强策略 | Augmentation strategy based on dataset analysis.
+    基于数据集分析的增强策略 (v2 扩展版) | Augmentation strategy based on dataset analysis (v2 extended).
 
     分析发现 | Analysis Findings:
         - Train/Test brightness shift: KS p=0.003 → RandomBrightnessContrast
-        - Train/Test blur shift: KS p<0.001 (50.8% blurry) → GaussianNoise
+        - Train/Test blur shift: KS p<0.001 (50.8% blurry) → GaussianBlur + MotionBlur
         - 52.9% overexposed → RandomGamma
+        - 低对比度缺陷 (Inclusion) 需要局部增强 → CLAHE
         - Objects have no canonical orientation → RandomFlip + RandomRotate90
+
+    v2 新增 | v2 New:
+        - CLAHE: 局部对比度增强, 对低对比度 Inclusion 特别有效
+        - RandomGamma: 模拟不同光照条件, 解决过曝问题
+        - MotionBlur: 模拟相机运动模糊
+        - GaussianBlur: 模拟对焦不准, 增强模糊鲁棒性
+        - CutMix: 跨样本区域混合 (可选)
     """
 
     def __init__(self, p_flip: float = 0.5, p_rotate: float = 0.5,
                  brightness_range: float = 0.2, contrast_range: float = 0.2,
-                 noise_std: float = 0.02, p_color: float = 0.7):
+                 noise_std: float = 0.02, p_color: float = 0.7,
+                 p_clahe: float = 0.3, p_gamma: float = 0.3,
+                 p_motion_blur: float = 0.2, p_gaussian_blur: float = 0.2,
+                 p_cutmix: float = 0.0):
         self.p_flip = p_flip
         self.p_rotate = p_rotate
         self.brightness_range = brightness_range
         self.contrast_range = contrast_range
         self.noise_std = noise_std
         self.p_color = p_color
+        self.p_clahe = p_clahe
+        self.p_gamma = p_gamma
+        self.p_motion_blur = p_motion_blur
+        self.p_gaussian_blur = p_gaussian_blur
+        self.p_cutmix = p_cutmix
+
+    # ── CLAHE: 自适应直方图均衡化 | Adaptive Histogram Equalization ──
+
+    @staticmethod
+    def _apply_clahe(image: torch.Tensor) -> torch.Tensor:
+        """
+        CLAHE (Contrast Limited Adaptive Histogram Equalization).
+        对低对比度缺陷 (Inclusion) 特别有效 | Especially effective for low-contrast defects.
+
+        在 LAB 色彩空间的 L 通道上应用 CLAHE, 避免色彩失真。
+        Apply CLAHE on L channel in LAB color space to avoid color distortion.
+
+        :param image: [3, H, W] float32 in [0, 1].
+        :return: [3, H, W] float32 in [0, 1].
+        """
+        import cv2
+        # [C, H, W] → [H, W, C] uint8
+        img_np = (image.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        # RGB → LAB
+        lab = cv2.cvtColor(img_np, cv2.COLOR_RGB2LAB)
+        l, a, b = cv2.split(lab)
+        # CLAHE on L channel
+        clahe = cv2.createCLAHE(
+            clipLimit=np.random.uniform(1.0, 4.0),
+            tileGridSize=(8, 8),
+        )
+        l_eq = clahe.apply(l)
+        # Merge + LAB → RGB
+        lab_eq = cv2.merge([l_eq, a, b])
+        img_eq = cv2.cvtColor(lab_eq, cv2.COLOR_LAB2RGB)
+        # Back to [C, H, W] float
+        return torch.from_numpy(img_eq.astype(np.float32) / 255.0).permute(2, 0, 1)
+
+    # ── RandomGamma: 伽马校正 | Gamma Correction ──
+
+    @staticmethod
+    def _apply_random_gamma(image: torch.Tensor) -> torch.Tensor:
+        """
+        随机伽马校正 | Random Gamma Correction.
+        模拟不同光照条件, 解决 52.9% 过曝问题。
+        Simulates varying illumination, addresses 52.9% overexposure issue.
+
+        gamma < 1: 增亮暗区 (reveal dark Inclusion details)
+        gamma > 1: 压暗亮区 (reduce overexposure)
+
+        :param image: [3, H, W] float32 in [0, 1].
+        :return: [3, H, W] float32 in [0, 1].
+        """
+        gamma = np.random.uniform(0.5, 2.0)  # 0.5→brighten, 2.0→darken
+        return torch.clamp(image ** gamma, 0.0, 1.0)
+
+    # ── MotionBlur: 运动模糊 | Motion Blur ──
+
+    @staticmethod
+    def _apply_motion_blur(image: torch.Tensor) -> torch.Tensor:
+        """
+        运动模糊核 | Motion Blur Kernel.
+        模拟相机/物体运动, 增强对模糊测试集的鲁棒性 (50.8% blurry)。
+        Simulates camera/object motion, improves robustness to blurry test images.
+
+        :param image: [3, H, W] float32 in [0, 1].
+        :return: [3, H, W] float32 in [0, 1].
+        """
+        import cv2
+        # Random kernel size (3-7) and angle
+        kernel_size = np.random.choice([3, 5, 7])
+        angle = np.random.uniform(0, 180)
+        # Create motion blur kernel
+        kernel = np.zeros((kernel_size, kernel_size), dtype=np.float32)
+        center = kernel_size // 2
+        # 水平线 + 旋转 | Horizontal line + rotation
+        kernel[center, :] = 1.0 / kernel_size
+        # 旋转核 | Rotate kernel
+        rot_mat = cv2.getRotationMatrix2D((center, center), angle, 1.0)
+        kernel = cv2.warpAffine(kernel, rot_mat, (kernel_size, kernel_size))
+        kernel = kernel / kernel.sum()
+        # Apply to each channel
+        img_np = (image.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        blurred = cv2.filter2D(img_np, -1, kernel)
+        return torch.from_numpy(blurred.astype(np.float32) / 255.0).permute(2, 0, 1)
+
+    # ── GaussianBlur: 高斯模糊 | Gaussian Blur ──
+
+    @staticmethod
+    def _apply_gaussian_blur(image: torch.Tensor) -> torch.Tensor:
+        """
+        高斯模糊 | Gaussian Blur.
+        模拟对焦不准, 增强模型对模糊输入的鲁棒性。
+        Simulates defocus, improves robustness to blurry inputs.
+
+        :param image: [3, H, W] float32 in [0, 1].
+        :return: [3, H, W] float32 in [0, 1].
+        """
+        import cv2
+        sigma = np.random.uniform(0.5, 2.0)
+        kernel_size = int(2 * np.ceil(3 * sigma) + 1)  # 99.7% within ±3σ
+        img_np = (image.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        blurred = cv2.GaussianBlur(img_np, (kernel_size, kernel_size), sigma)
+        return torch.from_numpy(blurred.astype(np.float32) / 255.0).permute(2, 0, 1)
 
     def __call__(self, image: torch.Tensor, mask: torch.Tensor
                  ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -433,7 +595,9 @@ class NEUSegAugmentation:
             image = torch.rot90(image, k, dims=[-2, -1])
             mask = torch.rot90(mask, k, dims=[-2, -1])
 
-        # ── 颜色变换 (仅图像) | Color transforms (image only) ──
+        # ── 颜色/光照变换 (仅图像) | Color/Illumination transforms (image only) ──
+
+        # Brightness + Contrast (原有 | original)
         if torch.rand(1).item() < self.p_color:
             brightness = 1.0 + (torch.rand(1).item() * 2 - 1) * self.brightness_range
             image = torch.clamp(image * brightness, 0.0, 1.0)
@@ -442,7 +606,23 @@ class NEUSegAugmentation:
             mean_val = image.mean(dim=(-2, -1), keepdim=True)
             image = torch.clamp((image - mean_val) * contrast + mean_val, 0.0, 1.0)
 
-        # ── 高斯噪声 (模拟模糊鲁棒性) | Gaussian noise (blur robustness) ──
+        # CLAHE: 局部对比度增强 | Local contrast enhancement (v2 新增)
+        if torch.rand(1).item() < self.p_clahe:
+            image = self._apply_clahe(image)
+
+        # RandomGamma: 伽马校正 | Gamma correction (v2 新增)
+        if torch.rand(1).item() < self.p_gamma:
+            image = self._apply_random_gamma(image)
+
+        # MotionBlur: 运动模糊 | Motion blur (v2 新增)
+        if torch.rand(1).item() < self.p_motion_blur:
+            image = self._apply_motion_blur(image)
+
+        # GaussianBlur: 高斯模糊 | Gaussian blur (v2 新增)
+        if torch.rand(1).item() < self.p_gaussian_blur:
+            image = self._apply_gaussian_blur(image)
+
+        # ── 噪声 (最后应用) | Noise (applied last) ──
         if torch.rand(1).item() < 0.5:
             noise = torch.randn_like(image) * self.noise_std
             image = torch.clamp(image + noise, 0.0, 1.0)
@@ -506,6 +686,7 @@ def evaluate(
     adapter: nn.Module | None = None,
     spectral_attn: nn.Module | None = None,
     freq_fusion: nn.Module | None = None,
+    freq_enhancer: nn.Module | None = None,
 ) -> dict:
     """
     多类别评估 — per-class mIoU + Dice | Multi-class evaluation — per-class mIoU + Dice.
@@ -547,6 +728,13 @@ def evaluate(
                 p2=feats.get("p2"), p3=feats.get("p3"), p4=feats.get("p4"),
             )
             feats.update(spec_feats)
+
+        # ── Encoder-side Frequency Enhancer | FFT 频域滤波 ──
+        if freq_enhancer is not None:
+            freq_feats = freq_enhancer(
+                p2=feats.get("p2"), p3=feats.get("p3"), p4=feats.get("p4"),
+            )
+            feats.update(freq_feats)
 
         pred_prob = _decoder_forward(decoder, feats, support_cache,
                                      freq_fusion=freq_fusion)
@@ -717,6 +905,14 @@ def parse_args():
     p.add_argument("--no-freeze-backbone", dest="freeze_backbone",
                    action="store_false",
                    help="解冻 backbone | Unfreeze backbone")
+    p.add_argument("--lora-rank", type=int, default=0,
+                   help="ConvLoRA 秩 (0=禁用, 建议 4-8) | "
+                        "ConvLoRA rank (0=disabled, recommend 4-8)")
+    p.add_argument("--lora-alpha", type=float, default=1.0,
+                   help="ConvLoRA 缩放因子 | ConvLoRA scaling factor")
+    p.add_argument("--lora-layers", type=str, default=None,
+                   help="LoRA 目标层名称 (逗号分隔, 如 'C2f,Conv') | "
+                        "LoRA target layer names (comma-separated, e.g. 'C2f,Conv')")
 
     # ── CAT-SAM Adapter | 特征域适配器 ──
     p.add_argument("--use-adapter", action="store_true", default=False,
@@ -728,6 +924,9 @@ def parse_args():
     p.add_argument("--use-freq-fusion", action="store_true", default=False,
                    help="使用 FrequencyGuidedFusion 替代 BiFPN 固定权重 (仅 pure_p2p3p4) | "
                         "Use frequency-guided fusion instead of BiFPN")
+    p.add_argument("--use-freq-enhancer", action="store_true", default=False,
+                   help="插入 MultiScaleFrequencyEnhancer (Encoder-side FFT 频域滤波) | "
+                        "Insert encoder-side FFT frequency-domain enhancer")
 
     # ── 数据增强 | Data Augmentation ──
     p.add_argument("--augment", action="store_true", default=False,
@@ -741,6 +940,9 @@ def parse_args():
     p.add_argument("--loss-type", type=str, default="ce_dice",
                    choices=["ce_dice", "lovasz", "spectral"],
                    help="损失函数: 'ce_dice' (CE+Dice) / 'lovasz' (CE+Dice+Lovász) / 'spectral' (CE+Dice+Spectral)")
+    p.add_argument("--boundary-weight", type=float, default=0.0,
+                   help="边界感知损失权重 (0=禁用, 建议 0.1-0.3) | "
+                        "Boundary-aware loss weight (0=disabled, recommend 0.1-0.3)")
 
     # ── 优化器 | Optimizer ──
     p.add_argument("--lr", type=float, default=1e-4,
@@ -779,8 +981,12 @@ def main():
         adapter_suffix = "_Ada" if args.use_adapter else ""
         spectral_suffix = "_Spec" if args.use_spectral else ""
         freq_fusion_suffix = "_FreqFuse" if args.use_freq_fusion else ""
+        freq_enhancer_suffix = "_FreqEnh" if args.use_freq_enhancer else ""
         loss_suffix = f"_{args.loss_type}" if args.loss_type != "ce_dice" else ""
-        args.output_dir = f"runs/neuseg_{dec_short}{adapter_suffix}{spectral_suffix}{freq_fusion_suffix}{loss_suffix}_{args.backbone}_{ts}"
+        lora_suffix = f"_LoRA{args.lora_rank}" if args.lora_rank > 0 else ""
+        bw_suffix = f"_BW{args.boundary_weight:.1f}" if args.boundary_weight > 0 else ""
+        aug_suffix = "_AugV2" if args.augment else ""
+        args.output_dir = f"runs/neuseg_{dec_short}{adapter_suffix}{spectral_suffix}{freq_fusion_suffix}{freq_enhancer_suffix}{loss_suffix}{lora_suffix}{bw_suffix}{aug_suffix}_{args.backbone}_{ts}"
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -839,6 +1045,21 @@ def main():
     decoder = build_decoder(args.decoder_type, args.proto_source, logger,
                             backbone=backbone, device=device).to(device)
 
+    # ── ConvLoRA: 将低秩适配器注入 backbone (True Backbone LoRA) ──
+    # Inject low-rank adapters into frozen backbone for domain adaptation
+    if args.lora_rank > 0:
+        lora_layer_names = (args.lora_layers.split(",")
+                           if args.lora_layers else None)
+        lora_params = backbone.apply_conv_lora(
+            rank=args.lora_rank, alpha=args.lora_alpha,
+            target_layer_names=lora_layer_names,
+        )
+        logger.log_info("model",
+            f"ConvLoRA injected: rank={args.lora_rank}, "
+            f"+{lora_params:,} params ({lora_params/1e3:.1f}K)")
+        logger.log_info("model",
+            f"LoRA targets: {lora_layer_names or 'all Conv2d in neck'}")
+
     # ── Auto-detect channels from backbone (after probing via build_decoder) | 从 backbone 自动获取通道数 ──
     ch = backbone.channels if all(v > 0 for v in backbone.channels.values()) else \
          {"p2": 160, "p3": 960, "p4": 1280, "p8": 1280}  # fallback
@@ -872,6 +1093,16 @@ def main():
         ff_params = sum(p.numel() for p in freq_fusion.parameters())
         logger.log_info("model", f"FrequencyGuidedFusion: {ff_params:,} params (dynamic weights)")
 
+    # ── Encoder-side Frequency Enhancer (FFT 频域滤波) | Frequency-domain feature filter ──
+    freq_enhancer = None
+    if args.use_freq_enhancer:
+        freq_enhancer = MultiScaleFrequencyEnhancer(
+            p2_channels=ch["p2"], p3_channels=ch["p3"], p4_channels=ch["p4"],
+            reduction=4,
+        ).to(device)
+        fe_params = sum(p.numel() for p in freq_enhancer.parameters())
+        logger.log_info("model", f"MultiScaleFrequencyEnhancer: {fe_params:,} params (FFT band filter)")
+
     trainable_params = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
     if adapter is not None:
         trainable_params += sum(p.numel() for p in adapter.parameters())
@@ -879,6 +1110,8 @@ def main():
         trainable_params += sum(p.numel() for p in spectral_attn.parameters())
     if freq_fusion is not None:
         trainable_params += sum(p.numel() for p in freq_fusion.parameters())
+    if freq_enhancer is not None:
+        trainable_params += sum(p.numel() for p in freq_enhancer.parameters())
     logger.log_info("model", f"Total trainable params: {trainable_params:,}")
 
     # ── 优化器 | Optimizer ──
@@ -889,6 +1122,15 @@ def main():
         optim_params += list(spectral_attn.parameters())
     if freq_fusion is not None:
         optim_params += list(freq_fusion.parameters())
+    if freq_enhancer is not None:
+        optim_params += list(freq_enhancer.parameters())
+    # ConvLoRA 参数 (backbone 内部的低秩适配器) | ConvLoRA params (low-rank adapters inside backbone)
+    if args.lora_rank > 0:
+        lora_params_list = backbone.get_lora_parameters()
+        optim_params += lora_params_list
+        logger.log_info("model",
+            f"Optimizer includes {len(lora_params_list)} LoRA param tensors "
+            f"({sum(p.numel() for p in lora_params_list):,} values)")
     optimizer = torch.optim.AdamW(
         optim_params, lr=args.lr, weight_decay=args.weight_decay,
     )
@@ -1002,6 +1244,13 @@ def main():
                 )
                 feats.update(spec_feats)
 
+            # ── Encoder-side Frequency Enhancer | FFT 频域滤波 ──
+            if freq_enhancer is not None:
+                freq_feats = freq_enhancer(
+                    p2=feats.get("p2"), p3=feats.get("p3"), p4=feats.get("p4"),
+                )
+                feats.update(freq_feats)
+
             pred_prob = _decoder_forward(decoder, feats, support_cache,
                                          freq_fusion=freq_fusion)
             if pred_prob is None:
@@ -1015,10 +1264,19 @@ def main():
 
             # ── Loss ──
             target = query_mask_dev.squeeze(0).long()
+
+            # 边界权重 (Boundary-aware) | Boundary weight map
+            bw = None
+            if args.boundary_weight > 0:
+                bw = boundary_weight_map(
+                    target.unsqueeze(0), sigma=3.0
+                ).squeeze(0)  # [H, W]
+
             if args.loss_type == "lovasz":
                 loss_val, loss_dict = lovasz_combined_loss(
                     pred_full.unsqueeze(0), target.unsqueeze(0),
                     ce_weight=ce_weight,
+                    boundary_weight=bw.unsqueeze(0) if bw is not None else None,
                 )
             elif args.loss_type == "spectral":
                 loss_val, loss_dict = spectral_combined_loss(
@@ -1029,6 +1287,7 @@ def main():
                 loss_val, loss_dict = multiclass_combined_loss(
                     pred_full.unsqueeze(0), target.unsqueeze(0),
                     ce_weight=ce_weight,
+                    boundary_weight=bw.unsqueeze(0) if bw is not None else None,
                 )
 
             if torch.isnan(loss_val) or torch.isinf(loss_val):
@@ -1050,6 +1309,13 @@ def main():
                 all_params += list(spectral_attn.named_parameters())
             if freq_fusion is not None:
                 all_params += list(freq_fusion.named_parameters())
+            if freq_enhancer is not None:
+                all_params += list(freq_enhancer.named_parameters())
+            # ConvLoRA 参数 | ConvLoRA parameters
+            if args.lora_rank > 0:
+                for module in backbone.model.model.modules():
+                    if module.__class__.__name__ == "ConvLoRA":
+                        all_params += list(module.named_parameters())
             for name, param in all_params:
                 if param.grad is not None:
                     if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
@@ -1110,6 +1376,7 @@ def main():
                 decoder, backbone, support_cache, val_ds, device,
                 num_classes=NUM_CLASSES, adapter=adapter,
                 spectral_attn=spectral_attn, freq_fusion=freq_fusion,
+                freq_enhancer=freq_enhancer,
             )
             miou = eval_result["mIoU"]
             dice = np.mean(list(eval_result.get("per_class_Dice", {}).values()))
@@ -1149,6 +1416,21 @@ def main():
                 if freq_fusion is not None:
                     checkpoint["freq_fusion_state_dict"] = {k: v.clone() for k, v
                         in freq_fusion.state_dict().items()}
+                if freq_enhancer is not None:
+                    checkpoint["freq_enhancer_state_dict"] = {k: v.clone() for k, v
+                        in freq_enhancer.state_dict().items()}
+                # ConvLoRA 权重 | ConvLoRA weights
+                if args.lora_rank > 0:
+                    lora_state = {}
+                    for module in backbone.model.model.modules():
+                        if module.__class__.__name__ == "ConvLoRA":
+                            lora_state[f"lora_down"] = module.lora_down.state_dict()
+                            lora_state[f"lora_up"] = module.lora_up.state_dict()
+                    # 更好的做法: 保存整个 backbone model state (但只保存 LoRA 部分)
+                    # Better: save full backbone state but only LoRA params are trainable
+                    lora_weights = {k: v.clone() for k, v in backbone.model.model.state_dict().items()
+                                   if any(x in k for x in ["lora_down", "lora_up"])}
+                    checkpoint["lora_state_dict"] = lora_weights
                 if isinstance(support_cache, tuple):
                     checkpoint["support_proto_p3"] = support_cache[0].clone()
                     checkpoint["support_proto_p4"] = support_cache[1].clone()

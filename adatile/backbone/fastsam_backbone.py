@@ -577,6 +577,93 @@ class FastSAMBackbone(nn.Module):
         )
         return n_params
 
+    def apply_conv_lora(self, rank: int = 4, alpha: float = 1.0,
+                        target_layers: list[int] | None = None,
+                        target_layer_names: list[str] | None = None) -> int:
+        """
+        将 ConvLoRA 注入 YOLOv8 backbone 的 Conv2d 层 (真正的 Backbone LoRA)。
+        Inject ConvLoRA into YOLOv8 backbone Conv2d layers (True Backbone LoRA).
+
+        与 apply_lora() 的区别 | Difference from apply_lora():
+            apply_lora(): 在 P3/P4 输出后添加特征空间适配器 (backbone 外部)
+            apply_conv_lora(): 替换 backbone 内部的 Conv2d 为 ConvLoRA (backbone 内部)
+
+        默认目标: neck 区域 (最后 16 层的前 14 层, 即 P3/P4 特征形成区域)。
+        Default target: neck region (first 14 of last 16 layers, P3/P4 formation zone).
+
+        原理 | Principle:
+            冻结 SA-1B 训练的原始卷积权重, 注入低秩可训练旁路。
+            旁路初始化为零 → 训练从原始行为开始逐步偏离 → 适应工业纹理域。
+            Freeze SA-1B original conv weights, inject low-rank trainable bypass.
+            Bypass initialized to zero → starts from original behavior → adapts to industrial textures.
+
+        :param rank: LoRA 秩 | LoRA rank (建议 4-8 | recommend 4-8).
+        :param alpha: LoRA 缩放因子 | LoRA scaling factor (default 1.0).
+        :param target_layers: 目标层索引列表 (None=自动选择 neck 区域).
+                              Target layer indices (None=auto-select neck region).
+        :param target_layer_names: 按层名称过滤 (如 ["C2f", "Conv"]), None=不过滤.
+                                   Filter by layer class name (e.g. ["C2f", "Conv"]).
+        :return: 添加的 LoRA 参数数量 | Number of LoRA parameters added.
+        """
+        sequential = self.model.model.model
+        total_layers = len(sequential)
+
+        if target_layers is None:
+            # 默认: neck 区域, 最后 16 层中排除 Detect head (最后 2 层)
+            # Default: neck region, last 16 layers excluding Detect head (last 2)
+            target_layers = list(range(max(0, total_layers - 16), total_layers - 1))
+
+        lora_params = 0
+        injected_layers = []
+
+        for idx in target_layers:
+            if idx >= total_layers:
+                continue
+            layer = sequential[idx]
+            layer_name = layer.__class__.__name__
+
+            # 按名称过滤 | Filter by name
+            if target_layer_names and layer_name not in target_layer_names:
+                continue
+
+            # 注入 ConvLoRA 到该层的所有 Conv2d 子模块
+            n = _inject_conv_lora(layer, rank=rank, alpha=alpha,
+                                  path=f"layer_{idx}({layer_name})")
+            if n > 0:
+                lora_params += n
+                injected_layers.append(f"{idx}({layer_name})")
+
+        self._has_conv_lora = True
+        self._lora_rank = rank
+
+        self.logger.log_info(
+            "backbone/conv_lora",
+            f"ConvLoRA injected: rank={rank}, alpha={alpha}, "
+            f"layers={injected_layers}, +{lora_params:,} trainable params "
+            f"({lora_params/1e3:.1f}K)",
+        )
+        return lora_params
+
+    def get_lora_parameters(self) -> list[nn.Parameter]:
+        """
+        获取所有 LoRA 可训练参数 (ConvLoRA + Feature LoRA).
+        Get all LoRA trainable parameters (ConvLoRA + Feature LoRA).
+
+        :return: 可训练参数列表 | List of trainable parameters.
+        """
+        params = []
+        # ConvLoRA 参数 (backbone 内部)
+        if getattr(self, '_has_conv_lora', False):
+            for module in self.model.model.modules():
+                if isinstance(module, ConvLoRA):
+                    params.extend(module.lora_down.parameters())
+                    params.extend(module.lora_up.parameters())
+        # Feature LoRA 参数 (backbone 外部, P3/P4 适配器)
+        if getattr(self, '_has_lora', False):
+            params.extend(self._lora_p3.parameters())
+            params.extend(self._lora_p4.parameters())
+        return params
+
     # ── 前向传播 | Forward Pass ───────────────────────────────
 
     def _forward_features(self, x: torch.Tensor) -> None:
@@ -662,7 +749,10 @@ class FastSAMBackbone(nn.Module):
 
         self._features.clear()
 
-        with torch.set_grad_enabled(not self._freeze_backbone):
+        # ── 梯度控制: LoRA 激活时允许梯度流 (即使 backbone 其他参数冻结) ──
+        # Gradient control: enable grad flow when LoRA is active (even if backbone is frozen)
+        _need_grad = (not self._freeze_backbone) or getattr(self, '_has_conv_lora', False)
+        with torch.set_grad_enabled(_need_grad):
             self._forward_features(x)
 
         result: dict[str, torch.Tensor] = {}
@@ -734,6 +824,12 @@ class ConvLoRA(nn.Module):
 
     y = W*x + (alpha/r) * B(A(x))
     原始权重 W 冻结，仅训练 A 和 B。
+    Original weight W frozen, only A and B trained.
+
+    用于注入 YOLOv8 backbone 的 Conv2d 层，
+    使冻结的 SA-1B 特征适应工业纹理域。
+    Injects into YOLOv8 backbone Conv2d layers,
+    adapting frozen SA-1B features to industrial texture domain.
     """
 
     def __init__(self, conv: nn.Conv2d, rank: int = 4, alpha: float = 1.0):
@@ -747,11 +843,23 @@ class ConvLoRA(nn.Module):
         for p in conv.parameters():
             p.requires_grad = False
 
-        # LoRA: 1×1 down → 1×1 up
+        # LoRA: 1×1 down → 1×1 up (低秩分解 | Low-rank decomposition)
         in_ch = conv.in_channels
         out_ch = conv.out_channels
+        kernel_size = conv.kernel_size
+        stride = conv.stride
+        padding = conv.padding
+        dilation = conv.dilation
+        groups = conv.groups
+
+        # LoRA A: C_in × rank (降维 | Down-projection)
         self.lora_down = nn.Conv2d(in_ch, rank, 1, bias=False)
-        self.lora_up = nn.Conv2d(rank, out_ch, 1, bias=False)
+        # LoRA B: rank × C_out (升维 | Up-projection)
+        self.lora_up = nn.Conv2d(rank, out_ch, kernel_size=kernel_size,
+                                 stride=stride, padding=padding,
+                                 dilation=dilation, groups=1, bias=False)
+
+        # 初始化 | Initialization
         nn.init.kaiming_uniform_(self.lora_down.weight, a=5**0.5)
         nn.init.zeros_(self.lora_up.weight)
 
@@ -762,6 +870,56 @@ class ConvLoRA(nn.Module):
         y = self.conv(x)
         lora_y = self.lora_up(self.lora_down(x))
         return y + self.scale * lora_y
+
+
+def _inject_conv_lora(module: nn.Module, rank: int = 4, alpha: float = 1.0,
+                       path: str = "") -> int:
+    """
+    递归替换模块树中的 Conv2d 为 ConvLoRA | Recursively replace Conv2d with ConvLoRA.
+
+    遍历 module 的所有子模块，将 nn.Conv2d 替换为 ConvLoRA 包装器。
+    Walk through all children of module, replace nn.Conv2d with ConvLoRA wrappers.
+
+    跳过 1×1 Conv (已经是低秩), 跳过 depthwise Conv (groups>1)。
+    Skip 1×1 Conv (already low-rank), skip depthwise Conv (groups>1).
+
+    :param module: 根模块 | Root module.
+    :param rank: LoRA 秩 | LoRA rank.
+    :param alpha: LoRA 缩放因子 | LoRA scaling factor.
+    :param path: 当前模块路径 (调试用) | Current module path (for debugging).
+    :return: 添加的 LoRA 参数数量 | Number of LoRA parameters added.
+    """
+    n_added = 0
+    for name, child in module.named_children():
+        child_path = f"{path}.{name}" if path else name
+        if isinstance(child, nn.Conv2d):
+            # 跳过 1×1 Conv (已低秩) 和 depthwise Conv | Skip 1×1 and depthwise
+            if child.kernel_size == (1, 1) or child.groups > 1:
+                continue
+            # 替换为 ConvLoRA | Replace with ConvLoRA
+            lora_conv = ConvLoRA(child, rank=rank, alpha=alpha)
+            setattr(module, name, lora_conv)
+            n_added += lora_conv.lora_params
+        elif isinstance(child, ConvLoRA):
+            # 已经注入过，跳过 | Already injected, skip
+            continue
+        else:
+            n_added += _inject_conv_lora(child, rank, alpha, child_path)
+    return n_added
+
+
+def _collect_lora_modules(module: nn.Module) -> list["ConvLoRA"]:
+    """
+    收集模块树中的所有 ConvLoRA 模块 | Collect all ConvLoRA modules in module tree.
+
+    :param module: 根模块 | Root module.
+    :return: ConvLoRA 模块列表 | List of ConvLoRA modules.
+    """
+    lora_modules = []
+    for child in module.modules():
+        if isinstance(child, ConvLoRA):
+            lora_modules.append(child)
+    return lora_modules
 
 
 
