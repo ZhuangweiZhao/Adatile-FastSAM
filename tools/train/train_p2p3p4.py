@@ -42,7 +42,6 @@ import numpy as np
 from tqdm import tqdm
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 from adatile.logging import get_logger
@@ -133,61 +132,6 @@ def evaluate(decoder, backbone, dataset, device, use_p2=True, max_samples=0):
     return {"mIoU": round(float(np.mean(valid)), 6) if valid else 0.0, "per_class_IoU": per_class_iou}
 
 
-# ═══════════════════════════════════════════════════════════════════
-# LoRA 注入 (可选) | LoRA Injection (optional)
-# ═══════════════════════════════════════════════════════════════════
-
-class ConvLoRA(nn.Module):
-    """极简 Conv2d LoRA: W' = W + B·A (zero-init)."""
-    def __init__(self, conv: nn.Conv2d, rank: int = 2):
-        super().__init__()
-        self.conv = conv
-        out_ch, in_ch = conv.weight.shape[:2]
-        # 冻结原权重 | Freeze original weights
-        conv.weight.requires_grad_(False)
-        if conv.bias is not None:
-            conv.bias.requires_grad_(False)
-        # LoRA: B (out×k×1×1), A (k×in×1×1)
-        self.A = nn.Parameter(torch.randn(rank, in_ch, 1, 1) * 0.02)
-        self.B = nn.Parameter(torch.zeros(out_ch, rank, 1, 1))
-        self.rank = rank
-
-    def forward(self, x):
-        base = self.conv(x)
-        # BA: [out_ch, in_ch] ← B [out_ch, rank] @ A [rank, in_ch]
-        ba = (self.B * self.A.sum(dim=0, keepdim=True)).sum(dim=1)
-        # 实际卷积: BA as 1×1 conv on x
-        lora_out = F.conv2d(x, self.B.squeeze(-1).squeeze(-1) @ self.A.squeeze(-1).squeeze(-1),
-                            bias=None, stride=self.conv.stride, padding=self.conv.padding)
-        return base + lora_out
-
-
-def inject_lora_into_neck(backbone, rank: int = 2):
-    """
-    将 ConvLoRA 注入 YOLOv8 neck 的 Conv2d 层。
-    Inject ConvLoRA into YOLOv8 neck Conv2d layers.
-    """
-    lora_modules = []
-    model = backbone.model.model  # YOLOv8 internal model
-
-    def _inject(module, prefix=""):
-        for name, child in module.named_children():
-            full = f"{prefix}.{name}" if prefix else name
-            if isinstance(child, nn.Conv2d) and child.in_channels == child.out_channels:
-                # 只注入 neck 中的方阵 Conv2d (常见于 neck fusion)
-                lora = ConvLoRA(child, rank=rank)
-                setattr(module, name, lora)
-                lora_modules.append(lora)
-            elif isinstance(child, (nn.Sequential, nn.Module)):
-                _inject(child, full)
-
-    # 注入 neck 层 | Inject into neck layers
-    if hasattr(model, 'model') and hasattr(model.model, '__iter__'):
-        for i, layer in enumerate(model.model):
-            if hasattr(layer, 'cv1') or hasattr(layer, 'cv2'):
-                _inject(layer, f"model.{i}")
-
-    return lora_modules
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -260,11 +204,10 @@ def main():
         backbone(torch.randn(1, 3, 224, 224, device=device), extract_proto=False)
     ch = backbone.channels
 
-    # ── LoRA 注入 (可选) ──
-    lora_modules = []
+    # ── LoRA 注入 (可选) | LoRA Injection (optional) ──
+    lora_params = 0
     if args.lora_rank > 0:
-        lora_modules = inject_lora_into_neck(backbone, rank=args.lora_rank)
-        logger.log_info("model", f"LoRA: rank={args.lora_rank}, {len(lora_modules)} layers injected")
+        lora_params = backbone.apply_conv_lora(rank=args.lora_rank)
 
     # ── Decoder ──
     if use_p2:
@@ -278,15 +221,14 @@ def main():
         ).to(device)
 
     dec_p = sum(p.numel() for p in decoder.parameters())
-    lora_p = sum(p.numel() for m in lora_modules for p in m.parameters()) if lora_modules else 0
-    total_p = dec_p + lora_p
-    logger.log_info("model", f"Decoder: {dec_p/1e3:.1f}K | LoRA: {lora_p/1e3:.1f}K | Total: {total_p/1e3:.1f}K ({total_p:,})")
+    total_p = dec_p + lora_params
+    logger.log_info("model", f"Decoder: {dec_p/1e3:.1f}K | LoRA: {lora_params/1e3:.1f}K | Total: {total_p/1e3:.1f}K ({total_p:,})")
     logger.log_info("model", f"Backbone P2: {ch['p2']}ch, P3: {ch['p3']}ch, P4: {ch['p4']}ch")
 
     # ── Optimizer ──
     optim_params = list(decoder.parameters())
-    if lora_modules:
-        optim_params += [p for m in lora_modules for p in m.parameters() if p.requires_grad]
+    if args.lora_rank > 0:
+        optim_params += backbone.get_lora_parameters()
     optimizer = torch.optim.AdamW(optim_params, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs * args.steps_per_epoch)
 
