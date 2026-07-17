@@ -181,7 +181,9 @@ def evaluate_neuseg(
             union = (pred_c | gt_c).sum()
             per_class_inter[c] += inter
             per_class_union[c] += union
-            if gt_c.sum() > 0 and union > 0:
+            # 统一口径: 类别出现在 GT 或预测中即计入 (与 eval_segnext/eval_baseline 一致)
+            # Unified gate: count class if present in GT OR prediction (same as other evaluators)
+            if union > 0:
                 sample_iou += (inter / union).item()
                 n_classes_present += 1
 

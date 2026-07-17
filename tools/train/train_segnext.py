@@ -389,8 +389,11 @@ def evaluate_segnext(backbone: MSCAN, head: LightHamHead,
 
     mIoU = float(np.mean(ious))
     pixel_acc = total_correct / max(total_pixels, 1)
-    dice = float(2 * per_class_intersection.sum() /
-                 max(per_class_intersection.sum() + per_class_union.sum(), 1))
+    # Macro Dice: 逐类 2I/(I+U) ≡ 2TP/(2TP+FP+FN) 后取均值 (全仓库统一定义)
+    # Macro Dice: per-class 2I/(I+U), then mean — unified definition repo-wide
+    dices = 2 * per_class_intersection / np.maximum(
+        per_class_intersection + per_class_union, 1)
+    dice = float(np.mean(dices))
 
     return {
         "mIoU": round(mIoU, 6),

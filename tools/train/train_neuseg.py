@@ -520,9 +520,6 @@ def evaluate(
 
     per_class_inter = torch.zeros(num_classes, device=device)
     per_class_union = torch.zeros(num_classes, device=device)
-    per_class_tp = torch.zeros(num_classes, device=device)
-    per_class_fp = torch.zeros(num_classes, device=device)
-    per_class_fn = torch.zeros(num_classes, device=device)
     per_sample = []
 
     indices = list(range(len(dataset)))
@@ -574,16 +571,12 @@ def evaluate(
             union = (pred_c | gt_c).sum()
             per_class_inter[c] += inter
             per_class_union[c] += union
-            if gt_c.sum() > 0:
-                tp = inter
-                fp = (pred_c & ~gt_c).sum()
-                fn = (~pred_c & gt_c).sum()
-                per_class_tp[c] += tp
-                per_class_fp[c] += fp
-                per_class_fn[c] += fn
-                if union > 0:
-                    sample_iou += (inter / union).item()
-                    n_classes_present += 1
+            # 统一口径: 类别出现在 GT 或预测中即计入 per-sample IoU
+            # Unified gate: count class if present in GT OR prediction
+            # (与 evaluate_segnext / evaluate_baseline 一致 | same as other evaluators)
+            if union > 0:
+                sample_iou += (inter / union).item()
+                n_classes_present += 1
 
         sample_miou = sample_iou / max(n_classes_present, 1)
         per_sample.append({
@@ -603,13 +596,13 @@ def evaluate(
     valid_ious = [v for v in per_class_iou.values() if not (v != v)]  # NaN check
     miou = np.mean(valid_ious) if valid_ious else 0.0
 
-    # ── Per-class Dice ──
+    # ── Per-class Dice (Macro, 由 inter/union 导出: 2I/(I+U) ≡ 2TP/(2TP+FP+FN)) ──
+    # Macro Dice derived from inter/union — unified definition across all evaluators
     per_class_dice = {}
     for c in range(num_classes):
-        tp = per_class_tp[c].item()
-        fp = per_class_fp[c].item()
-        fn = per_class_fn[c].item()
-        dice_c = (2 * tp) / (2 * tp + fp + fn + 1e-6)
+        inter = per_class_inter[c].item()
+        union = per_class_union[c].item()
+        dice_c = (2 * inter) / (inter + union + 1e-6)
         per_class_dice[CLASS_NAMES[c]] = round(dice_c, 6)
 
     return {
