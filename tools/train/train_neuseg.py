@@ -871,33 +871,131 @@ def build_decoder(decoder_type: str, proto_source: str, logger,
 # 参数解析 | Argument Parsing
 # ═══════════════════════════════════════════════════════════════════
 
-def parse_args():
+def _load_yaml_config(config_path: str) -> dict:
+    """从 YAML 配置文件加载参数 | Load parameters from YAML config file."""
+    import yaml
+    with open(config_path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def _yaml_to_arg_defaults(config: dict) -> dict:
+    """
+    从 YAML 配置提取 argparse 默认值映射。
+    Extract argparse default value mapping from YAML config.
+
+    嵌套路径 → argparse dest; 未找到返回空 | missing paths return None (skip).
+    """
+    def _get(d: dict, *keys):
+        for k in keys:
+            if isinstance(d, dict) and k in d:
+                d = d[k]
+            else:
+                return None
+        return d
+
+    mapping = {}
+
+    # Data
+    mapping["data_root"] = _get(config, "data", "data_root")
+
+    # Few-shot
+    mapping["k_support"] = _get(config, "fewshot", "k_support")
+    mapping["steps_per_epoch"] = _get(config, "fewshot", "steps_per_epoch")
+
+    # Decoder
+    mapping["decoder_type"] = _get(config, "decoder", "type")
+    mapping["proto_source"] = _get(config, "decoder", "proto_source")
+
+    # Backbone
+    mapping["backbone"] = _get(config, "backbone", "model")
+    mapping["lora_rank"] = _get(config, "backbone", "lora", "rank")
+    mapping["lora_alpha"] = _get(config, "backbone", "lora", "alpha")
+
+    # Adapter
+    mapping["use_adapter"] = _get(config, "adapter", "enabled")
+
+    # Frequency
+    mapping["use_spectral"] = _get(config, "frequency", "spectral_attention")
+    mapping["use_freq_fusion"] = _get(config, "frequency", "freq_fusion")
+    mapping["use_freq_enhancer"] = _get(config, "frequency", "freq_enhancer")
+
+    # Augmentation
+    mapping["augment"] = _get(config, "augmentation", "enabled")
+
+    # Loss
+    mapping["loss_type"] = _get(config, "loss", "type")
+    mapping["class_weights"] = _get(config, "loss", "class_weights")
+    mapping["boundary_weight"] = _get(config, "loss", "boundary_weight")
+
+    # Training
+    mapping["epochs"] = _get(config, "train", "epochs")
+    mapping["lr"] = _get(config, "train", "lr")
+    mapping["weight_decay"] = _get(config, "train", "weight_decay")
+    mapping["eval_every"] = _get(config, "train", "eval_every")
+
+    # Seed
+    mapping["seed"] = _get(config, "seed")
+
+    # 过滤 None | Filter None
+    return {k: v for k, v in mapping.items() if v is not None}
+
+
+def parse_args(argv: list[str] | None = None):
+    """
+    解析命令行参数，支持 YAML 配置文件。
+    Parse CLI args with optional YAML config file support.
+
+    用法: python tools/train/train_neuseg.py --config configs/neu_seg.yaml
+          python tools/train/train_neuseg.py --config configs/neu_seg.yaml --epochs 100
+    """
+    # ── 第一遍: 仅解析 --config | First pass: only parse --config ──
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", type=str, default=None)
+    pre_args, remaining = pre_parser.parse_known_args(argv)
+
+    # ── 从 YAML 获取默认值 | Get defaults from YAML ──
+    yaml_defaults = {}
+    if pre_args.config:
+        config = _load_yaml_config(pre_args.config)
+        yaml_defaults = _yaml_to_arg_defaults(config)
+
     p = argparse.ArgumentParser(
         description="Neu_seg Multi-class Segmentation Training"
     )
 
+    # ── 配置文件 | Config File ──
+    p.add_argument("--config", type=str, default=None,
+                   help="YAML 配置文件路径 | YAML config file path (e.g. configs/neu_seg.yaml)")
+
     # ── 数据 | Data ──
-    p.add_argument("--data-root", type=str, default=DEFAULT_DATA_ROOT,
+    p.add_argument("--data-root", type=str,
+                   default=yaml_defaults.get("data_root", DEFAULT_DATA_ROOT),
                    help="数据集根目录 | Data root")
 
     # ── 训练 | Training ──
-    p.add_argument("--epochs", type=int, default=50,
+    p.add_argument("--epochs", type=int,
+                   default=yaml_defaults.get("epochs", 50),
                    help="训练轮数 | Training epochs")
-    p.add_argument("--steps-per-epoch", type=int, default=200,
+    p.add_argument("--steps-per-epoch", type=int,
+                   default=yaml_defaults.get("steps_per_epoch", 200),
                    help="每轮训练步数 | Training steps per epoch")
-    p.add_argument("--k-support", type=int, default=3,
+    p.add_argument("--k-support", type=int,
+                   default=yaml_defaults.get("k_support", 3),
                    help="每步 support tile 数 | Support tiles per step")
     p.add_argument("--batch-size", type=int, default=1,
                    help="批次大小 (当前仅支持 bs=1) | Batch size (only bs=1)")
 
     # ── 模型 | Model ──
-    p.add_argument("--decoder-type", type=str, default="adaptive",
+    p.add_argument("--decoder-type", type=str,
+                   default=yaml_defaults.get("decoder_type", "adaptive"),
                    choices=["adaptive", "pure", "pure_p3p4", "pure_p2p3p4"],
                    help="Decoder 类型 | Decoder type")
-    p.add_argument("--backbone", type=str, default="fastsam-x",
+    p.add_argument("--backbone", type=str,
+                   default=yaml_defaults.get("backbone", "fastsam-x"),
                    choices=["fastsam-x", "fastsam-s"],
                    help="Backbone 模型: fastsam-x (YOLOv8x/68M) / fastsam-s (YOLOv8s/~14M)")
-    p.add_argument("--proto-source", type=str, default="p4",
+    p.add_argument("--proto-source", type=str,
+                   default=yaml_defaults.get("proto_source", "p4"),
                    choices=["p3", "p4"],
                    help="Support prototype 特征来源 (adaptive only)")
     p.add_argument("--freeze-backbone", action="store_true", default=True,
@@ -905,49 +1003,61 @@ def parse_args():
     p.add_argument("--no-freeze-backbone", dest="freeze_backbone",
                    action="store_false",
                    help="解冻 backbone | Unfreeze backbone")
-    p.add_argument("--lora-rank", type=int, default=0,
+    p.add_argument("--lora-rank", type=int,
+                   default=yaml_defaults.get("lora_rank", 0),
                    help="ConvLoRA 秩 (0=禁用, 建议 4-8) | "
                         "ConvLoRA rank (0=disabled, recommend 4-8)")
-    p.add_argument("--lora-alpha", type=float, default=1.0,
+    p.add_argument("--lora-alpha", type=float,
+                   default=yaml_defaults.get("lora_alpha", 1.0),
                    help="ConvLoRA 缩放因子 | ConvLoRA scaling factor")
     p.add_argument("--lora-layers", type=str, default=None,
                    help="LoRA 目标层名称 (逗号分隔, 如 'C2f,Conv') | "
                         "LoRA target layer names (comma-separated, e.g. 'C2f,Conv')")
 
     # ── CAT-SAM Adapter | 特征域适配器 ──
-    p.add_argument("--use-adapter", action="store_true", default=False,
+    p.add_argument("--use-adapter", action="store_true",
+                   default=yaml_defaults.get("use_adapter", False),
                    help="插入 MultiScaleAdapter (CAT-SAM 风格) 在 backbone 和 decoder 之间 | "
                         "Insert MultiScaleAdapter between backbone and decoder")
-    p.add_argument("--use-spectral", action="store_true", default=False,
+    p.add_argument("--use-spectral", action="store_true",
+                   default=yaml_defaults.get("use_spectral", False),
                    help="插入 MultiScaleSpectralAttention (DCT 频域注意力) | "
                         "Insert DCT spectral attention")
-    p.add_argument("--use-freq-fusion", action="store_true", default=False,
+    p.add_argument("--use-freq-fusion", action="store_true",
+                   default=yaml_defaults.get("use_freq_fusion", False),
                    help="使用 FrequencyGuidedFusion 替代 BiFPN 固定权重 (仅 pure_p2p3p4) | "
                         "Use frequency-guided fusion instead of BiFPN")
-    p.add_argument("--use-freq-enhancer", action="store_true", default=False,
+    p.add_argument("--use-freq-enhancer", action="store_true",
+                   default=yaml_defaults.get("use_freq_enhancer", False),
                    help="插入 MultiScaleFrequencyEnhancer (Encoder-side FFT 频域滤波) | "
                         "Insert encoder-side FFT frequency-domain enhancer")
 
     # ── 数据增强 | Data Augmentation ──
-    p.add_argument("--augment", action="store_true", default=False,
+    p.add_argument("--augment", action="store_true",
+                   default=yaml_defaults.get("augment", False),
                    help="启用数据增强 (brightness/contrast/noise/flip)")
 
     # ── 类别权重 | Class Weights ──
-    p.add_argument("--class-weights", type=str, default="none",
+    p.add_argument("--class-weights", type=str,
+                   default=yaml_defaults.get("class_weights", "none"),
                    choices=["none", "balanced", "inverse"],
                    help="类别权重策略: 'none'=均匀, 'balanced'=1/freq, "
                         "'inverse'=中频加权 | Class weight strategy")
-    p.add_argument("--loss-type", type=str, default="ce_dice",
+    p.add_argument("--loss-type", type=str,
+                   default=yaml_defaults.get("loss_type", "ce_dice"),
                    choices=["ce_dice", "lovasz", "spectral"],
                    help="损失函数: 'ce_dice' (CE+Dice) / 'lovasz' (CE+Dice+Lovász) / 'spectral' (CE+Dice+Spectral)")
-    p.add_argument("--boundary-weight", type=float, default=0.0,
+    p.add_argument("--boundary-weight", type=float,
+                   default=yaml_defaults.get("boundary_weight", 0.0),
                    help="边界感知损失权重 (0=禁用, 建议 0.1-0.3) | "
                         "Boundary-aware loss weight (0=disabled, recommend 0.1-0.3)")
 
     # ── 优化器 | Optimizer ──
-    p.add_argument("--lr", type=float, default=1e-4,
+    p.add_argument("--lr", type=float,
+                   default=yaml_defaults.get("lr", 1e-4),
                    help="学习率 | Learning rate")
-    p.add_argument("--weight-decay", type=float, default=1e-4,
+    p.add_argument("--weight-decay", type=float,
+                   default=yaml_defaults.get("weight_decay", 1e-4),
                    help="权重衰减 | Weight decay")
 
     # ── 硬件 | Hardware ──
@@ -956,11 +1066,13 @@ def parse_args():
 
     # ── 输出 | Output ──
     p.add_argument("--output-dir", type=str, default=None)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--eval-every", type=int, default=5,
+    p.add_argument("--seed", type=int,
+                   default=yaml_defaults.get("seed", 42))
+    p.add_argument("--eval-every", type=int,
+                   default=yaml_defaults.get("eval_every", 5),
                    help="每 N epochs 评估一次 | Evaluate every N epochs")
 
-    return p.parse_args()
+    return p.parse_args(remaining)
 
 
 # ═══════════════════════════════════════════════════════════════════

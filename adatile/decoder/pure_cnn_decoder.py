@@ -402,6 +402,21 @@ class PureDecoderP2P3P4(nn.Module):
             nn.Conv2d(32, out_channels, 1),
         )
 
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        """Kaiming 初始化 | Kaiming initialization."""
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, (nn.BatchNorm2d, nn.InstanceNorm2d)):
+                if m.weight is not None:
+                    nn.init.ones_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
     def forward(
         self,
         p2: torch.Tensor,   # [1, C2, H/4, W/4]

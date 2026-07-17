@@ -234,6 +234,85 @@ def build_experiments(data_root: str) -> list[dict]:
             "description": desc, "tags": "full-supervision,ceiling",
         })
 
+    # ═══════════════════════════════════════════════════════════════
+    # Phase NS: NEU_Seg 工业缺陷分割 | Industrial Defect Segmentation
+    #   多类别 (4-class): BG + Inclusion + Patch + Scratch
+    # ═══════════════════════════════════════════════════════════════
+    TRAIN_NEUSEG = "tools/train/train_neuseg.py"
+    EVAL_NEUSEG = "tools/eval/eval_neuseg.py"
+
+    # ── NS-1: 基础 Pure CNN Decoder | Baseline Pure CNN ──
+    experiments.append({
+        "id": "NS-pure", "phase": "NS", "script": TRAIN_NEUSEG,
+        "args": ("--config configs/neu_seg.yaml --decoder-type pure_p3p4 "
+                 "--epochs 200 --device cuda"),
+        "train": True, "depends_on": None,
+        "description": "NEU_Seg: PureDecoderP3P4 baseline (CE+Dice)", "tags": "neuseg,pure,baseline",
+    })
+
+    # ── NS-2: Adaptive Decoder | 自适应原型解码器 ──
+    experiments.append({
+        "id": "NS-adaptive", "phase": "NS", "script": TRAIN_NEUSEG,
+        "args": ("--config configs/neu_seg.yaml --decoder-type adaptive "
+                 "--epochs 200 --device cuda"),
+        "train": True, "depends_on": None,
+        "description": "NEU_Seg: AdaptiveSparseDecoder (prototype-conditioned)", "tags": "neuseg,adaptive,prototype",
+    })
+
+    # ── NS-3: LoRA r=2 | 轻量微调 ──
+    experiments.append({
+        "id": "NS-lora2", "phase": "NS", "script": TRAIN_NEUSEG,
+        "args": ("--config configs/neu_seg.yaml --decoder-type pure_p3p4 "
+                 "--lora-rank 2 --epochs 200 --device cuda"),
+        "train": True, "depends_on": None,
+        "description": "NEU_Seg: PureDecoderP3P4 + ConvLoRA r=2", "tags": "neuseg,lora,r2",
+    })
+
+    # ── NS-4: LoRA r=4 | 中等微调 ──
+    experiments.append({
+        "id": "NS-lora4", "phase": "NS", "script": TRAIN_NEUSEG,
+        "args": ("--config configs/neu_seg.yaml --decoder-type pure_p3p4 "
+                 "--lora-rank 4 --epochs 200 --device cuda"),
+        "train": True, "depends_on": None,
+        "description": "NEU_Seg: PureDecoderP3P4 + ConvLoRA r=4", "tags": "neuseg,lora,r4",
+    })
+
+    # ── NS-5: MultiScaleAdapter | CAT-SAM 风格适配器 ──
+    experiments.append({
+        "id": "NS-adapter", "phase": "NS", "script": TRAIN_NEUSEG,
+        "args": ("--config configs/neu_seg.yaml --decoder-type adaptive "
+                 "--use-adapter --epochs 200 --device cuda"),
+        "train": True, "depends_on": None,
+        "description": "NEU_Seg: Adaptive + MultiScaleAdapter (CAT-SAM style)", "tags": "neuseg,adapter,catsam",
+    })
+
+    # ── NS-6: Spectral Attention + Pure | 频域注意力 ──
+    experiments.append({
+        "id": "NS-spectral", "phase": "NS", "script": TRAIN_NEUSEG,
+        "args": ("--config configs/neu_seg.yaml --decoder-type pure_p3p4 "
+                 "--use-spectral --epochs 200 --device cuda"),
+        "train": True, "depends_on": None,
+        "description": "NEU_Seg: PureDecoderP3P4 + DCT SpectralAttention", "tags": "neuseg,spectral,dct",
+    })
+
+    # ── NS-7: Lovász loss | 边界优化损失 ──
+    experiments.append({
+        "id": "NS-lovasz", "phase": "NS", "script": TRAIN_NEUSEG,
+        "args": ("--config configs/neu_seg.yaml --decoder-type pure_p3p4 "
+                 "--loss-type lovasz --epochs 200 --device cuda"),
+        "train": True, "depends_on": None,
+        "description": "NEU_Seg: PureDecoderP3P4 + Lovász-Softmax loss", "tags": "neuseg,lovasz,boundary",
+    })
+
+    # ── NS-8: Augmentation v2 | 数据增强 ──
+    experiments.append({
+        "id": "NS-augv2", "phase": "NS", "script": TRAIN_NEUSEG,
+        "args": ("--config configs/neu_seg.yaml --decoder-type pure_p3p4 "
+                 "--augment --epochs 200 --device cuda"),
+        "train": True, "depends_on": None,
+        "description": "NEU_Seg: PureDecoderP3P4 + full augmentation (CLAHE+Gamma+Blur)", "tags": "neuseg,augmentation",
+    })
+
     return experiments
 
 

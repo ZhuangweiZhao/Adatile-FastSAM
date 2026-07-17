@@ -1,0 +1,93 @@
+# AdaTile-FastSAM NEU_Seg configuration | NEU_Seg 配置
+# ==============================================================
+# NEU_Seg 工业缺陷分割数据集 (200×200, 4 类)
+# Industrial Defect Segmentation Dataset (200×200, 4 classes).
+#
+# 类别编码 | Class Encoding:
+#   0 = Background (背景)
+#   1 = Inclusion (夹杂物)
+#   2 = Patch (斑块)
+#   3 = Scratch (划痕)
+
+# ── Backbone (FastSAM, frozen) ──
+backbone:
+  model: fastsam-x              # fastsam-x (68M) | fastsam-s (14M)
+  freeze: true
+  checkpoint: thirdLibrary/FastSAM/weights/FastSAM-x.pt
+  lora:
+    enabled: false
+    rank: 2                     # 建议 2-4 | recommended 2-4
+    alpha: 1.0
+    target_layers: null         # null = all Conv2d in neck
+
+# ── Data ──
+data:
+  data_root: data/NEU_Seg
+  image_size: [200, 200]        # [H, W]
+  num_classes: 4                # BG + Inclusion + Patch + Scratch
+  class_names: ["background", "Inclusion", "Patch", "Scratch"]
+  train_split: training         # 3630 images
+  test_split: test              # 840 images
+
+# ── Decoder ──
+decoder:
+  type: adaptive                # adaptive | pure | pure_p3p4 | pure_p2p3p4
+  proto_source: p4              # p3 (960-dim) | p4 (1280-dim)
+  proto_dim: 32
+  use_fdr: false
+
+# ── Adapter (CAT-SAM style, 可选 | optional) ──
+adapter:
+  enabled: false
+  reduction: 4
+
+# ── Spectral / Frequency (可选 | optional) ──
+frequency:
+  spectral_attention: false     # DCT 频域注意力 | DCT spectral attention
+  freq_fusion: false            # 频率引导融合 (仅 pure_p2p3p4) | freq-guided fusion
+  freq_enhancer: false          # Encoder-side FFT 频域滤波 | encoder-side FFT filter
+
+# ── Few-shot episode ──
+fewshot:
+  k_support: 3                  # 每步 support tile 数 | support tiles per step
+  steps_per_epoch: 200
+  binary_fg: true               # 将 {1,2,3} 合并为 FG 计算 prototype
+
+# ── Loss ──
+loss:
+  type: ce_dice                 # ce_dice | lovasz | spectral
+  ce_alpha: 0.5                 # CE vs Dice 权重
+  class_weights: none           # none | balanced | inverse
+  boundary_weight: 0.0          # 边界感知权重 (0=禁用 | disabled)
+  lovasz_alpha: 0.4             # Lovász weight (only for lovasz type)
+
+# ── Augmentation ──
+augmentation:
+  enabled: false
+  p_flip: 0.5
+  p_rotate: 0.5
+  brightness_range: 0.2
+  contrast_range: 0.2
+  noise_std: 0.02
+  p_color: 0.7
+  p_clahe: 0.3                  # CLAHE: 局部对比度增强
+  p_gamma: 0.3                  # Gamma correction
+  p_motion_blur: 0.2            # Motion blur
+  p_gaussian_blur: 0.2          # Gaussian blur
+
+# ── Training ──
+train:
+  epochs: 50
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  device: cuda
+  eval_every: 5
+
+# ── Evaluation ──
+eval:
+  num_classes: 4
+
+# ── Reproducibility ──
+seed: 42
+output_dir: runs

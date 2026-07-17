@@ -17,7 +17,7 @@ from adatile.decoder.adaptive_sparse_decoder import (
     ProtoOnlyDecoder,
 )
 from adatile.decoder.adaptive_decoder_p3p4 import AdaptiveDecoderP3P4
-from adatile.decoder.pure_cnn_decoder import PureDecoder, PureDecoderP3P4
+from adatile.decoder.pure_cnn_decoder import PureDecoder, PureDecoderP3P4, PureDecoderP2P3P4
 from adatile.decoder.prompt_decoder import PromptDecoderP3P4
 
 __all__ = [
@@ -31,4 +31,6 @@ __all__ = [
     "AdaptiveDecoderP3P4",
     "PureDecoder",
     "PureDecoderP3P4",
+    "PureDecoderP2P3P4",
+    "PromptDecoderP3P4",
 ]
