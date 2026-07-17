@@ -540,11 +540,11 @@ class NEUSegAugmentation:
         angle = np.random.uniform(0, 180)
         # Create motion blur kernel
         kernel = np.zeros((kernel_size, kernel_size), dtype=np.float32)
-        center = float(kernel_size // 2)
+        center = kernel_size // 2
         # 水平线 + 旋转 | Horizontal line + rotation
         kernel[center, :] = 1.0 / kernel_size
         # 旋转核 | Rotate kernel
-        rot_mat = cv2.getRotationMatrix2D((center, center), angle, 1.0)
+        rot_mat = cv2.getRotationMatrix2D((float(center), float(center)), angle, 1.0)
         kernel = cv2.warpAffine(kernel, rot_mat, (kernel_size, kernel_size))
         kernel = kernel / kernel.sum()
         # Apply to each channel
