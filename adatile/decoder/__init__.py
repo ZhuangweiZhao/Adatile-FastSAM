@@ -18,6 +18,7 @@ from adatile.decoder.adaptive_sparse_decoder import (
 )
 from adatile.decoder.adaptive_decoder_p3p4 import AdaptiveDecoderP3P4
 from adatile.decoder.pure_cnn_decoder import PureDecoder, PureDecoderP3P4
+from adatile.decoder.prompt_decoder import PromptDecoderP3P4
 
 __all__ = [
     "LinearProbe",

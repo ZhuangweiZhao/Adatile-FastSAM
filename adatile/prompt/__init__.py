@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 """
-Prompt Token — 类别条件编码 (CAT-SAM Prompt Token 迁移)
-========================================================
-Class-Conditional Prompt Encoding — CAT-SAM Prompt Token concept.
+Prompt Token — 类别条件编码 + 缺陷感知 Prompt 生成
+====================================================
+Class-Conditional Prompt Encoding + Defect-aware Prompt Generation.
 
 CAT-SAM 使用可学习的 Prompt Token 编码"找什么类别"的信息。
 本模块将其适配为：通用 Prompt (遥感先验) + Few-Shot Prototype (具体类别)。
@@ -9,17 +11,17 @@ CAT-SAM uses learnable Prompt Tokens to encode "what to look for".
 This module adapts it as: Generic Prompt (remote sensing prior) + Few-Shot Prototype (specific class).
 
 设计 | Design:
-    GenericPrompt:   可学习 embedding, 编码"遥感目标"的通用概念.
-    GenericPrompt:   learnable embeddings encoding the general concept of "remote sensing objects."
-    PrototypePrompt: 从 Support Set 提取的类别原型, 编码"这一个具体类别".
-    PrototypePrompt: class prototype extracted from Support Set, encoding "this specific class."
-    Fusion:          concat + linear projection → unified condition.
+    GenericPrompt:        可学习 embedding, 编码"遥感目标"的通用概念.
+    GenericPrompt:        learnable embeddings encoding the general concept of "remote sensing objects."
+    PrototypePrompt:      从 Support Set 提取的类别原型, 编码"这一个具体类别".
+    PrototypePrompt:      class prototype extracted from Support Set, encoding "this specific class."
+    Fusion:               concat + linear projection → unified condition.
+    DefectPromptGenerator: P2 特征 → K heatmap → K prompt token → 缺陷感知条件.
+    DefectPromptGenerator: P2 features → K heatmaps → K prompt tokens → defect-aware conditioning.
 
 对应 CAT-SAM: Prompt Token → 类别嵌入 → Cross-Attention 到图像特征.
 CAT-SAM analog: Prompt Token → class embedding → Cross-Attention to image features.
 """
-
-from __future__ import annotations
 
 import torch
 import torch.nn as nn
@@ -185,3 +187,6 @@ class PromptFusion(nn.Module):
         # generic dim + proto dim → output dim
         # 如果维度不同，用线性层对齐 | If dims differ, align with linear
         return self.fusion(combined)
+
+
+from adatile.prompt.defect_prompt import DefectPromptGenerator, prompt_global_conditioning, prompt_diversity_loss  # noqa: E402
