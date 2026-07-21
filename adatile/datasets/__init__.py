@@ -16,12 +16,14 @@ from adatile.datasets.base import BaseSegDataset
 from adatile.datasets.isaid import ISAIDDataset, ISAID_CATEGORIES
 from adatile.datasets.mass_buildings import MassachusettsBuildingsDataset
 from adatile.datasets.neu_seg import NEUSegDataset
+from adatile.datasets.severstal import SeverstalDataset
 
 __all__ = [
     "BaseSegDataset",
     "ISAIDDataset",
     "MassachusettsBuildingsDataset",
     "NEUSegDataset",
+    "SeverstalDataset",
     "ISAID_CATEGORIES",
 ]
 

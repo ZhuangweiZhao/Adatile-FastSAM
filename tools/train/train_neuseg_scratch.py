@@ -621,8 +621,9 @@ def main():
             logger.log_info("eval", f"{'─'*60}")
             logger.log_info("eval", f"Evaluation @ Epoch {epoch}")
 
-            miou = metrics["mIoU"]
+            metrics = evaluate_scratch(backbone, decoder, val_ds, device)
 
+            miou = metrics["mIoU"]
             logger.log_info("eval",
                 f"  mIoU={miou:.4f}  dice={metrics['Dice']:.4f}  "
                 f"px_acc={metrics['pixel_accuracy']:.4f}  "
@@ -632,14 +633,14 @@ def main():
                 logger.log_info("eval",
                     f"    {name:>12s}: IoU={metrics['per_class_IoU'][name]:.4f}")
 
-            logger.log_metric("mIoU", miou, step=epoch,
+            logger.log_metric("mIoU", metrics["mIoU"], step=epoch,
                               tags=["neuseg_scratch_eval"])
             logger.log_metric("Dice", metrics["Dice"], step=epoch,
                               tags=["neuseg_scratch_eval"])
 
             # ── 保存最佳模型 (按 mIoU) | Save Best Model (by mIoU) ──
-            if miou > best_miou:
-                best_miou = miou
+            if metrics["mIoU"] > best_miou:
+                best_miou = metrics["mIoU"]
                 best_dice = metrics["Dice"]
                 best_epoch = epoch
 

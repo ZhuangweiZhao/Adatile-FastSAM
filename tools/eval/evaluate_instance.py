@@ -311,7 +311,8 @@ def build_class_prototypes(model, decoder, args, class_index, split, data_root,
             support_imgs.append(img)
             support_masks.append(m)
         support_feats = extract_features(model, support_imgs, device)
-        proto = compute_support_prototype(support_feats, source=args.prototype_source)
+        proto = compute_support_prototype(support_feats, source=args.prototype_source,
+                                           support_masks=support_masks)
 
         # baseline decoder 需要空间模板 | baseline decoder needs a spatial template
         support_tmpl = None
@@ -438,17 +439,22 @@ def cv2_resize_bool(mask: np.ndarray, h: int, w: int) -> np.ndarray:
 # 5. GT 逐实例加载 | Per-instance GT loading (pycocotools)
 # ═══════════════════════════════════════════════════════════════════
 
-def load_gt_instances(coco, image_id: int) -> list[dict]:
+def load_gt_instances(coco, image_id: int, valid_category_ids: set[int] | None = None) -> list[dict]:
     """从 COCO GT 读取该图的逐实例掩码 | Load per-instance GT masks for an image from COCO GT.
 
+    :param coco: pycocotools.COCO GT 对象.
+    :param image_id: 图像 ID.
+    :param valid_category_ids: 有效类别 ID 集合 (默认从 coco.getCatIds() 自动获取) | Valid category ID set.
     :return: list of {category_id, mask(bool [H,W]), area}
     """
+    if valid_category_ids is None:
+        valid_category_ids = set(coco.getCatIds())
     ann_ids = coco.getAnnIds(imgIds=image_id, iscrowd=None)
     anns = coco.loadAnns(ann_ids)
     out = []
     for ann in anns:
         cat = ann.get("category_id", 0)
-        if cat < 1 or cat > 15:
+        if cat not in valid_category_ids:
             continue
         m = coco.annToMask(ann).astype(bool)      # polygon → binary mask
         if m.sum() == 0:
@@ -706,7 +712,7 @@ def main():
                 ft_eval.add_prediction(image_id, it["category_id"], it["mask"], it["score"])
 
         # GT 逐实例 | Per-instance GT
-        gt_insts = load_gt_instances(coco, image_id)
+        gt_insts = load_gt_instances(coco, image_id, valid_category_ids=set(coco.getCatIds()))
         gt_by_class = defaultdict(list)
         for g in gt_insts:
             gt_by_class[g["category_id"]].append(g["mask"])

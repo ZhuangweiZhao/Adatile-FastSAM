@@ -829,19 +829,44 @@ def compute_support_bbox(support_masks: list[np.ndarray]) -> torch.Tensor:
 
 
 def compute_support_prototype(support_feats: list[dict],
-                              source: str = "p4") -> torch.Tensor:
+                              source: str = "p4",
+                              support_masks: list[np.ndarray] | None = None) -> torch.Tensor:
     """
     从 K 个 support 特征计算 prototype.
     Compute prototype from K support features.
 
+    训练时 (mask 传入): FG-masked 平均池化，仅前景像素参与。
+    Training (mask provided): FG-masked average pooling, only foreground pixels.
+    评估时 (mask=None): 全局平均池化 (GAP)，保留 GAP 方式以与历史实验一致。
+    Evaluation (mask=None): Global average pooling (GAP), kept for historical consistency.
+
     :param support_feats: K 个 support 特征字典 | K support feature dicts.
     :param source: 特征来源 | Feature source — "p4" (stride-16, 语义-空间平衡)
                    or "p8" (stride-32, 全局语义).
+    :param support_masks: K 个 binary FG mask (None=GAP) | K binary FG masks (None=GAP).
     :return: [1, feat_dim] L2-normalized prototype.
     """
     vectors = []
-    for sf in support_feats:
-        v = sf[source].mean(dim=(2, 3))  # spatial avg → [1, feat_dim]
+    for i, sf in enumerate(support_feats):
+        feat = sf[source]  # [1, feat_dim, H, W]
+        if support_masks is not None and i < len(support_masks):
+            # FG-masked 平均池化 | FG-masked average pooling
+            mask = support_masks[i]  # [H, W] or [H_gt, W_gt]
+            mask_t = torch.from_numpy(mask).float().to(feat.device)
+            # 下采样 mask 到特征分辨率 | Downsample mask to feature resolution
+            mask_ds = F.interpolate(
+                mask_t.unsqueeze(0).unsqueeze(0), size=feat.shape[2:], mode="nearest"
+            )  # [1, 1, H_feat, W_feat]
+            fg = mask_ds > 0.5  # [1, 1, H_feat, W_feat]
+            if fg.sum() > 0:
+                # 广播相乘: fg_mask 沿通道维广播到 feat | Broadcast multiply: fg_mask broadcasts over channels
+                feat_masked = feat * fg  # [1, 1280, H_feat, W_feat]
+                v = feat_masked.sum(dim=(2, 3)) / fg.sum()  # [1, 1280]
+            else:
+                v = feat.mean(dim=(2, 3))  # 退化: 无 FG → fallback to GAP | Degenerate: no FG → GAP
+        else:
+            # GAP (评估兼容) | GAP (evaluation compatibility)
+            v = feat.mean(dim=(2, 3))  # spatial avg → [1, feat_dim]
         v = F.normalize(v, p=2, dim=-1)
         vectors.append(v)
     proto = torch.stack(vectors).mean(dim=0)  # [1, feat_dim]
@@ -923,7 +948,8 @@ def train_episode(model, decoder, optimizer, class_id: int,
     query_feats = extract_features(model, [query_img], device, no_grad=not backbone_trainable)[0]
 
     # Support prototype (source: p4 or p8)
-    support_proto = compute_support_prototype(support_feats, source=proto_source)  # [1, feat_dim]
+    support_proto = compute_support_prototype(support_feats, source=proto_source,
+                                               support_masks=support_bmasks)  # [1, feat_dim]
 
     if decoder_type == "adaptive":
         # ── AdaptiveSparseDecoder: proto mask 线性组合 + P4 精炼 ──
@@ -1312,17 +1338,40 @@ def train_episode(model, decoder, optimizer, class_id: int,
             importance = spm.importance_head(p8)  # [1, 1, H/32, W/32] raw logits
             # GT density: pool query mask to P8 resolution
             gt_density = _compute_gt_density(query_gt, importance.shape[2], importance.shape[3]).to(device)
-            # BCE loss
+            # BCE loss: per-pixel importance ≈ GT density
             bce_spm = F.binary_cross_entropy_with_logits(importance, gt_density)
-            # Budget loss: encourage ~40% tile selection
-            imp_mean = torch.sigmoid(importance).mean()
-            budget_target = 0.4
-            budget = (imp_mean - budget_target) ** 2
-            spm_loss = bce_spm + 0.1 * budget  # budget weight reduced
+
+            # Tile-level ranking loss: Top-K tiles (by GT density) should have higher importance
+            # 瓦片级排序损失: GT密度高的瓦片应获得更高的重要性
+            tile_size_p8 = spm.router.tile_size if hasattr(spm, 'router') else 4
+            n_h = importance.shape[2] // tile_size_p8
+            n_w = importance.shape[3] // tile_size_p8
+            if n_h > 0 and n_w > 0:
+                # Pool importance and GT density to tile grid
+                # 池化到瓦片网格
+                tile_imp = F.adaptive_avg_pool2d(torch.sigmoid(importance), (n_h, n_w))  # [1, 1, n_h, n_w]
+                tile_gt = F.adaptive_avg_pool2d(gt_density, (n_h, n_w))  # [1, 1, n_h, n_w]
+                tile_imp_flat = tile_imp.view(1, -1)  # [1, n_total]
+                tile_gt_flat = tile_gt.view(1, -1)  # [1, n_total]
+                # Top-K by GT density = "truly important" tiles
+                # 按GT密度Top-K = "真正重要"的瓦片
+                _, topk_by_gt = torch.topk(tile_gt_flat, max(1, n_h * n_w // 2), dim=1)
+                # Build masks
+                sel_mask = torch.zeros(1, n_h * n_w, dtype=torch.bool, device=importance.device)
+                sel_mask.scatter_(1, topk_by_gt, True)
+                # Ranking loss: selected tiles' importance > unselected + margin
+                # 排序损失: 选中瓦片的重要性 > 未选中 + 边际
+                sel_mean = tile_imp_flat[sel_mask].mean()
+                unsel_mean = tile_imp_flat[~sel_mask].mean()
+                margin = 0.1
+                ranking = torch.relu(margin - (sel_mean - unsel_mean))
+            else:
+                ranking = torch.tensor(0.0, device=importance.device)
+
+            spm_loss = bce_spm + 0.1 * ranking  # ranking weight matches old budget weight
             loss = loss + 0.05 * spm_loss  # λ_spm = 0.05
             loss_dict["spm_bce"] = bce_spm.item()
-            loss_dict["spm_budget"] = budget.item()
-            loss_dict["spm_mean"] = imp_mean.item()
+            loss_dict["spm_ranking"] = ranking.item()
 
     # Backward
     optimizer.zero_grad()
@@ -1456,6 +1505,11 @@ def main():
     print(f"  K={args.k_shot} | Epochs={args.epochs} | LR={args.lr}")
     print(f"  Episodes/epoch={args.episodes_per_epoch}")
     print(f"  Device={device} | Output={out_dir}")
+    # ⚠️ 解冻 backbone 时 normalize_proto="none" 会导致 proto basis 幅值爆炸 → sigmoid 饱和 → 梯度消失
+    # ⚠️ When unfreezing backbone, normalize_proto="none" causes proto basis explosion → saturation → zero gradient
+    if args.unfreeze_layers > 0 and args.normalize_proto == "none":
+        print(f"  ⚠️  WARNING: unfreeze_layers={args.unfreeze_layers} with normalize_proto='none' "
+              f"will cause proto saturation! Use --normalize-proto l2 or layernorm.")
     print(f"{'=' * 60}")
 
     # ── 1. Build class index | 构建类别索引 ──
@@ -1736,7 +1790,7 @@ def main():
         decoder.train()
         epoch_losses = {"loss": [], "iou": [], "dice": [], "bce": []}
         if spm is not None:
-            epoch_losses["spm_mean"] = []
+            epoch_losses["spm_ranking"] = []
         if decoder_type == "dynamic_kernel":
             for _k in ("n_matched", "n_unmatched_pred", "n_unmatched_gt", "n_gt",
                        "kernel_dice", "kernel_cos_sim"):
@@ -1806,8 +1860,8 @@ def main():
         fwd_str = (f" | basis_l2={fwd_means['proto_basis_l2']:.2e} sat={fwd_means['sat_frac']:.3f} "
                    f"cgrad={fwd_means['coeff_grad_norm']:.2e}") if fwd_means else ""
         if spm is not None:
-            avg_spm_mean = np.mean(epoch_losses.get("spm_mean", [])) if epoch_losses.get("spm_mean") else 0
-            spm_str = f", spm_mean={avg_spm_mean:.3f}"
+            avg_spm_rank = np.mean(epoch_losses.get("spm_ranking", [])) if epoch_losses.get("spm_ranking") else 0
+            spm_str = f", spm_rank={avg_spm_rank:.4f}"
         else:
             spm_str = ""
         # Dynamic kernel: show matching stats + kernel semantic Dice
@@ -1876,7 +1930,8 @@ def main():
                         support_bmasks_v.append(semantic_mask_to_binary(smask, is_tile=is_tile))
                     support_feats = extract_features(model, support_imgs, device)
                     support_proto = compute_support_prototype(support_feats,
-                                                              source=args.prototype_source)
+                                                              source=args.prototype_source,
+                                                              support_masks=support_bmasks_v)
 
                     if decoder_type in ("adaptive", "adaptive-p3p4", "pure", "pure-p3p4",
                                          "dynamic_kernel", "center_affinity"):

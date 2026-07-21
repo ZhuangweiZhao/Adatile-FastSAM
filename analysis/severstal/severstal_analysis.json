@@ -1,0 +1,155 @@
+{
+  "overview": {
+    "total_images": 12568,
+    "defect_images": 6666,
+    "clean_images": 5902,
+    "defect_ratio": 53.0,
+    "total_annotations": 7095,
+    "num_classes": 4,
+    "image_size": "1600×256",
+    "image_size_pixels": 409600,
+    "per_class": {
+      "class_1": {
+        "name": "Class 1",
+        "annotations": 897,
+        "images": 897,
+        "avg_per_image": 1.0
+      },
+      "class_2": {
+        "name": "Class 2",
+        "annotations": 247,
+        "images": 247,
+        "avg_per_image": 1.0
+      },
+      "class_3": {
+        "name": "Class 3",
+        "annotations": 5150,
+        "images": 5150,
+        "avg_per_image": 1.0
+      },
+      "class_4": {
+        "name": "Class 4",
+        "annotations": 801,
+        "images": 801,
+        "avg_per_image": 1.0
+      }
+    },
+    "multi_class_dist": {
+      "1_class": 6239,
+      "2_class": 425,
+      "3_class": 2
+    }
+  },
+  "defect_areas": {
+    "class_1": {
+      "name": "Class 1",
+      "count": 897,
+      "mean_px": 4361.3,
+      "median_px": 3326.0,
+      "std_px": 3589.1,
+      "min_px": 163,
+      "max_px": 31303,
+      "mean_pct": 1.0648,
+      "p25_px": 1762.0,
+      "p75_px": 5795.0,
+      "p95_px": 11502.0
+    },
+    "class_2": {
+      "name": "Class 2",
+      "count": 247,
+      "mean_px": 3378.4,
+      "median_px": 2944.0,
+      "std_px": 2045.2,
+      "min_px": 316,
+      "max_px": 14023,
+      "mean_pct": 0.8248,
+      "p25_px": 1947.5,
+      "p75_px": 4337.5,
+      "p95_px": 7138.4
+    },
+    "class_3": {
+      "name": "Class 3",
+      "count": 5150,
+      "mean_px": 25496.5,
+      "median_px": 11953.5,
+      "std_px": 37941.6,
+      "min_px": 115,
+      "max_px": 368240,
+      "mean_pct": 6.2247,
+      "p25_px": 5054.2,
+      "p75_px": 29029.5,
+      "p95_px": 94007.1
+    },
+    "class_4": {
+      "name": "Class 4",
+      "count": 801,
+      "mean_px": 34374.0,
+      "median_px": 25357.0,
+      "std_px": 29571.8,
+      "min_px": 491,
+      "max_px": 192780,
+      "mean_pct": 8.3921,
+      "p25_px": 13114.0,
+      "p75_px": 45221.0,
+      "p95_px": 98530.0
+    }
+  },
+  "rle": {
+    "class_1": {
+      "name": "Class 1",
+      "segments_mean": 101.4,
+      "segments_median": 64.0,
+      "segments_max": 548,
+      "run_length_mean": 43.0,
+      "run_length_median": 34.0,
+      "run_length_max": 9023,
+      "total_runs": 90925
+    },
+    "class_2": {
+      "name": "Class 2",
+      "segments_mean": 25.8,
+      "segments_median": 24.0,
+      "segments_max": 82,
+      "run_length_mean": 130.9,
+      "run_length_median": 118.0,
+      "run_length_max": 6890,
+      "total_runs": 6377
+    },
+    "class_3": {
+      "name": "Class 3",
+      "segments_mean": 254.7,
+      "segments_median": 94.0,
+      "segments_max": 3686,
+      "run_length_mean": 100.1,
+      "run_length_median": 61.0,
+      "run_length_max": 97343,
+      "total_runs": 1311567
+    },
+    "class_4": {
+      "name": "Class 4",
+      "segments_mean": 441.6,
+      "segments_median": 339.0,
+      "segments_max": 2186,
+      "run_length_mean": 77.8,
+      "run_length_median": 66.0,
+      "run_length_max": 45824,
+      "total_runs": 353692
+    }
+  },
+  "fg_ratio": {
+    "all_mean": 3.1778,
+    "all_median": 0.4023,
+    "all_max": 89.9,
+    "with_defect_mean": 5.9913,
+    "with_defect_median": 2.6696,
+    "zero_ratio_pct": 47.0
+  },
+  "brightness": {
+    "brightness_mean": 89.1,
+    "brightness_std": 30.9,
+    "brightness_min": 1.7,
+    "brightness_max": 210.3,
+    "contrast_mean": 35.4,
+    "contrast_std": 13.8
+  }
+}

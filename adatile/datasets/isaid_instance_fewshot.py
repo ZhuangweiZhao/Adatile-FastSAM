@@ -247,11 +247,12 @@ class ISAIDInstanceFewShotDataset(Dataset):
             # 即使无可见类实例, 也保留 tile (作为 BG 样本)
             # Keep tile even without visible class instances (as BG sample)
             self._active_tile_indices.append(tile_idx)
+            active_idx = len(self._active_tile_indices) - 1  # dataset index space
 
-            # Class→tile 映射 | Class→tile mapping
+            # Class→tile 映射 | Class→tile mapping (dataset index space)
             tile_cats = set(ann["category_id"] for ann in tile_anns)
             for cat_id in tile_cats:
-                self._class_to_tile_indices[cat_id].append(tile_idx)
+                self._class_to_tile_indices[cat_id].append(active_idx)
 
     # ── 核心接口 | Core Interface ──
 
@@ -373,7 +374,7 @@ class ISAIDInstanceFewShotDataset(Dataset):
         获取包含指定类的所有 tile 索引 | Get all tile indices containing a given class.
 
         :param class_id: 类别 ID (1-15) | Class ID (1-15).
-        :return: tile 索引列表 | List of tile indices (in self._active_tile_indices).
+        :return: tile 索引列表 (dataset 索引空间, 可直接用于 dataset[idx]) | List of tile indices in dataset index space.
         """
         return self._class_to_tile_indices.get(class_id, [])
 

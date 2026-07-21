@@ -1,0 +1,16 @@
+[
+  {
+    "fingerprint": "task",
+    "summary": "---",
+    "first_seen_iteration": 1,
+    "last_seen_iteration": 1,
+    "count": 1
+  },
+  {
+    "fingerprint": "p0-p1-5-4731baa8",
+    "summary": "所有 P0、P1 修复和 5 项调查均已完成并通过验证。",
+    "first_seen_iteration": 2,
+    "last_seen_iteration": 2,
+    "count": 1
+  }
+]

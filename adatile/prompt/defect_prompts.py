@@ -137,9 +137,14 @@ class DefectPromptExtractor:
         img_back = np.fft.ifft2(f_ishift)
         anomaly = np.abs(img_back)
 
-        # 归一化 | Normalize
+        # 鲁棒归一化 (percentile clip 抑制噪声拖尾) | Robust normalize (percentile clip)
         if anomaly.max() > anomaly.min():
-            anomaly = (anomaly - anomaly.min()) / (anomaly.max() - anomaly.min() + 1e-8)
+            p_low, p_high = np.percentile(anomaly, [2, 98])
+            if p_high > p_low:
+                anomaly = np.clip(anomaly, p_low, p_high)
+                anomaly = (anomaly - p_low) / (p_high - p_low + 1e-8)
+            else:
+                anomaly = (anomaly - anomaly.min()) / (anomaly.max() - anomaly.min() + 1e-8)
         return anomaly.astype(np.float32)
 
     # ═══════════════════════════════════════════════════════════════
@@ -163,9 +168,14 @@ class DefectPromptExtractor:
         gy = cv2.Sobel(gray_u8, cv2.CV_32F, 0, 1, ksize=ksize)
         mag = np.sqrt(gx ** 2 + gy ** 2)
 
-        # 归一化 | Normalize
+        # 鲁棒归一化 (percentile clip 抑制噪声拖尾) | Robust normalize (percentile clip)
         if mag.max() > mag.min():
-            mag = (mag - mag.min()) / (mag.max() - mag.min() + 1e-8)
+            p_low, p_high = np.percentile(mag, [2, 98])
+            if p_high > p_low:
+                mag = np.clip(mag, p_low, p_high)
+                mag = (mag - p_low) / (p_high - p_low + 1e-8)
+            else:
+                mag = (mag - mag.min()) / (mag.max() - mag.min() + 1e-8)
         return mag.astype(np.float32)
 
     # ═══════════════════════════════════════════════════════════════
@@ -190,9 +200,14 @@ class DefectPromptExtractor:
         local_var = np.maximum(local_sq_mean - local_mean * local_mean, 0)
         local_std = np.sqrt(local_var)
 
-        # 归一化 | Normalize
+        # 鲁棒归一化 (percentile clip 抑制噪声拖尾) | Robust normalize (percentile clip)
         if local_std.max() > local_std.min():
-            local_std = (local_std - local_std.min()) / (local_std.max() - local_std.min() + 1e-8)
+            p_low, p_high = np.percentile(local_std, [2, 98])
+            if p_high > p_low:
+                local_std = np.clip(local_std, p_low, p_high)
+                local_std = (local_std - p_low) / (p_high - p_low + 1e-8)
+            else:
+                local_std = (local_std - local_std.min()) / (local_std.max() - local_std.min() + 1e-8)
         return local_std.astype(np.float32)
 
     # ═══════════════════════════════════════════════════════════════

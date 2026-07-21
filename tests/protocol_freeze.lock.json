@@ -7,8 +7,8 @@
     "InstanceMIoU": "2c6b67ea8cfc1819588f6a54450077b9a0888350da1b26fcd4099753246c94ad",
     "COCO_AP": "8a1d9b3d3755cbfee1cea7b4235c18d20984d4de7e563ab8c0b7de1e4a6aa368",
     "ZeroShot": "a712bdde1b31245110d8616a7b94bb20feb7a4b4624219538812dcd204c97fda",
-    "SupportQuery": "43869a999452fb19785cdf2edbe0cbbb71bff91666fe14aa634b76fe088f07a1",
-    "GroundTruth": "ca1827002f4c73b3de53792eeefaba9ff084ad54f1036f2bb90bd4b21d0d0636",
+    "SupportQuery": "a57a5fb3da7372d7dfba5d939bfab6c86fb5b6ca9b05b8368fa56cc0ee85de61",
+    "GroundTruth": "4a1b534819875921e5d3d8999dcd5c52b37c7cce3bf257fadf09797bd2458e95",
     "Manifest": "053d56e24d9c6c3c931742536ac9d20386699f6ec65f9d2307b6ebef3a99fc98"
   }
 }

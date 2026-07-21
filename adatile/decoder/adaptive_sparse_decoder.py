@@ -234,8 +234,8 @@ class AdaptiveSparseDecoder(nn.Module):
         :param support_proto: [in_channels] 或 [1, in_channels] L2-normalized support prototype.
         :param fdr_map: [1, 1, H/32, W/32] 或 None. FDR 密度图 (可选).
             FDR density map (optional). When None, FDR gating is skipped.
-        :return: out_channels=1 → [H/4,W/4] sigmoid mask.
-                 out_channels=C → [C, H/4, W/4] softmax probs.
+        :return: out_channels=1 → [H/4,W/4] sigmoid mask (batch=1) 或 [B,H/4,W/4] (batch>1).
+                 out_channels=C → [B, C, H/4, W/4] softmax probs.
         """
         # ── 输入标准化 | Input normalization ──
         if proto_masks.dim() == 4:
@@ -244,7 +244,7 @@ class AdaptiveSparseDecoder(nn.Module):
             support_proto = support_proto.squeeze(0)
 
         # ── proto basis 归一化 (防饱和; 默认 none=identity, 零影响) | normalize proto basis ──
-        proto_masks = self._normalize_proto(proto_masks)  # [1, 1280] → [1280]
+        proto_masks = self._normalize_proto(proto_masks)  # [proto_dim, H/4, W/4]
 
         # ═══════════════════════════════════════════════════════════
         # Step 1: 从 support prototype 预测 proto mask 系数
@@ -306,10 +306,11 @@ class AdaptiveSparseDecoder(nn.Module):
         # ============================================================
         # Binary: proto mask + refined -> sigmoid. Multi-class: refined only -> softmax
         if self.out_channels == 1:
-            final_logit = refined_logit_up.squeeze(1) + proto_mask.squeeze(0)  # [H/4, W/4]
-            final_mask = torch.sigmoid(final_logit)  # [H/4, W/4]
+            final_logit = refined_logit_up.squeeze(1) + proto_mask.squeeze(0)  # [B, H/4, W/4]
+            final_mask = torch.sigmoid(final_logit)  # [B, H/4, W/4]
         else:
-            final_mask = torch.softmax(refined_logit_up.squeeze(0), dim=0)  # [C, H/4, W/4]
+            # 多类: 对 batch 中每个样本在通道维做 softmax | Multi-class: softmax over channels per sample
+            final_mask = torch.softmax(refined_logit_up, dim=1)  # [B, C, H/4, W/4]
 
         return final_mask
 

@@ -20,14 +20,17 @@ from __future__ import annotations
 import numpy as np
 
 
-def render_category_mask(annotations: list, h: int, w: int) -> np.ndarray:
+def render_category_mask(annotations: list, h: int, w: int,
+                         valid_categories: set[int] | None = None) -> np.ndarray:
     """
-    Render dense category-ID mask [H, W] uint8 (values 0-15) from COCO instance annotations.
-    从 COCO 实例标注渲染密集类别 ID 掩码 [H, W] uint8（值 0-15）。
+    Render dense category-ID mask [H, W] uint8 from COCO instance annotations.
+    从 COCO 实例标注渲染密集类别 ID 掩码 [H, W] uint8。
 
     Merges all instance polygons into a single per-pixel label map by category_id.
     Mapping is done by prep_isaid.py fix_annotations().
     将所有实例多边形按 category_id 合并到逐像素标签图中。ID 映射由 prep_isaid.py 完成。
+
+    :param valid_categories: 有效类别 ID 集合 (None=保留原 1-15 范围) | Valid category IDs (None=keep original 1-15 range).
 
     Uses cv2.fillPoly for speed; falls back to PIL if cv2 unavailable.
     """
@@ -40,7 +43,10 @@ def render_category_mask(annotations: list, h: int, w: int) -> np.ndarray:
 
     for ann in annotations:
         cat_id = ann.get("category_id", 0)
-        if cat_id <= 0 or cat_id > 15:
+        if valid_categories is not None:
+            if cat_id not in valid_categories:
+                continue
+        elif cat_id <= 0 or cat_id > 15:  # 默认 iSAID 范围 | Default iSAID range
             continue
 
         seg = ann.get("segmentation", [])
