@@ -319,6 +319,8 @@ def parse_args():
                    help="HDN 辅助 loss 权重 | HDN auxiliary loss weight")
 
     # ── 训练 | Training ──
+    p.add_argument("--batch-size", type=int, default=1,
+                   help="Batch size | 批次大小 (default: 1)")
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--lr-frn", type=float, default=None,
@@ -422,13 +424,13 @@ def main():
     # ── DataLoader: full-epoch iteration (standard training protocol) ──
     train_loader = DataLoader(
         train_ds,
-        batch_size=1,
+        batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
         drop_last=False,
     )
-    logger.log_info("data", f"DataLoader: batch=1, workers={args.num_workers}, "
+    logger.log_info("data", f"DataLoader: batch={args.batch_size}, workers={args.num_workers}, "
                     f"batches/epoch={len(train_loader)}")
 
     # ── Backbone (frozen) ──
@@ -569,73 +571,90 @@ def main():
         epoch_dice = []
 
         # Full-epoch DataLoader iteration (standard training protocol)
+        # Decoder 内部有 .squeeze(0), 因此 B>1 时逐样本循环累积梯度
+        # Decoder internally squeezes dim 0, so for B>1 we loop per-sample with grad accumulation
         pbar = tqdm(train_loader, desc=f"Epoch {epoch:3d}/{args.epochs}", unit="batch")
         for batch in pbar:
-            img = batch["image"]        # [B, 3, H, W] with DataLoader batch dim
-            mask = batch["masks"]       # [B, 1, H, W]
-            mask = mask.squeeze(1)      # -> [B, H, W] (match old convention)
+            img_batch = batch["image"]        # [B, 3, H_img, W_img]
+            mask_batch = batch["masks"]       # [B, 1, H_img, W_img]
+            mask_batch = mask_batch.squeeze(1)  # -> [B, H_img, W_img]
 
-            # Apply augmentation per-sample (B=1 in practice)
-            if augment:
-                img_s, mask_s = augment(img[0], mask[0])
-                img = img_s.unsqueeze(0)
-                mask = mask_s.unsqueeze(0)
+            B = img_batch.shape[0]
 
-            # Get H,W AFTER augmentation (rot90 can swap spatial dims)
-            H, W = mask.shape[1:]
-
-            img_dev = img.to(device)    # [B, 3, H, W] — DataLoader already provides batch dim
-            mask_dev = mask.to(device)  # [B, H, W] long
-
-            # ── Forward ──
             decoder.train()
             frn.train()
-            feats = backbone(img_dev, extract_proto=False)
-            p3, p4 = feats["p3"], feats["p4"]
 
-            # DA-FRN: 特征校正 | Feature Rectification
-            p3_r, p4_r = frn(p3, p4)
+            optimizer.zero_grad()
+            batch_loss = 0.0
+            batch_ce = 0.0
+            batch_dice = 0.0
+            valid_samples = 0
 
-            # Decoder
-            pred_prob = decoder(p3_r, p4_r)
+            for b_idx in range(B):
+                img = img_batch[b_idx]          # [3, H, W]
+                mask = mask_batch[b_idx]        # [H, W]
 
-            pred_full = F.interpolate(pred_prob.unsqueeze(0), size=(H, W),
-                                      mode="bilinear", align_corners=False).squeeze(0)
-            target = mask_dev.squeeze(0).long()
+                # Apply augmentation per-sample
+                if augment:
+                    img, mask = augment(img, mask)
 
-            # ── HDN auxiliary loss ──
-            hdn_loss = torch.tensor(0.0, device=device)
-            if hdn is not None:
-                gray = _rgb_to_gray(img_dev)
-                raw_grad = _sobel_gradient(gray)
-                denoised = hdn(raw_grad)
-                gt_binary = (target > 0).float().unsqueeze(0).unsqueeze(0)
-                denoised_resized = F.interpolate(denoised, size=(H, W),
-                                                  mode="bilinear", align_corners=False)
-                hdn_loss = F.binary_cross_entropy(
-                    denoised_resized.clamp(1e-7, 1 - 1e-7), gt_binary, reduction='mean'
-                )
+                H, W = mask.shape
+                img_dev = img.unsqueeze(0).to(device)    # [1, 3, H, W]
+                mask_dev = mask.unsqueeze(0).to(device)  # [1, H, W]
 
-            # ── Loss ──
-            log_pred = torch.log(pred_full.unsqueeze(0).clamp(1e-7, 1))
-            ce = F.nll_loss(log_pred, target.unsqueeze(0), weight=ce_weight, reduction='mean')
+                # ── Forward ──
+                feats = backbone(img_dev, extract_proto=False)
+                p3, p4 = feats["p3"], feats["p4"]
 
-            if args.binary:
-                dice = binary_dice_loss(pred_full.unsqueeze(0), target.unsqueeze(0))
-            else:
-                dice = multiclass_dice_loss(pred_full.unsqueeze(0), target.unsqueeze(0))
+                # DA-FRN: 特征校正 | Feature Rectification
+                p3_r, p4_r = frn(p3, p4)
 
-            loss_val = 0.5 * ce + 0.5 * dice + args.hdn_weight * hdn_loss
+                # Decoder (returns [num_classes, H/4, W/4] — no batch dim)
+                pred_prob = decoder(p3_r, p4_r)
 
-            if torch.isnan(loss_val) or torch.isinf(loss_val):
-                nan_count += 1
+                pred_full = F.interpolate(pred_prob.unsqueeze(0), size=(H, W),
+                                          mode="bilinear", align_corners=False).squeeze(0)
+                target = mask_dev.squeeze(0).long()
+
+                # ── HDN auxiliary loss ──
+                hdn_loss = torch.tensor(0.0, device=device)
+                if hdn is not None:
+                    gray = _rgb_to_gray(img_dev)
+                    raw_grad = _sobel_gradient(gray)
+                    denoised = hdn(raw_grad)
+                    gt_binary = (target > 0).float().unsqueeze(0).unsqueeze(0)
+                    denoised_resized = F.interpolate(denoised, size=(H, W),
+                                                      mode="bilinear", align_corners=False)
+                    hdn_loss = F.binary_cross_entropy(
+                        denoised_resized.clamp(1e-7, 1 - 1e-7), gt_binary, reduction='mean'
+                    )
+
+                # ── Loss ──
+                log_pred = torch.log(pred_full.unsqueeze(0).clamp(1e-7, 1))
+                ce = F.nll_loss(log_pred, target.unsqueeze(0), weight=ce_weight, reduction='mean')
+
+                if args.binary:
+                    dice = binary_dice_loss(pred_full.unsqueeze(0), target.unsqueeze(0))
+                else:
+                    dice = multiclass_dice_loss(pred_full.unsqueeze(0), target.unsqueeze(0))
+
+                loss_val = (0.5 * ce + 0.5 * dice + args.hdn_weight * hdn_loss) / B
+
+                if torch.isnan(loss_val) or torch.isinf(loss_val):
+                    nan_count += 1
+                    continue
+
+                # Accumulate gradients (no step() until batch is done)
+                loss_val.backward()
+                batch_loss += loss_val.item() * B
+                batch_ce += ce.item()
+                batch_dice += dice.item()
+                valid_samples += 1
+
+            if valid_samples == 0:
                 continue
 
-            # ── Backward ──
-            optimizer.zero_grad()
-            loss_val.backward()
-
-            # NaN grad check (include all optimizable params including Stage 2 backbone)
+            # ── Post-batch: gradient check + clip + step ──
             all_params = list(decoder.parameters()) + list(frn.parameters())
             if hdn is not None:
                 all_params += list(hdn.parameters())
@@ -647,7 +666,7 @@ def main():
             )
             if grad_nan:
                 optimizer.zero_grad()
-                nan_count += 1
+                nan_count += valid_samples
                 continue
 
             torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
@@ -655,9 +674,9 @@ def main():
             scheduler.step()
             global_step += 1
 
-            epoch_losses.append(loss_val.item())
-            epoch_ce.append(ce.item())
-            epoch_dice.append(dice.item())
+            epoch_losses.append(batch_loss / valid_samples)
+            epoch_ce.append(batch_ce / valid_samples)
+            epoch_dice.append(batch_dice / valid_samples)
 
             if epoch_losses:
                 postfix = {
