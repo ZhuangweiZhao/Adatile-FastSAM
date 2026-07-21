@@ -48,6 +48,7 @@ Dataset: 1600×256 steel strip images, RLE-encoded annotations, 4 defect classes
 
 from __future__ import annotations
 
+import random
 from pathlib import Path
 from typing import Optional
 
@@ -398,6 +399,42 @@ class SeverstalDataset(BaseSegDataset):
         """原始图像尺寸 (H, W) | Native image size (H, W)."""
         return (self.IMG_H, self.IMG_W)
 
+    def class_to_images(self, class_id: int) -> list[int]:
+        """
+        获取包含指定缺陷类的所有样本索引。
+        Return all dataset indices containing a given defect class.
+
+        遍历 _samples 和 _annotations, 找到包含指定 class_id 的图像，
+        返回其在数据集中的索引列表（可用于 dataset[idx]）。
+
+        Scans _samples and _annotations to find images containing the given
+        class_id, returning their dataset indices (usable as dataset[idx]).
+
+        :param class_id: 缺陷类 ID (1-4)。0 (background) 返回所有无缺陷图像。
+        :return: 可用于 dataset[idx] 的索引列表。
+        :raises ValueError: 如果 class_id 不在 [0, 1, 2, 3, 4] 范围内。
+        """
+        if class_id not in (0, 1, 2, 3, 4):
+            raise ValueError(
+                f"class_id must be 0-4, got {class_id}. "
+                f"0=clean images, 1-4=defect classes."
+            )
+
+        if class_id == 0:
+            return [
+                idx for idx, (_, has_defect) in enumerate(self._samples)
+                if not has_defect
+            ]
+
+        result = []
+        for idx, (name, has_defect) in enumerate(self._samples):
+            if not has_defect:
+                continue
+            ann = self._annotations.get(name, {})
+            if class_id in ann:
+                result.append(idx)
+        return result
+
     # ═══════════════════════════════════════════════════════════════
     # 类别统计 (惰性) | Class Stats (lazy)
     # ═══════════════════════════════════════════════════════════════
@@ -471,6 +508,67 @@ class SeverstalDataset(BaseSegDataset):
             return self._class_pixel_counts.get(class_id, 0) / max(total_px, 1)
         fg_px = sum(v for k, v in self._class_pixel_counts.items() if k > 0)
         return fg_px / max(total_px, 1)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 少样本采样工具 | Few-Shot Sampling Utility
+# ═══════════════════════════════════════════════════════════════════
+
+def sample_k_shot_severstal(
+    dataset: SeverstalDataset,
+    k: int = 5,
+    seed: int = 42,
+    include_clean: bool = True,
+    max_clean: int | None = None,
+) -> list[int]:
+    """
+    从 Severstal 数据集中每类采样 K 张图，返回去重后的训练子集索引。
+    Sample K images per defect class, return deduplicated training subset indices.
+
+    对每类缺陷 (1-4) 随机采样最多 K 张包含该类的图，取并集去重。
+    可选地加入无缺陷（干净）图像用于背景学习。
+
+    For each defect class (1-4), randomly samples up to K images containing
+    that class. Takes the union across all classes (deduplicated). Optionally
+    includes clean (defect-free) images for background learning.
+
+    :param dataset: SeverstalDataset 实例 (split="train")。
+    :param k: 每类采样图像数 | Number of images to sample per class.
+    :param seed: 随机种子 | Random seed for reproducibility.
+    :param include_clean: 是否包含无缺陷图像 | Whether to include clean images.
+    :param max_clean: 最多包含多少张无缺陷图 (None=全部) | Max clean images.
+    :return: 排序后的数据集索引列表 | Sorted list of dataset indices.
+    :raises ValueError: 如果 K 超过某类可用图像数。
+    """
+    rng = random.Random(seed)
+    selected: set[int] = set()
+
+    # ── 每类采样 K 张 | Sample K per class ──
+    for cls_id in [1, 2, 3, 4]:
+        candidates = dataset.class_to_images(cls_id)
+        if k > len(candidates):
+            raise ValueError(
+                f"K={k} exceeds available images for Class {cls_id} "
+                f"({len(candidates)} images). Reduce --k-shot or exclude this class."
+            )
+        n_pick = min(k, len(candidates))
+        picked = rng.sample(candidates, n_pick)
+        selected.update(picked)
+
+    n_defect = len(selected)
+
+    # ── 可选: 加入无缺陷图像 | Optional: add clean images ──
+    n_clean = 0
+    if include_clean:
+        clean_candidates = dataset.class_to_images(0)
+        if max_clean is not None:
+            clean_candidates = rng.sample(
+                clean_candidates, min(max_clean, len(clean_candidates))
+            )
+        selected.update(clean_candidates)
+        n_clean = len(selected) - n_defect
+
+    return sorted(selected)
 
 
 # ═══════════════════════════════════════════════════════════════════
