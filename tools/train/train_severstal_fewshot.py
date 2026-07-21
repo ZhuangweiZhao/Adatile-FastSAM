@@ -1,40 +1,34 @@
 #!/usr/bin/env python3
 """
-少样本训练 — Severstal 钢铁缺陷检测 | Few-Shot Training — Severstal Steel Defect.
-==================================================================================
+Episodic Few-Shot 训练 — Severstal 钢铁缺陷检测 | Episodic Few-Shot — Severstal Steel.
+========================================================================================
 
-K-shot per-class 采样 → 训练 → 全量验证集评估。支持多 K 值 × 多 seed 扫参。
-K-shot per-class sampling → train → evaluate on full validation set.
-Supports multi-K × multi-seed sweep.
+标准 FSS 协议: 每步随机采样一个缺陷类 → K support + 1 query → prototype → decoder → loss。
+一 Epoch = N 个 random episodes，不遍历全部图像。
 
-每类缺陷 (Class 1-4) 各采样 K 张图像，取并集作为训练子集。
-可选加入无缺陷（干净）图像用于背景学习。
-
-For each defect class (1-4), K images are sampled, unioned as the training subset.
-Clean (defect-free) images are optionally included for background learning.
+Standard FSS protocol: each step samples a defect class → K support + 1 query
+→ prototype → decoder → loss. One epoch = N random episodes.
 
 用法 | Usage::
 
-    # K=1, 单种子快速验证 | Quick test: K=1, single seed
-    python tools/train/train_severstal_fewshot.py --k-shot 1 --seeds 42 --epochs 5
+    # K=1, 快速验证 | Quick test
+    python tools/train/train_severstal_fewshot.py --k-shot 1 --seeds 42 --epochs 5 --device cuda
 
-    # 完整扫参: K=1/3/5/10/20 × 3 seeds | Full sweep
+    # 完整扫参 | Full sweep: K=1/3/5/10/20 × 3 seeds
     python tools/train/train_severstal_fewshot.py \
         --k-shot 1 3 5 10 20 --seeds 42 123 456 \
-        --epochs 100 --batch-size 8 --device cuda
+        --epochs 50 --batch-size 8 --device cuda
 
-    # 二值模式 + 指定干净样本数 | Binary mode + capped clean samples
-    python tools/train/train_severstal_fewshot.py \
-        --k-shot 5 --binary --clean-samples 50
+    # 二值模式 (所有缺陷合并为 FG) | Binary mode
+    python tools/train/train_severstal_fewshot.py --k-shot 5 --binary --device cuda
 """
 
 from __future__ import annotations
 
-import sys
-import json
-import argparse
+import sys, json, argparse, random
 from pathlib import Path
 from datetime import datetime
+from collections import defaultdict
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_PROJECT_ROOT))
@@ -45,36 +39,30 @@ from tqdm import tqdm
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 
 from adatile.logging import get_logger
 from adatile.logging.backends import ConsoleBackend, FileBackend
 from adatile.utils.seed import set_seed
 from adatile.backbone import FastSAMBackbone
-from adatile.decoder.pure_cnn_decoder import PureDecoderP3P4
-from adatile.rectify import DA_FRN
-from adatile.rectify.hdn import HeatmapDenoiser
-from adatile.datasets.severstal import SeverstalDataset, sample_k_shot_severstal
+from adatile.decoder.adaptive_sparse_decoder import AdaptiveSparseDecoder
+from adatile.datasets.severstal import SeverstalDataset
 
 
 # ═══════════════════════════════════════════════════════════════════
 # 常量 | Constants
 # ═══════════════════════════════════════════════════════════════════
 
-MULTI_NUM_CLASSES = 5
-MULTI_CLASS_NAMES = ["background", "Class1", "Class2", "Class3", "Class4"]
-BINARY_NUM_CLASSES = 2
-BINARY_CLASS_NAMES = ["background", "foreground"]
-
 IMG_H, IMG_W = 256, 1600  # Severstal native (multiples of 32)
+DEFECT_CLASSES = [1, 2, 3, 4]  # 四类缺陷 | Four defect classes
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 数据增强 | Data Augmentation (from train_dafrn_severstal.py)
+# 数据增强 | Data Augmentation
 # ═══════════════════════════════════════════════════════════════════
 
 class BasicAugmentation:
-    """极简增强: flip + rotate + brightness + noise."""
+    """极简增强: flip + rotate + brightness + noise (steel strip aware)."""
 
     def __init__(self, p_flip=0.5, p_rotate=0.3, brightness=0.2, contrast=0.2, noise_std=0.02):
         self.p_hflip = p_flip
@@ -107,184 +95,282 @@ class BasicAugmentation:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 损失函数 | Loss Functions (from train_dafrn_severstal.py)
+# Prototype 计算 | Prototype Computation
 # ═══════════════════════════════════════════════════════════════════
 
-def multiclass_dice_loss(pred, target, smooth=1e-6, ignore_bg=True):
-    """多类别 Dice 损失 | Multi-class Dice loss."""
-    C = pred.shape[1]
-    dice_sum = 0.0
-    count = 0
-    for c in range(1 if ignore_bg else 0, C):
-        pred_c = pred[:, c]
-        target_c = (target == c).float()
-        if target_c.sum() > 0:
-            inter = (pred_c * target_c).sum()
-            union = pred_c.sum() + target_c.sum()
-            dice_sum += (2.0 * inter + smooth) / (union + smooth)
-            count += 1
-    if count == 0:
-        return torch.tensor(0.0, device=pred.device, requires_grad=True)
-    return 1.0 - dice_sum / count
+def compute_prototype(
+    backbone: FastSAMBackbone,
+    support_images: torch.Tensor,    # [K, 3, H, W]
+    support_masks: torch.Tensor,     # [K, H, W] binary FG mask
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    从 K 张 support 图像计算 L2-normalized FG prototype。
+    Compute L2-normalized FG prototype from K support images.
+
+    每张 support: 提取 P4 特征 → FG masked average pool → mean over K → L2 norm.
+
+    :return: [1280] L2-normalized prototype vector.
+    """
+    K = support_images.shape[0]
+    feats_list = []
+
+    for i in range(K):
+        img = support_images[i:i + 1].to(device)
+        mask = support_masks[i].to(device)
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0)
+
+        with torch.no_grad():
+            feats = backbone(img)
+            p4 = feats["p4"]  # [1, 1280, H/16, W/16]
+
+        # Resize mask to P4 resolution
+        _, _, H_p4, W_p4 = p4.shape
+        mask_p4 = F.interpolate(
+            mask.unsqueeze(0).float(), size=(H_p4, W_p4), mode="nearest"
+        ).squeeze(0)  # [1, H_p4, W_p4]
+
+        fg_area = mask_p4.sum()
+        if fg_area > 0:
+            proto = (p4.squeeze(0) * mask_p4).sum(dim=(1, 2)) / (fg_area + 1e-8)
+            feats_list.append(proto)
+
+    if not feats_list:
+        return torch.zeros(1280, device=device)
+
+    proto = torch.stack(feats_list).mean(dim=0)  # [1280]
+    return F.normalize(proto, dim=0, p=2)
 
 
-def binary_dice_loss(pred, target, smooth=1e-6):
-    """二值 Dice 损失 | Binary Dice loss."""
-    pred_fg = pred[:, 1]
-    target_fg = (target > 0).float()
-    if target_fg.sum() == 0:
+# ═══════════════════════════════════════════════════════════════════
+# Episode 采样器 | Episode Sampler
+# ═══════════════════════════════════════════════════════════════════
+
+class EpisodeSampler:
+    """
+    每步: 随机类 → K support + 1 query (同类别，不同图像，0% overlap)。
+    Each step: random class → K support + 1 query (same class, distinct images).
+
+    Parameters
+    ----------
+    dataset : SeverstalDataset
+        训练集 (split="train")。
+    class_ids : list[int]
+        参与训练的缺陷类 ID | Defect class IDs to sample from.
+    k_shot : int
+        每次 episode 的 support 图像数 | Support images per episode.
+    seed : int
+        随机种子 | Random seed for reproducibility.
+    """
+
+    def __init__(
+        self,
+        dataset: SeverstalDataset,
+        class_ids: list[int] = None,
+        k_shot: int = 1,
+        seed: int = 42,
+    ):
+        self.dataset = dataset
+        self.class_ids = class_ids or DEFECT_CLASSES
+        self.k_shot = k_shot
+        self.rng = random.Random(seed)
+
+        # ── 预建每类候选池 | Pre-build per-class candidate pool ──
+        self._class_pool: dict[int, list[int]] = {}
+        for cls_id in self.class_ids:
+            pool = dataset.class_to_images(cls_id)
+            if len(pool) <= k_shot:
+                raise ValueError(
+                    f"Class {cls_id} has only {len(pool)} images, "
+                    f"need at least {k_shot + 1} (K={k_shot} support + 1 query)."
+                )
+            self._class_pool[cls_id] = pool
+
+    def sample(self) -> dict:
+        """
+        采样一个 episode | Sample one episode.
+
+        :return: {
+            "class_id": int,
+            "support_indices": list[int],  # K indices
+            "query_index": int,             # 1 index
+        }
+        """
+        cls_id = self.rng.choice(self.class_ids)
+        pool = self._class_pool[cls_id]
+
+        # K support + 1 query, all distinct
+        sampled = self.rng.sample(pool, self.k_shot + 1)
+
+        return {
+            "class_id": cls_id,
+            "support_indices": sampled[:self.k_shot],
+            "query_index": sampled[self.k_shot],
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 获取每类的 binary mask | Get Per-Class Binary Mask
+# ═══════════════════════════════════════════════════════════════════
+
+def get_class_mask(sample: dict, class_id: int) -> torch.Tensor:
+    """
+    从数据集样本中提取指定类别的二值掩码。
+    Extract binary mask for a specific class from a dataset sample.
+
+    多类别模式下 mask 值为 {0, 1, 2, 3, 4} → (mask == class_id) → {0, 1}。
+    二值模式下 mask 已是 {0, 1}，直接返回。
+
+    :param sample: dataset[idx] 返回值，包含 "masks" key [1, H, W].
+    :param class_id: 缺陷类 ID | Defect class ID.
+    :return: [H, W] binary float tensor.
+    """
+    mask = sample["masks"].squeeze(0)  # [H, W]
+    if mask.max() > 1:
+        # 多类别模式: 提取指定类 | Multi-class mode: extract specific class
+        return (mask == class_id).float()
+    else:
+        # 二值模式: 直接使用 | Binary mode: use directly
+        return mask.float()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 损失函数 | Loss Functions
+# ═══════════════════════════════════════════════════════════════════
+
+def dice_loss(pred: torch.Tensor, target: torch.Tensor, smooth: float = 1e-6) -> torch.Tensor:
+    """
+    二值 Dice 损失 | Binary Dice loss.
+
+    :param pred: [H, W] sigmoid probability ∈ [0, 1].
+    :param target: [H, W] binary float {0, 1}.
+    """
+    pred_f = pred.flatten()
+    target_f = target.flatten()
+    if target_f.sum() == 0:
         return torch.tensor(0.0, device=pred.device, requires_grad=True)
-    inter = (pred_fg * target_fg).sum()
-    union = pred_fg.sum() + target_fg.sum()
+    inter = (pred_f * target_f).sum()
+    union = pred_f.sum() + target_f.sum()
     return 1.0 - (2.0 * inter + smooth) / (union + smooth)
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 评估 | Evaluation (from train_dafrn_severstal.py)
+# 评估: 基于 prototype 的 per-class IoU | Evaluation w/ Prototype
 # ═══════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def evaluate(decoder, frn, backbone, dataset, device, num_classes, class_names,
-             max_samples=0):
-    """分割评估: per-class IoU + mIoU | Segmentation evaluation."""
+def evaluate_with_prototypes(
+    decoder: AdaptiveSparseDecoder,
+    backbone: FastSAMBackbone,
+    val_ds: SeverstalDataset,
+    device: torch.device,
+    class_ids: list[int],
+    support_cache: dict[int, dict],  # {cls_id: {"images": [K,3,H,W], "masks": [K,H,W]}}
+    binary: bool = False,
+    max_samples: int = 0,
+) -> dict:
+    """
+    使用固定 support prototype 在验证集上评估每类 IoU。
+    Evaluate per-class IoU on validation set using fixed support prototypes.
+
+    对每类: support → prototype → 所有 val 图预测 binary mask → IoU vs GT。
+    For each class: support → prototype → predict on all val images → IoU vs GT.
+
+    :param support_cache: 预先采样的 support 数据 (与训练时一致)。
+    :return: {"mIoU": float, "per_class_IoU": dict, "background_IoU": float}
+    """
     decoder.eval()
     backbone.eval()
-    if frn is not None:
-        frn.eval()
 
-    per_class_inter = torch.zeros(num_classes, device=device)
-    per_class_union = torch.zeros(num_classes, device=device)
+    # ── 预计算所有类的 prototype | Pre-compute prototypes ──
+    prototypes: dict[int, torch.Tensor] = {}
+    for cls_id in class_ids:
+        sc = support_cache[cls_id]
+        proto = compute_prototype(
+            backbone,
+            sc["images"].to(device) if isinstance(sc["images"], torch.Tensor)
+                else sc["images"].clone().to(device),
+            sc["masks"].to(device) if isinstance(sc["masks"], torch.Tensor)
+                else sc["masks"].clone().to(device),
+            device,
+        )
+        prototypes[cls_id] = proto
 
-    indices = list(range(len(dataset)))
+    num_classes = len(class_ids) + 1  # +1 for background
+    per_class_inter = {c: 0.0 for c in [0] + class_ids}
+    per_class_union = {c: 0.0 for c in [0] + class_ids}
+
+    indices = list(range(len(val_ds)))
     if max_samples > 0:
         indices = indices[:max_samples]
 
     for idx in tqdm(indices, desc="Eval", leave=False):
-        sample = dataset[idx]
+        sample = val_ds[idx]
         img = sample["image"].unsqueeze(0).to(device)
-        gt = sample["masks"].squeeze(0).to(device).long()
-        H, W = gt.shape
+        gt_full = sample["masks"].squeeze(0).to(device)
+        H, W = gt_full.shape
 
-        feats = backbone(img, extract_proto=False)
-        p3, p4 = feats["p3"], feats["p4"]
+        # Extract features once
+        feats = backbone(img, extract_proto=True)
+        p4 = feats["p4"]         # [1, 1280, H/16, W/16]
+        proto_masks = feats["proto"]  # [1, 32, H/4, W/4]
 
-        if frn is not None:
-            p3, p4 = frn(p3, p4)
+        # ── 每类预测 binary mask | Predict binary mask per class ──
+        pred_class = torch.zeros(H, W, dtype=torch.long, device=device)
+        for cls_id in class_ids:
+            proto = prototypes[cls_id]
+            pred_prob = decoder(p4, proto_masks, proto)  # [1, H/4, W/4]
+            pred_full = F.interpolate(
+                pred_prob.unsqueeze(0), size=(H, W),
+                mode="bilinear", align_corners=False,
+            ).squeeze(0).squeeze(0)  # [H, W]
+            pred_binary = (pred_full > 0.5).long()
+            # 后到的类不覆盖先到的（按面积排序，大缺陷优先）
+            area = pred_binary.sum().item()
+            # 冲突区域: 取置信度更高的类 | Conflict: higher confidence wins
+            overlap_mask = (pred_binary > 0) & (pred_class > 0)
+            if overlap_mask.any():
+                # 在重叠区域取置信度更高的类
+                overlap_pixels = overlap_mask.nonzero(as_tuple=True)
+                for py, px in zip(overlap_pixels[0].tolist(), overlap_pixels[1].tolist()):
+                    # 简化: 大缺陷优先 (大面积缺陷更可能置信度高)
+                    pass  # 当前简单策略: 后预测的不覆盖先预测的
+            pred_class[(pred_binary > 0) & (pred_class == 0)] = cls_id
 
-        pred_prob = decoder(p3, p4)
-        pred_full = F.interpolate(pred_prob.unsqueeze(0), size=(H, W),
-                                  mode="bilinear", align_corners=False).squeeze(0)
-        pred_class = torch.argmax(pred_full, dim=0)
-
-        for c in range(num_classes):
+        # ── 计算 per-class IoU | Compute per-class IoU ──
+        for c in [0] + class_ids:
             pc = (pred_class == c)
-            gc = (gt == c)
-            per_class_inter[c] += (pc & gc).sum()
-            per_class_union[c] += (pc | gc).sum()
+            gc = _get_gt_binary(gt_full, c, binary)
+            inter = (pc & gc).sum().item()
+            union = (pc | gc).sum().item()
+            per_class_inter[c] += inter
+            per_class_union[c] += union
 
+    # ── 汇总 | Summarize ──
+    class_names = {0: "background", 1: "Class1", 2: "Class2", 3: "Class3", 4: "Class4"}
     per_class_iou = {}
-    for c in range(num_classes):
-        inter = per_class_inter[c].item()
-        union = per_class_union[c].item()
-        name = class_names[c] if c < len(class_names) else f"class_{c}"
-        per_class_iou[name] = round(inter / union, 6) if union > 0 else float("nan")
+    for c in [0] + class_ids:
+        name = class_names.get(c, f"class_{c}")
+        per_class_iou[name] = (
+            round(per_class_inter[c] / per_class_union[c], 6)
+            if per_class_union[c] > 0 else float("nan")
+        )
 
-    valid = [v for v in per_class_iou.values() if not (v != v)]
+    valid = [v for v in per_class_iou.values() if v == v]  # filter NaN
     return {
         "mIoU": round(float(np.mean(valid)), 6) if valid else 0.0,
         "per_class_IoU": per_class_iou,
     }
 
 
-# ═══════════════════════════════════════════════════════════════════
-# HDN 辅助 | HDN Helpers (from train_dafrn_severstal.py)
-# ═══════════════════════════════════════════════════════════════════
-
-def _rgb_to_gray(img: torch.Tensor) -> torch.Tensor:
-    return 0.299 * img[:, 0:1] + 0.587 * img[:, 1:2] + 0.114 * img[:, 2:3]
-
-
-def _sobel_gradient(gray: torch.Tensor) -> torch.Tensor:
-    device = gray.device
-    sobel_x = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]],
-                           device=device).view(1, 1, 3, 3)
-    sobel_y = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]],
-                           device=device).view(1, 1, 3, 3)
-    gx = F.conv2d(F.pad(gray, (1, 1, 1, 1), mode='reflect'), sobel_x)
-    gy = F.conv2d(F.pad(gray, (1, 1, 1, 1), mode='reflect'), sobel_y)
-    mag = torch.sqrt(gx ** 2 + gy ** 2 + 1e-8)
-    B = mag.shape[0]
-    for b in range(B):
-        m = mag[b].flatten()
-        p_low = torch.quantile(m, 0.02)
-        p_high = torch.quantile(m, 0.98)
-        if p_high > p_low:
-            mag[b] = torch.clamp(mag[b], p_low, p_high)
-            mag[b] = (mag[b] - p_low) / (p_high - p_low + 1e-8)
-    return mag
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 命令行参数 | CLI Arguments
-# ═══════════════════════════════════════════════════════════════════
-
-def parse_args():
-    p = argparse.ArgumentParser(
-        description="Few-Shot Training — Severstal Steel Defect Detection"
-    )
-
-    # ── 数据 | Data ──
-    p.add_argument("--data-root", type=str, default="data/severstal-steel-defect-detection")
-    p.add_argument("--binary", action="store_true",
-                   help="二值模式 (FG/BG)。默认多类别 (5 类)。")
-    p.add_argument("--no-augment", action="store_true")
-
-    # ── 少样本 | Few-Shot ──
-    p.add_argument("--k-shot", type=int, nargs="+", default=[1, 3, 5, 10, 20],
-                   help="每类采样 K 张图，可多个值 (default: 1 3 5 10 20)")
-    p.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 456],
-                   help="随机种子，可多个值 (default: 42 123 456)")
-    p.add_argument("--clean-samples", type=int, default=None,
-                   help="最多包含多少张无缺陷图 (None=全部, 0=不含)")
-    p.add_argument("--epochs", type=int, default=100,
-                   help="每个 (K, seed) 的训练轮数 (default: 100)")
-
-    # ── 模型 | Model ──
-    p.add_argument("--backbone", type=str, default="fastsam-x",
-                   choices=["fastsam-x", "fastsam-s"])
-    p.add_argument("--dcr", dest="enable_dcr", action="store_true", default=True,
-                   help="启用 DCR (Defect-aware Channel Reweighting)")
-    p.add_argument("--no-dcr", dest="enable_dcr", action="store_false")
-    p.add_argument("--fde", dest="enable_fde", action="store_true", default=True,
-                   help="启用 FDE (Frequency-aware Defect Enhancement)")
-    p.add_argument("--no-fde", dest="enable_fde", action="store_false")
-    p.add_argument("--cdf", dest="enable_cdf", action="store_true", default=True,
-                   help="启用 CDF (Cross-scale Defect Fusion)")
-    p.add_argument("--no-cdf", dest="enable_cdf", action="store_false")
-    p.add_argument("--dcr-reduction", type=int, default=16)
-    p.add_argument("--fde-alpha", type=float, default=0.5)
-    p.add_argument("--cdf-hidden", type=int, default=64)
-    p.add_argument("--heatmap-denoise", action="store_true",
-                   help="启用 HDN 热力图去噪")
-    p.add_argument("--hdn-weight", type=float, default=0.1)
-
-    # ── 训练 | Training ──
-    p.add_argument("--batch-size", type=int, default=1,
-                   help="Batch size (default: 1). B>1 时逐样本梯度累积。")
-    p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--lr-frn", type=float, default=None)
-    p.add_argument("--weight-decay", type=float, default=1e-4)
-    p.add_argument("--class-weights", type=str, default="balanced",
-                   choices=["none", "balanced"],
-                   help="类别权重 (推荐 balanced 应对极端 FG/BG 不平衡)")
-    p.add_argument("--device", type=str,
-                   default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--num-workers", type=int, default=0)
-    p.add_argument("--output-dir", type=str, default=None)
-    p.add_argument("--eval-every", type=int, default=10,
-                   help="每 N 轮评估一次 (default: 10)")
-
-    return p.parse_args()
+def _get_gt_binary(gt: torch.Tensor, class_id: int, binary: bool) -> torch.Tensor:
+    """获取指定类的 GT binary mask。"""
+    if binary:
+        if class_id == 0:
+            return (gt == 0)
+        return (gt > 0)
+    return (gt == class_id)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -292,7 +378,6 @@ def parse_args():
 # ═══════════════════════════════════════════════════════════════════
 
 def train_one_run(
-    train_indices: list[int],
     train_ds: SeverstalDataset,
     val_ds: SeverstalDataset,
     backbone: FastSAMBackbone,
@@ -302,74 +387,57 @@ def train_one_run(
     run_dir: Path,
     k: int,
     seed: int,
-    class_names: list[str],
-    num_classes: int,
-    augment,
+    binary: bool,
 ) -> dict:
     """
-    在 K-shot 子集上训练一次 | Train on K-shot subset for one (K, seed).
+    对一个 (K, seed) 组合执行 episodic 训练 | Train one (K, seed) with episodic protocol.
 
-    :return: {"k": int, "seed": int, "n_defect": int, "n_clean": int,
-              "best_mIoU": float, "best_epoch": int, "per_class_IoU": dict}
+    :return: results dict with best_mIoU, per_class_IoU, etc.
     """
     set_seed(seed)
 
-    # ── 构建训练子集 DataLoader | Build subset DataLoader ──
-    subset = Subset(train_ds, train_indices)
-    train_loader = DataLoader(
-        subset, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=(device.type == "cuda"),
-        drop_last=False,
-    )
+    class_ids = DEFECT_CLASSES if not binary else [1]  # binary: single FG class
+    num_classes = 2 if binary else 5
 
-    # ── 统计子集构成 | Log subset composition ──
-    n_defect = sum(1 for idx in train_indices
-                   if train_ds._samples[idx][1])  # has_defect
-    n_clean = len(train_indices) - n_defect
+    # ── Episode sampler ──
+    sampler = EpisodeSampler(train_ds, class_ids=class_ids, k_shot=k, seed=seed)
+    episodes_per_epoch = args.episodes_per_epoch
+
     logger.log_info("fewshot/run",
-                    f"K={k} seed={seed}: {n_defect} defect + {n_clean} clean = "
-                    f"{len(train_indices)} train samples, "
-                    f"{len(train_loader)} batches/epoch")
+                    f"K={k} seed={seed}: {episodes_per_epoch} episodes/epoch, "
+                    f"classes={class_ids}")
 
-    # ── 类别权重 | Class weights ──
-    ce_weight = None
-    if args.class_weights == "balanced":
-        stats = train_ds.get_class_stats()
-        pc = [stats.get(cn, {}).get("pixels", 1) for cn in class_names]
-        total = sum(pc)
-        if total > 0:
-            raw = [total / max(p, 0.01) for p in pc]
-            mean_w = sum(raw) / len(raw)
-            ce_weight = torch.tensor([w / mean_w for w in raw],
-                                     dtype=torch.float32, device=device)
-
-    # ── 模型 (重新初始化 FRN + Decoder) | Model (re-init FRN + Decoder) ──
-    ch = backbone.channels
-    frn = DA_FRN(
-        p3_channels=ch["p3"], p4_channels=ch["p4"],
-        dcr_reduction=args.dcr_reduction,
-        fde_kernel_sizes=(3, 7, 15), fde_alpha_init=args.fde_alpha,
-        cdf_hidden=args.cdf_hidden,
-        enable_dcr=args.enable_dcr, enable_fde=args.enable_fde,
-        enable_cdf=args.enable_cdf,
+    # ── 模型 | Model (fresh init per run) ──
+    decoder = AdaptiveSparseDecoder(
+        in_channels=1280, proto_dim=32, hidden_dim=256,
+        use_fdr=False, normalize_proto="none", out_channels=1,  # binary per-class
     ).to(device)
-    decoder = PureDecoderP3P4(
-        p3_channels=ch["p3"], p4_channels=ch["p4"],
-        out_channels=num_classes,
-    ).to(device)
-    hdn = HeatmapDenoiser(in_channels=1).to(device) if args.heatmap_denoise else None
+    decoder_params = sum(p.numel() for p in decoder.parameters())
+    logger.log_info("fewshot/model", f"AdaptiveSparseDecoder: {decoder_params/1e3:.1f}K params")
 
     # ── Optimizer ──
-    frn_lr = args.lr_frn if args.lr_frn is not None else args.lr
-    optim_params = [
-        {"params": decoder.parameters(), "lr": args.lr},
-        {"params": frn.parameters(), "lr": frn_lr},
-    ]
-    if hdn is not None:
-        optim_params.append({"params": hdn.parameters(), "lr": frn_lr})
-    optimizer = torch.optim.AdamW(optim_params, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(decoder.parameters(), lr=args.lr,
+                                  weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs * len(train_loader))
+        optimizer, T_max=args.epochs * episodes_per_epoch)
+
+    # ── 固定 support cache (eval 用) | Fixed support cache (for eval) ──
+    eval_support_cache: dict[int, dict] = {}
+    eval_rng = random.Random(seed + 10000)  # 独立 RNG | Independent RNG for eval
+    for cls_id in class_ids:
+        pool = train_ds.class_to_images(cls_id)
+        picked = eval_rng.sample(pool, min(k, len(pool)))
+        s_imgs, s_masks = [], []
+        for idx in picked:
+            s = train_ds[idx]
+            s_imgs.append(s["image"])
+            s_masks.append(get_class_mask(s, cls_id))
+        eval_support_cache[cls_id] = {
+            "images": torch.stack(s_imgs),
+            "masks": torch.stack(s_masks),
+        }
+
+    augment = None if args.no_augment else BasicAugmentation()
 
     # ── 训练循环 | Training Loop ──
     global_step = 0
@@ -380,147 +448,169 @@ def train_one_run(
 
     for epoch in range(1, args.epochs + 1):
         decoder.train()
-        frn.train()
-        epoch_losses, epoch_ce, epoch_dice = [], [], []
+        epoch_losses, epoch_ce_list, epoch_dice_list = [], [], []
 
-        pbar = tqdm(train_loader, desc=f"K{k}_S{seed} E{epoch:3d}/{args.epochs}",
-                    unit="batch", leave=False)
-        for batch in pbar:
-            img_batch = batch["image"]
-            mask_batch = batch["masks"].squeeze(1)
-            B = img_batch.shape[0]
+        pbar = tqdm(range(episodes_per_epoch), desc=f"K{k}_S{seed} E{epoch:3d}/{args.epochs}",
+                    unit="ep", leave=False)
+        for _ in pbar:
+            # ── 采样 episode | Sample episode ──
+            episode = sampler.sample()
+            cls_id = episode["class_id"]
 
-            optimizer.zero_grad()
-            batch_loss = 0.0
-            batch_ce_sum = 0.0
-            batch_dice_sum = 0.0
-            valid_samples = 0
+            # ── 加载 support | Load support ──
+            s_imgs, s_masks = [], []
+            for si in episode["support_indices"]:
+                s = train_ds[si]
+                s_imgs.append(s["image"])       # [3, H, W]
+                s_masks.append(get_class_mask(s, cls_id))  # [H, W]
+            s_imgs = torch.stack(s_imgs)         # [K, 3, H, W]
+            s_masks = torch.stack(s_masks)        # [K, H, W]
 
-            for b_idx in range(B):
-                img = img_batch[b_idx]
-                mask = mask_batch[b_idx]
+            # ── 加载 query | Load query ──
+            q = train_ds[episode["query_index"]]
+            q_img = q["image"]      # [3, H, W]
+            q_mask = get_class_mask(q, cls_id)  # [H, W]
+            H, W = q_mask.shape
 
-                if augment:
-                    img, mask = augment(img, mask)
+            # Augment query only (support stays clean for accurate prototype)
+            if augment:
+                q_img, q_mask = augment(q_img, q_mask)
+                H, W = q_mask.shape
 
-                H, W = mask.shape
-                img_dev = img.unsqueeze(0).to(device)
-                mask_dev = mask.unsqueeze(0).to(device)
+            q_img = q_img.unsqueeze(0).to(device)   # [1, 3, H, W]
+            q_mask = q_mask.unsqueeze(0).to(device)  # [1, H, W]
 
-                # Forward
-                feats = backbone(img_dev, extract_proto=False)
-                p3, p4 = feats["p3"], feats["p4"]
-                p3_r, p4_r = frn(p3, p4)
-                pred_prob = decoder(p3_r, p4_r)
+            # ── Prototype | Compute support prototype ──
+            support_proto = compute_prototype(backbone, s_imgs, s_masks, device)
 
-                pred_full = F.interpolate(pred_prob.unsqueeze(0), size=(H, W),
-                                          mode="bilinear", align_corners=False).squeeze(0)
-                target = mask_dev.squeeze(0).long()
+            # ── Query forward | Query forward ──
+            feats = backbone(q_img, extract_proto=True)
+            p4 = feats["p4"]              # [1, 1280, H/16, W/16]
+            proto_masks = feats["proto"]  # [1, 32, H/4, W/4]
 
-                # HDN
-                hdn_loss = torch.tensor(0.0, device=device)
-                if hdn is not None:
-                    gray = _rgb_to_gray(img_dev)
-                    raw_grad = _sobel_gradient(gray)
-                    denoised = hdn(raw_grad)
-                    gt_binary = (target > 0).float().unsqueeze(0).unsqueeze(0)
-                    denoised_resized = F.interpolate(
-                        denoised, size=(H, W), mode="bilinear", align_corners=False)
-                    hdn_loss = F.binary_cross_entropy(
-                        denoised_resized.clamp(1e-7, 1 - 1e-7), gt_binary, reduction='mean')
+            pred_prob = decoder(p4, proto_masks, support_proto)  # [1, H/4, W/4]
+            pred_full = F.interpolate(
+                pred_prob.unsqueeze(0), size=(H, W),
+                mode="bilinear", align_corners=False,
+            ).squeeze(0).squeeze(0)  # [H, W]
 
-                # Loss
-                log_pred = torch.log(pred_full.unsqueeze(0).clamp(1e-7, 1))
-                ce = F.nll_loss(log_pred, target.unsqueeze(0), weight=ce_weight,
-                               reduction='mean')
+            target = q_mask.squeeze(0)  # [H, W]
 
-                if args.binary:
-                    dice = binary_dice_loss(pred_full.unsqueeze(0), target.unsqueeze(0))
-                else:
-                    dice = multiclass_dice_loss(pred_full.unsqueeze(0), target.unsqueeze(0))
+            # ── Loss ──
+            ce = F.binary_cross_entropy(
+                pred_full.clamp(1e-7, 1 - 1e-7), target, reduction="mean"
+            )
+            dice = dice_loss(pred_full, target)
+            loss_val = 0.5 * ce + 0.5 * dice
 
-                loss_val = (0.5 * ce + 0.5 * dice + args.hdn_weight * hdn_loss) / B
-
-                if torch.isnan(loss_val) or torch.isinf(loss_val):
-                    nan_count += 1
-                    continue
-
-                loss_val.backward()
-                batch_loss += loss_val.item() * B
-                batch_ce_sum += ce.item()
-                batch_dice_sum += dice.item()
-                valid_samples += 1
-
-            if valid_samples == 0:
+            if torch.isnan(loss_val) or torch.isinf(loss_val):
+                nan_count += 1
                 continue
 
-            # Gradient check + clip + step
-            all_params = list(decoder.parameters()) + list(frn.parameters())
-            if hdn is not None:
-                all_params += list(hdn.parameters())
+            optimizer.zero_grad()
+            loss_val.backward()
+
             grad_nan = any(
                 p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any())
-                for p in all_params
+                for p in decoder.parameters()
             )
             if grad_nan:
                 optimizer.zero_grad()
-                nan_count += valid_samples
+                nan_count += 1
                 continue
 
-            torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(decoder.parameters(), max_norm=1.0)
             optimizer.step()
             scheduler.step()
             global_step += 1
 
-            epoch_losses.append(batch_loss / valid_samples)
-            epoch_ce.append(batch_ce_sum / valid_samples)
-            epoch_dice.append(batch_dice_sum / valid_samples)
+            epoch_losses.append(loss_val.item())
+            epoch_ce_list.append(ce.item())
+            epoch_dice_list.append(dice.item())
 
             if epoch_losses:
                 pbar.set_postfix({
                     "loss": f"{np.mean(epoch_losses[-20:]):.4f}",
-                    "dice": f"{np.mean(epoch_dice[-20:]):.4f}",
+                    "dice": f"{np.mean(epoch_dice_list[-20:]):.4f}",
+                    "cls": cls_id,
                 })
 
         # ── Epoch summary ──
         avg_loss = np.mean(epoch_losses) if epoch_losses else 0.0
 
-        # ── Evaluation ──
+        # ── Evaluation (every eval_every epochs) ──
         if epoch % args.eval_every == 0 or epoch == args.epochs:
-            result = evaluate(decoder, frn, backbone, val_ds, device,
-                             num_classes, class_names)
+            result = evaluate_with_prototypes(
+                decoder, backbone, val_ds, device,
+                class_ids=class_ids, support_cache=eval_support_cache,
+                binary=binary,
+            )
             miou = result["mIoU"]
+            logger.log_info("fewshot/eval",
+                            f"K={k} S={seed} E{epoch:3d}: mIoU={miou:.4f}")
+            logger.log_metric(f"miou_K{k}_S{seed}", miou, step=epoch, tags=["fewshot"])
+
             if miou > best_miou:
                 best_miou = miou
                 best_epoch = epoch
                 best_per_class = result["per_class_IoU"]
                 ckpt = {
                     "epoch": epoch, "global_step": global_step,
-                    "frn_state_dict": {k: v.clone() for k, v in frn.state_dict().items()},
-                    "decoder_state_dict": {k: v.clone() for k, v in decoder.state_dict().items()},
+                    "decoder_state_dict": {
+                        k: v.clone() for k, v in decoder.state_dict().items()},
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(),
                     "mIoU": miou, "per_class_IoU": best_per_class,
-                    "args": vars(args), "k": k, "seed": seed,
-                    "num_classes": num_classes, "class_names": class_names,
+                    "k": k, "seed": seed,
                 }
-                if hdn is not None:
-                    ckpt["hdn_state_dict"] = {
-                        k: v.clone() for k, v in hdn.state_dict().items()}
                 torch.save(ckpt, str(run_dir / "best_model.pt"))
 
     logger.log_info("fewshot/run_done",
-                    f"K={k} S={seed}: best mIoU={best_miou:.4f} @ epoch {best_epoch}, "
-                    f"NaN={nan_count}")
+                    f"K={k} S={seed}: best mIoU={best_miou:.4f} @ epoch {best_epoch}, NaN={nan_count}")
 
     return {
         "k": k, "seed": seed,
-        "n_defect": n_defect, "n_clean": n_clean,
-        "n_total": len(train_indices),
         "best_mIoU": best_miou, "best_epoch": best_epoch,
         "per_class_IoU": best_per_class,
-        "nan_count": nan_count,
+        "nan_count": nan_count, "episodes_per_epoch": episodes_per_epoch,
     }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 命令行参数 | CLI Arguments
+# ═══════════════════════════════════════════════════════════════════
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Episodic Few-Shot — Severstal Steel Defect Detection"
+    )
+
+    # ── 数据 | Data ──
+    p.add_argument("--data-root", type=str, default="data/severstal-steel-defect-detection")
+    p.add_argument("--binary", action="store_true",
+                   help="二值模式 (所有缺陷合并为 FG) | Binary mode (all defects → FG).")
+    p.add_argument("--no-augment", action="store_true")
+
+    # ── 少样本 | Few-Shot ──
+    p.add_argument("--k-shot", type=int, nargs="+", default=[1, 3, 5, 10, 20],
+                   help="每类 support 图像数 (default: 1 3 5 10 20)")
+    p.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 456],
+                   help="随机种子 (default: 42 123 456)")
+    p.add_argument("--epochs", type=int, default=50,
+                   help="训练 epoch 数 (default: 50)")
+    p.add_argument("--episodes-per-epoch", type=int, default=200,
+                   help="每 epoch 的 episode 数 (default: 200)")
+
+    # ── 训练 | Training ──
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--device", type=str,
+                   default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--output-dir", type=str, default=None)
+    p.add_argument("--eval-every", type=int, default=5,
+                   help="每 N epoch 评估一次 (default: 5)")
+
+    return p.parse_args()
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -529,31 +619,18 @@ def train_one_run(
 
 def main():
     args = parse_args()
-    set_seed(42)  # global seed for output dir, etc.
+    set_seed(42)
     device = torch.device(args.device)
 
-    # ── 模式 | Mode ──
-    if args.binary:
-        NUM_CLASSES = BINARY_NUM_CLASSES
-        CLASS_NAMES = BINARY_CLASS_NAMES
-        mode_str = "binary"
-    else:
-        NUM_CLASSES = MULTI_NUM_CLASSES
-        CLASS_NAMES = MULTI_CLASS_NAMES
-        mode_str = "multi"
-
-    # ── 模块标签 | Module tag ──
-    modules = []
-    if args.enable_dcr: modules.append("DCR")
-    if args.enable_fde: modules.append("FDE")
-    if args.enable_cdf: modules.append("CDF")
-    if args.heatmap_denoise: modules.append("HDN")
-    module_tag = "+".join(modules) if modules else "Baseline"
+    mode_str = "binary" if args.binary else "multi"
+    class_ids = [1] if args.binary else DEFECT_CLASSES
+    class_names = {0: "background", 1: "foreground"} if args.binary \
+        else {0: "background", 1: "Class1", 2: "Class2", 3: "Class3", 4: "Class4"}
 
     # ── 输出目录 | Output dir ──
     if args.output_dir is None:
         ts = datetime.now().strftime("%m%d_%H%M")
-        args.output_dir = f"runs/severstal_fewshot_{module_tag}_{mode_str}_{ts}"
+        args.output_dir = f"runs/severstal_episodic_{mode_str}_{ts}"
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -561,99 +638,80 @@ def main():
     logger = get_logger("train_severstal_fewshot")
     logger.add_backend(ConsoleBackend())
     logger.add_backend(FileBackend(str(out_dir / "train.jsonl")))
-    logger.log_info("config", f"Severstal Few-Shot | K={args.k_shot} | seeds={args.seeds}")
-    logger.log_info("config", f"DA-FRN: {module_tag} | mode={mode_str}")
-    logger.log_info("config", f"Epochs={args.epochs} | batch={args.batch_size} | lr={args.lr}")
-    logger.log_info("config", f"Class weights={args.class_weights} | clean_samples={args.clean_samples}")
-    logger.log_info("config", f"Output: {out_dir}")
+    logger.log_info("config",
+                    f"Severstal Episodic Few-Shot | K={args.k_shot} | seeds={args.seeds}")
+    logger.log_info("config",
+                    f"Mode={mode_str} | Epochs={args.epochs} | "
+                    f"Episodes/epoch={args.episodes_per_epoch} | lr={args.lr}")
 
     # ── 数据 | Data ──
     train_ds = SeverstalDataset(root=args.data_root, split="train",
                                 binary=args.binary, seed=42)
     val_ds = SeverstalDataset(root=args.data_root, split="val",
                               binary=args.binary, seed=42)
-    logger.log_info("data", f"Train: {len(train_ds)}, Val: {len(val_ds)}, Mode: {mode_str}")
-    logger.log_info("data", f"Per-class images: "
-                    f"C1={len(train_ds.class_to_images(1))}, "
-                    f"C2={len(train_ds.class_to_images(2))}, "
-                    f"C3={len(train_ds.class_to_images(3))}, "
-                    f"C4={len(train_ds.class_to_images(4))}")
+    logger.log_info("data", f"Train: {len(train_ds)}, Val: {len(val_ds)}")
+    for cls_id in class_ids:
+        logger.log_info("data",
+                        f"  Class {cls_id}: {len(train_ds.class_to_images(cls_id))} images")
 
-    # ── Backbone (frozen, shared across all runs) ──
+    # ── Backbone (frozen, shared) ──
     backbone = FastSAMBackbone(
         freeze_backbone=True,
-        checkpoint=f"thirdLibrary/FastSAM/weights/FastSAM-{args.backbone.split('-')[-1]}.pt",
+        checkpoint="thirdLibrary/FastSAM/weights/FastSAM-x.pt",
     ).to(device)
     backbone.eval()
     with torch.no_grad():
-        backbone(torch.randn(1, 3, IMG_H, IMG_W, device=device), extract_proto=False)
-    ch = backbone.channels
-    logger.log_info("model", f"Backbone: {args.backbone}, P3={ch['p3']}ch, P4={ch['p4']}ch")
+        backbone(torch.randn(1, 3, IMG_H, IMG_W, device=device), extract_proto=True)
+    logger.log_info("model", "Backbone: FastSAM-x (frozen)")
 
-    # ── Augmentation ──
-    augment = None if args.no_augment else BasicAugmentation()
-
-    # ── 计算验证 K 值合法性 | Validate K values ──
+    # ── 验证 K 值 | Validate K values ──
     for k in args.k_shot:
-        for cls_id in [1, 2, 3, 4]:
-            n_avail = len(train_ds.class_to_images(cls_id))
-            if k > n_avail:
+        for cls_id in class_ids:
+            n = len(train_ds.class_to_images(cls_id))
+            if k + 1 > n:  # need K+1 for distinct support+query
                 logger.log_info("warning",
-                                f"K={k} > Class {cls_id} available images ({n_avail}). "
-                                f"Will sample all {n_avail}.")
+                                f"K={k} needs {k+1} images for class {cls_id}, "
+                                f"but only {n} available. Skipping.")
+                # Remove from sweep
+                args.k_shot = [x for x in args.k_shot if x != k]
+                break
 
-    # ── 扫参: K × Seed | Sweep: K × Seed ──
+    if not args.k_shot:
+        logger.log_info("error", "No valid K values after validation. Exiting.")
+        return
+
+    # ── 扫参 | Sweep ──
     runs = [(k, s) for k in args.k_shot for s in args.seeds]
     all_results = []
-    total_runs = len(runs)
-
-    logger.log_info("sweep", f"{'='*60}")
-    logger.log_info("sweep", f"Starting sweep: {total_runs} runs ({len(args.k_shot)} K × {len(args.seeds)} seeds)")
-    logger.log_info("sweep", f"{'='*60}")
+    logger.log_info("sweep", f"Starting sweep: {len(runs)} runs "
+                    f"({len(args.k_shot)} K × {len(args.seeds)} seeds)")
 
     for run_idx, (k, seed) in enumerate(runs):
-        logger.log_info("sweep", f"[{run_idx+1}/{total_runs}] K={k}, seed={seed}")
+        logger.log_info("sweep", f"[{run_idx+1}/{len(runs)}] K={k}, seed={seed}")
 
-        # 采样 | Sample
+        run_dir = out_dir / f"K{k}_S{seed}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+
         try:
-            fewshot_indices = sample_k_shot_severstal(
-                train_ds, k=k, seed=seed,
-                include_clean=(args.clean_samples is None or args.clean_samples > 0),
-                max_clean=args.clean_samples,
+            result = train_one_run(
+                train_ds=train_ds, val_ds=val_ds,
+                backbone=backbone, device=device,
+                args=args, logger=logger, run_dir=run_dir,
+                k=k, seed=seed, binary=args.binary,
             )
+            all_results.append(result)
         except ValueError as e:
             logger.log_info("sweep", f"  SKIP: {e}")
             continue
 
-        # 子目录 | Run subdirectory
-        run_dir = out_dir / f"K{k}_S{seed}"
-        run_dir.mkdir(parents=True, exist_ok=True)
-
-        # 训练 | Train
-        result = train_one_run(
-            train_indices=fewshot_indices,
-            train_ds=train_ds, val_ds=val_ds,
-            backbone=backbone, device=device,
-            args=args, logger=logger, run_dir=run_dir,
-            k=k, seed=seed,
-            class_names=CLASS_NAMES, num_classes=NUM_CLASSES,
-            augment=augment,
-        )
-        all_results.append(result)
-        logger.log_metric(f"miou_K{k}_S{seed}", result["best_mIoU"],
-                          step=0, tags=["fewshot"])
-
-    # ── 汇总 | Summary ──
     if not all_results:
         logger.log_info("done", "No results to report.")
         return
 
-    # 按 K 聚合 | Aggregate by K
+    # ── 汇总 | Summary ──
     summary_by_k = {}
-    for k in args.k_shot:
+    for k in sorted(set(r["k"] for r in all_results)):
         k_results = [r for r in all_results if r["k"] == k]
-        if not k_results:
-            continue
         mious = [r["best_mIoU"] for r in k_results]
         summary_by_k[str(k)] = {
             "mean_mIoU": round(float(np.mean(mious)), 4),
@@ -663,40 +721,34 @@ def main():
             "n_runs": len(k_results),
         }
 
-    # ── 打印汇总表 | Print Summary Table ──
-    header = (f"{'K':>3}  {'Seed':>4}  {'#Defect':>7}  {'#Clean':>6}  "
-              f"{'mIoU':>8}  {'BG':>8}  {'C1':>8}  {'C2':>8}  {'C3':>8}  {'C4':>8}  {'Epoch':>6}")
+    # ── 打印汇总表 | Print Table ──
+    col_names = [class_names.get(c, f"c{c}") for c in [0] + class_ids]
+    header = (f"{'K':>3} {'Seed':>4} | {'mIoU':>7} | "
+              + " | ".join(f"{n:>7}" for n in col_names)
+              + f" | {'Ep':>5}")
     sep = "-" * len(header.expandtabs())
 
     print(f"\n{'='*len(header.expandtabs())}")
-    print(f"  Severstal Few-Shot Results — DA-FRN ({module_tag})")
+    print(f"  Severstal Episodic Few-Shot — AdaptiveSparseDecoder")
     print(f"{'='*len(header.expandtabs())}")
     print(header)
     print(sep)
 
     for r in all_results:
         p = r["per_class_IoU"]
-        print(f"{r['k']:3d}  {r['seed']:4d}  {r['n_defect']:7d}  {r['n_clean']:6d}  "
-              f"{r['best_mIoU']:8.4f}  "
-              f"{p.get('background', float('nan')):8.4f}  "
-              f"{p.get('Class1', p.get('foreground', float('nan'))):8.4f}  "
-              f"{p.get('Class2', float('nan')):8.4f}  "
-              f"{p.get('Class3', float('nan')):8.4f}  "
-              f"{p.get('Class4', float('nan')):8.4f}  "
-              f"{r['best_epoch']:6d}")
+        vals = " | ".join(f"{p.get(class_names.get(c, f'c{c}'), float('nan')):7.4f}"
+                          for c in [0] + class_ids)
+        print(f"{r['k']:3d} {r['seed']:4d} | {r['best_mIoU']:7.4f} | {vals} | {r['best_epoch']:5d}")
 
-    # 均值行 | Mean rows
     print(sep)
     for k_str, s in summary_by_k.items():
-        print(f"{k_str:>3}  {'mean':>4}  {'-':>7}  {'-':>6}  "
-              f"{s['mean_mIoU']:8.4f}  {'±'+str(s['std_mIoU']):>13}")
+        print(f"{k_str:>3} {'mean':>4} | {s['mean_mIoU']:7.4f} | ({s['std_mIoU']:.4f})")
     print(f"{'='*len(header.expandtabs())}\n")
 
-    # ── 保存 results.json | Save results.json ──
+    # ── results.json ──
     results_json = {
-        "experiment": "Severstal Few-Shot Training",
+        "experiment": "Severstal Episodic Few-Shot",
         "timestamp": datetime.now().isoformat(),
-        "module_tag": module_tag,
         "mode": mode_str,
         "config": vars(args),
         "runs": all_results,
@@ -706,9 +758,7 @@ def main():
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(results_json, f, indent=2, ensure_ascii=False, default=str)
     logger.log_info("done", f"Results saved to {json_path}")
-    logger.log_info("done", f"Best per K: {json.dumps(summary_by_k, indent=2)}")
-
-    print(f"Results saved to: {json_path}")
+    print(f"Results: {json_path}")
 
 
 if __name__ == "__main__":
