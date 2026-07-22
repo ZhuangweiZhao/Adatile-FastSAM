@@ -57,6 +57,7 @@ from matplotlib.colors import LinearSegmentedColormap
 
 from adatile.backbone import FastSAMBackbone
 from adatile.decoder.adaptive_sparse_decoder import AdaptiveSparseDecoder
+from adatile.decoder.film_decoder import FiLMDecoder
 from adatile.datasets.severstal import SeverstalDataset
 
 # ═══════════════════════════════════════════════════════════════════
@@ -273,6 +274,101 @@ def ablation_forward(
 
 
 # ═══════════════════════════════════════════════════════════════════
+# FiLM Decoder 分步前向 | FiLM Decoder Instrumented Forward
+# ═══════════════════════════════════════════════════════════════════
+
+@torch.no_grad()
+def instrumented_forward_film(
+    decoder: FiLMDecoder,
+    p4_features: torch.Tensor,
+    support_proto: torch.Tensor,
+) -> dict:
+    """
+    FiLM Decoder 分步前向, 捕获 γ/β 和中间特征。
+    Step through FiLM decoder, capturing γ/β and intermediate features.
+
+    :return: {
+        "gamma": [256],
+        "beta": [256],
+        "modulated_feat": [256, H/16, W/16] (flattened mean),
+        "final_mask": [H/4, W/4],
+    }
+    """
+    if support_proto.dim() == 2:
+        support_proto = support_proto.squeeze(0)
+    B = p4_features.shape[0]
+
+    # ── FiLM γ/β ──
+    gamma = decoder.film_gamma(support_proto)  # [256]
+    beta = decoder.film_beta(support_proto)     # [256]
+
+    # ── P4 projection ──
+    feat = decoder.feat_proj(p4_features)  # [B, 256, H/16, W/16]
+
+    # ── FiLM modulation ──
+    gamma_exp = gamma.view(1, -1, 1, 1)
+    beta_exp = beta.view(1, -1, 1, 1)
+    feat_mod = gamma_exp * feat + beta_exp  # [B, 256, H/16, W/16]
+
+    # ── Refinement + Mask ──
+    feat_refined = decoder.feat_refine(feat_mod)
+    logit = decoder.mask_head(feat_refined)
+    final_up = F.interpolate(logit, scale_factor=4, mode="bilinear", align_corners=False)
+    final_mask = torch.sigmoid(final_up.squeeze(1))  # [B, H/4, W/4]
+
+    return {
+        "gamma": gamma.cpu().numpy(),              # [256]
+        "beta": beta.cpu().numpy(),                 # [256]
+        "modulated_feat_mean": feat_mod.squeeze(0).mean(dim=(1, 2)).cpu().numpy(),  # [256]
+        "final_mask": final_mask.squeeze(0).cpu().numpy(),  # [H/4, W/4]
+        "gamma_l2": float(gamma.norm().item()),
+        "beta_l2": float(beta.norm().item()),
+    }
+
+
+@torch.no_grad()
+def ablation_forward_film(
+    decoder: FiLMDecoder,
+    p4_features: torch.Tensor,
+    support_proto: torch.Tensor,
+    zero_proto: torch.Tensor,
+) -> dict:
+    """
+    FiLM Ablation: Normal Prototype vs Zero Prototype.
+    Prototype=0 → γ≈1, β≈0 (从初始化的行为).
+    如果 Normal ≈ Zero → Proto 对 FiLM 无影响.
+    """
+    if support_proto.dim() == 2:
+        support_proto = support_proto.squeeze(0)
+
+    # Normal
+    gamma = decoder.film_gamma(support_proto)
+    beta = decoder.film_beta(support_proto)
+    feat = decoder.feat_proj(p4_features)
+    feat_mod_norm = gamma.view(1, -1, 1, 1) * feat + beta.view(1, -1, 1, 1)
+    feat_ref = decoder.feat_refine(feat_mod_norm)
+    logit_n = decoder.mask_head(feat_ref)
+    mask_norm = torch.sigmoid(F.interpolate(
+        logit_n, scale_factor=4, mode="bilinear", align_corners=False,
+    ).squeeze(1))
+
+    # Zero Proto
+    gamma_z = decoder.film_gamma(zero_proto.to(support_proto.device))
+    beta_z = decoder.film_beta(zero_proto.to(support_proto.device))
+    feat_mod_zero = gamma_z.view(1, -1, 1, 1) * feat + beta_z.view(1, -1, 1, 1)
+    feat_ref_z = decoder.feat_refine(feat_mod_zero)
+    logit_z = decoder.mask_head(feat_ref_z)
+    mask_zero = torch.sigmoid(F.interpolate(
+        logit_z, scale_factor=4, mode="bilinear", align_corners=False,
+    ).squeeze(1))
+
+    return {
+        "normal": mask_norm.squeeze(0).cpu().numpy(),
+        "zero_proto": mask_zero.squeeze(0).cpu().numpy(),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
 # 主审计函数 | Main Audit Function
 # ═══════════════════════════════════════════════════════════════════
 
@@ -295,23 +391,21 @@ def run_info_flow_audit(
     decoder.eval()
     backbone.eval()
 
-    # ── 每类数据容器 | Per-class data containers ──
-    # Prototype level
-    support_protos: dict[int, np.ndarray] = {}  # {cls: [1280]}
-    # Coeff level
-    per_class_coeffs: dict[int, list[np.ndarray]] = defaultdict(list)  # {cls: [[32], ...]}
-    # Proto Mask level
-    per_class_proto_masks: dict[int, list[np.ndarray]] = defaultdict(list)  # {cls: [[H/4,W/4], ...]}
-    # Refined level
-    per_class_refined: dict[int, list[np.ndarray]] = defaultdict(list)
-    # Final Mask level
-    per_class_final: dict[int, list[np.ndarray]] = defaultdict(list)
-    # Contribution ratios
-    per_class_contrib: dict[int, list[float]] = defaultdict(list)
-    # Ablation masks (proto_only, p4_only, full)
-    per_class_ablation: dict[int, list[dict]] = defaultdict(list)
+    # ── 检测 Decoder 类型 | Detect Decoder Type ──
+    is_film = isinstance(decoder, FiLMDecoder)
 
-    H4, W4 = IMG_H // 4, IMG_W // 4  # 64, 400
+    # ── 每类数据容器 | Per-class data containers ──
+    support_protos: dict[int, np.ndarray] = {}
+    per_class_coeffs: dict[int, list[np.ndarray]] = defaultdict(list)
+    per_class_proto_masks: dict[int, list[np.ndarray]] = defaultdict(list)
+    per_class_refined: dict[int, list[np.ndarray]] = defaultdict(list)
+    per_class_final: dict[int, list[np.ndarray]] = defaultdict(list)
+    per_class_contrib: dict[int, list[float]] = defaultdict(list)
+    per_class_ablation: dict[int, list[dict]] = defaultdict(list)
+    per_class_gamma: dict[int, list[np.ndarray]] = defaultdict(list)
+    per_class_beta: dict[int, list[np.ndarray]] = defaultdict(list)
+
+    zero_proto = torch.zeros(1280)
 
     for cls_id in DEFECT_CLASSES:
         pool = dataset.class_to_images(cls_id)
@@ -340,42 +434,55 @@ def run_info_flow_audit(
         # ── Per-query instrumented forward ──
         for idx in tqdm(query_indices, desc=f"  Class {cls_id}", leave=False):
             q = dataset[idx]
-            q_img = q["image"].unsqueeze(0).to(device)  # [1, 3, 256, 1600]
-            q_mask_full = get_class_mask(q, cls_id)       # [256, 1600] binary
+            q_img = q["image"].unsqueeze(0).to(device)
 
-            # Backbone forward
             feats = backbone(q_img, extract_proto=True)
-            p4 = feats["p4"]         # [1, 1280, H/16, W/16]
-            proto_masks = feats["proto"]  # [1, 32, H/4, W/4]
+            p4 = feats["p4"]
+            proto_masks = feats["proto"]
 
-            # Instrumented decoder forward
-            result = instrumented_forward(
-                decoder, p4, proto_masks, sp, device,
-            )
+            if is_film:
+                result = instrumented_forward_film(decoder, p4, sp)
+                per_class_gamma[cls_id].append(result["gamma"])
+                per_class_beta[cls_id].append(result["beta"])
+                per_class_final[cls_id].append(result["final_mask"])
+                abl = ablation_forward_film(decoder, p4, sp, zero_proto)
+            else:
+                result = instrumented_forward(
+                    decoder, p4, proto_masks, sp, device,
+                )
+                per_class_coeffs[cls_id].append(result["coeffs"])
+                per_class_proto_masks[cls_id].append(result["proto_mask"])
+                per_class_refined[cls_id].append(result["refined_up"])
+                per_class_final[cls_id].append(result["final_mask"])
+                per_class_contrib[cls_id].append(result["contribution_ratio"])
+                abl = ablation_forward(decoder, p4, proto_masks, sp)
 
-            per_class_coeffs[cls_id].append(result["coeffs"])
-            per_class_proto_masks[cls_id].append(result["proto_mask"])
-            per_class_refined[cls_id].append(result["refined_up"])
-            per_class_final[cls_id].append(result["final_mask"])
-            per_class_contrib[cls_id].append(result["contribution_ratio"])
-
-            # Ablation
-            abl = ablation_forward(decoder, p4, proto_masks, sp)
             per_class_ablation[cls_id].append(abl)
 
     # ── 转换为 numpy | Convert to numpy ──
     def stack_dict(d, cls_ids):
         return {c: np.stack(d[c]) for c in cls_ids}
 
-    coeffs_data = stack_dict(per_class_coeffs, DEFECT_CLASSES)
-    proto_mask_data = stack_dict(per_class_proto_masks, DEFECT_CLASSES)
-    refined_data = stack_dict(per_class_refined, DEFECT_CLASSES)
     final_data = stack_dict(per_class_final, DEFECT_CLASSES)
-    contrib_data = {c: np.array(per_class_contrib[c]) for c in DEFECT_CLASSES}
     ablation_data = {c: per_class_ablation[c] for c in DEFECT_CLASSES}
 
+    if is_film:
+        gamma_data = stack_dict(per_class_gamma, DEFECT_CLASSES)
+        beta_data = stack_dict(per_class_beta, DEFECT_CLASSES)
+        coeffs_data = {}
+        proto_mask_data = {}
+        refined_data = {}
+        contrib_data = {}
+    else:
+        coeffs_data = stack_dict(per_class_coeffs, DEFECT_CLASSES)
+        proto_mask_data = stack_dict(per_class_proto_masks, DEFECT_CLASSES)
+        refined_data = stack_dict(per_class_refined, DEFECT_CLASSES)
+        contrib_data = {c: np.array(per_class_contrib[c]) for c in DEFECT_CLASSES}
+        gamma_data = {}
+        beta_data = {}
+
     # ═══════════════════════════════════════════════════════════════
-    # Stage 0: Prototype — 类间余弦相似度
+    # Stage 0: Prototype — 类间余弦相似度 (共用) | Common
     # ═══════════════════════════════════════════════════════════════
     proto_cross_cos = cross_class_cosine(
         {c: support_protos[c][np.newaxis, :] for c in DEFECT_CLASSES}
@@ -384,152 +491,148 @@ def run_info_flow_audit(
         {c: support_protos[c][np.newaxis, :] for c in DEFECT_CLASSES}
     )
 
-    # ═══════════════════════════════════════════════════════════════
-    # Stage 1: Coeff — 类间余弦相似度 + std
-    # ═══════════════════════════════════════════════════════════════
-    coeff_cross_cos = cross_class_cosine(coeffs_data)
-    coeff_within_sim = within_class_similarity(coeffs_data)
-    coeff_per_class_std = {
-        c: float(np.mean(np.std(coeffs_data[c], axis=0)))
-        for c in DEFECT_CLASSES
-    }
-
-    # Coeff PCA (合并所有 query)
-    all_coeffs = np.concatenate([coeffs_data[c] for c in DEFECT_CLASSES], axis=0)
-    all_coeff_labels = np.concatenate([
-        np.full(coeffs_data[c].shape[0], c) for c in DEFECT_CLASSES
-    ])
-    if all_coeffs.shape[0] >= 4:
-        pca = PCA(n_components=2)
-        coeff_pca_2d = pca.fit_transform(all_coeffs)
-        coeff_pca_var = pca.explained_variance_ratio_.tolist()
-    else:
-        coeff_pca_2d = np.zeros((all_coeffs.shape[0], 2))
-        coeff_pca_var = [0, 0]
-
-    # ═══════════════════════════════════════════════════════════════
-    # Stage 2: Proto Mask — 类间相似度 (spatial)
-    # ═══════════════════════════════════════════════════════════════
-    # 展平为向量计算 | Flatten to vectors for similarity
-    proto_mask_flat = {
-        c: proto_mask_data[c].reshape(proto_mask_data[c].shape[0], -1)
-        for c in DEFECT_CLASSES
-    }
-    proto_mask_cross_cos = cross_class_cosine(proto_mask_flat)
-    proto_mask_within_sim = within_class_similarity(proto_mask_flat)
-
-    # 类间 IoU (取每类平均 mask → 二值化 → IoU)
-    proto_mask_mean = {c: proto_mask_data[c].mean(axis=0) for c in DEFECT_CLASSES}
-    proto_mask_cross_iou = 0.0
-    iou_pairs = 0
-    for i, ci in enumerate(DEFECT_CLASSES):
-        for cj in DEFECT_CLASSES[i + 1:]:
-            a = proto_mask_mean[ci] > 0.5
-            b = proto_mask_mean[cj] > 0.5
-            inter = (a & b).sum()
-            union = (a | b).sum()
-            if union > 0:
-                proto_mask_cross_iou += float(inter / union)
-                iou_pairs += 1
-    proto_mask_cross_iou = proto_mask_cross_iou / max(iou_pairs, 1)
-
-    # ═══════════════════════════════════════════════════════════════
-    # Stage 3: P4 Refined — 类间相似度
-    # ═══════════════════════════════════════════════════════════════
-    refined_flat = {
-        c: refined_data[c].reshape(refined_data[c].shape[0], -1)
-        for c in DEFECT_CLASSES
-    }
-    refined_cross_cos = cross_class_cosine(refined_flat)
-    refined_within_sim = within_class_similarity(refined_flat)
-
-    # ═══════════════════════════════════════════════════════════════
-    # Stage 4: Final Mask — 类间相似度
-    # ═══════════════════════════════════════════════════════════════
-    final_flat = {
-        c: final_data[c].reshape(final_data[c].shape[0], -1)
-        for c in DEFECT_CLASSES
-    }
-    final_cross_cos = cross_class_cosine(final_flat)
-    final_within_sim = within_class_similarity(final_flat)
-
-    # ═══════════════════════════════════════════════════════════════
-    # Branch Contribution | 分支贡献
-    # ═══════════════════════════════════════════════════════════════
-    contrib_mean = {c: float(np.mean(contrib_data[c])) for c in DEFECT_CLASSES}
-    contrib_global = float(np.mean(list(contrib_mean.values())))
-
-    # ═══════════════════════════════════════════════════════════════
-    # Ablation: mask diversity (类间差异)
-    # ═══════════════════════════════════════════════════════════════
-    ablation_cross_cos = {}
-    for mode in ["proto_only", "p4_only", "full"]:
-        mode_data = {}
-        for cls_id in DEFECT_CLASSES:
-            masks = np.stack([abl[mode] for abl in ablation_data[cls_id]])
-            mode_data[cls_id] = masks.reshape(masks.shape[0], -1)
-        ablation_cross_cos[mode] = cross_class_cosine(mode_data)
-
-    return {
-        # Per-class support prototypes
-        "support_protos": {c: support_protos[c].tolist() for c in DEFECT_CLASSES},
-        # Stage metrics
-        "stage_metrics": {
-            "prototype": {
-                "cross_class_cosine": proto_cross_cos,
-                "within_class_similarity": proto_within_sim,
-                "discrimination": 1.0 - proto_cross_cos,
-            },
-            "coeff": {
-                "cross_class_cosine": coeff_cross_cos,
-                "within_class_similarity": coeff_within_sim,
-                "per_class_std": coeff_per_class_std,
-                "pca_variance_ratio": coeff_pca_var,
-            },
-            "proto_mask": {
-                "cross_class_cosine": proto_mask_cross_cos,
-                "within_class_similarity": proto_mask_within_sim,
-                "cross_class_iou": proto_mask_cross_iou,
-            },
-            "refined": {
-                "cross_class_cosine": refined_cross_cos,
-                "within_class_similarity": refined_within_sim,
-            },
-            "final": {
-                "cross_class_cosine": final_cross_cos,
-                "within_class_similarity": final_within_sim,
-            },
-        },
-        # Signal decay curve
-        "signal_decay": {
-            "stages": ["Prototype", "Coeff", "ProtoMask", "Refined", "Final"],
-            "cross_class_cosine": [
-                proto_cross_cos, coeff_cross_cos, proto_mask_cross_cos,
-                refined_cross_cos, final_cross_cos,
-            ],
-            "discrimination": [
-                1.0 - x for x in [
-                    proto_cross_cos, coeff_cross_cos, proto_mask_cross_cos,
-                    refined_cross_cos, final_cross_cos,
-                ]
-            ],
-        },
-        # Branch contribution
-        "branch_contribution": {
-            "per_class": contrib_mean,
-            "global_mean": contrib_global,
-        },
+    if is_film:
+        # ═══════════════════════════════════════════════════════════
+        # FiLM: Gamma + Beta + Final | 3 阶段
+        # ═══════════════════════════════════════════════════════════
+        gamma_cross_cos = cross_class_cosine(gamma_data)
+        gamma_within_sim = within_class_similarity(gamma_data)
+        gamma_per_class_std = {
+            c: float(np.mean(np.std(gamma_data[c], axis=0)))
+            for c in DEFECT_CLASSES
+        }
+        beta_cross_cos = cross_class_cosine(beta_data)
+        beta_within_sim = within_class_similarity(beta_data)
+        beta_per_class_std = {
+            c: float(np.mean(np.std(beta_data[c], axis=0)))
+            for c in DEFECT_CLASSES
+        }
+        # Gamma PCA
+        all_gamma = np.concatenate([gamma_data[c] for c in DEFECT_CLASSES], axis=0)
+        all_gamma_labels = np.concatenate([
+            np.full(gamma_data[c].shape[0], c) for c in DEFECT_CLASSES
+        ])
+        if all_gamma.shape[0] >= 4:
+            pca = PCA(n_components=2)
+            gamma_pca_2d = pca.fit_transform(all_gamma)
+            gamma_pca_var = pca.explained_variance_ratio_.tolist()
+        else:
+            gamma_pca_2d = np.zeros((all_gamma.shape[0], 2))
+            gamma_pca_var = [0, 0]
+        # Final mask
+        final_flat = {c: final_data[c].reshape(final_data[c].shape[0], -1) for c in DEFECT_CLASSES}
+        final_cross_cos = cross_class_cosine(final_flat)
+        final_within_sim = within_class_similarity(final_flat)
         # Ablation
-        "ablation": ablation_cross_cos,
-        # Raw data for visualization
-        "raw": {
-            "coeffs_2d": coeff_pca_2d.tolist(),
-            "coeff_labels": all_coeff_labels.tolist(),
-            "coeffs_per_class": {c: coeffs_data[c].tolist() for c in DEFECT_CLASSES},
-            "proto_mask_mean": {c: proto_mask_mean[c].tolist() for c in DEFECT_CLASSES},
-            "contrib_per_class": contrib_mean,
-        },
-    }
+        ablation_cross_cos = {"normal": 0.0, "zero_proto": 0.0}
+        for mode in ["normal", "zero_proto"]:
+            mode_data = {}
+            for cls_id in DEFECT_CLASSES:
+                masks = np.stack([abl[mode] for abl in ablation_data[cls_id]])
+                mode_data[cls_id] = masks.reshape(masks.shape[0], -1)
+            ablation_cross_cos[mode] = cross_class_cosine(mode_data)
+
+        # ── 信号衰减 | Signal Decay (FiLM: 4 stages) ──
+        signal_stages = ["Prototype", "Gamma", "Beta", "Final"]
+        signal_cos = [proto_cross_cos, gamma_cross_cos, beta_cross_cos, final_cross_cos]
+        signal_disc = [1.0 - x for x in signal_cos]
+
+        return {
+            "support_protos": {c: support_protos[c].tolist() for c in DEFECT_CLASSES},
+            "stage_metrics": {
+                "prototype": {"cross_class_cosine": proto_cross_cos, "within_class_similarity": proto_within_sim, "discrimination": 1.0 - proto_cross_cos},
+                "gamma": {"cross_class_cosine": gamma_cross_cos, "within_class_similarity": gamma_within_sim, "per_class_std": gamma_per_class_std, "pca_variance_ratio": gamma_pca_var},
+                "beta": {"cross_class_cosine": beta_cross_cos, "within_class_similarity": beta_within_sim, "per_class_std": beta_per_class_std},
+                "final": {"cross_class_cosine": final_cross_cos, "within_class_similarity": final_within_sim},
+            },
+            "signal_decay": {"stages": signal_stages, "cross_class_cosine": signal_cos, "discrimination": signal_disc},
+            "branch_contribution": {"per_class": {}, "global_mean": 0.0},
+            "ablation": ablation_cross_cos,
+            "raw": {
+                "coeffs_2d": gamma_pca_2d.tolist(), "coeff_labels": all_gamma_labels.tolist(),
+                "coeffs_per_class": {c: gamma_data[c].tolist() for c in DEFECT_CLASSES},
+                "proto_mask_mean": {}, "contrib_per_class": {},
+                "is_film": True,
+            },
+        }
+
+    else:
+        # ═══════════════════════════════════════════════════════════
+        # Adaptive: Coeff + ProtoMask + Refined + Final | 5 阶段 (原有逻辑)
+        # ═══════════════════════════════════════════════════════════
+        coeff_cross_cos = cross_class_cosine(coeffs_data)
+        coeff_within_sim = within_class_similarity(coeffs_data)
+        coeff_per_class_std = {c: float(np.mean(np.std(coeffs_data[c], axis=0))) for c in DEFECT_CLASSES}
+        all_coeffs = np.concatenate([coeffs_data[c] for c in DEFECT_CLASSES], axis=0)
+        all_coeff_labels = np.concatenate([np.full(coeffs_data[c].shape[0], c) for c in DEFECT_CLASSES])
+        if all_coeffs.shape[0] >= 4:
+            pca = PCA(n_components=2)
+            coeff_pca_2d = pca.fit_transform(all_coeffs)
+            coeff_pca_var = pca.explained_variance_ratio_.tolist()
+        else:
+            coeff_pca_2d = np.zeros((all_coeffs.shape[0], 2))
+            coeff_pca_var = [0, 0]
+
+        proto_mask_flat = {c: proto_mask_data[c].reshape(proto_mask_data[c].shape[0], -1) for c in DEFECT_CLASSES}
+        proto_mask_cross_cos = cross_class_cosine(proto_mask_flat)
+        proto_mask_within_sim = within_class_similarity(proto_mask_flat)
+        proto_mask_mean = {c: proto_mask_data[c].mean(axis=0) for c in DEFECT_CLASSES}
+        proto_mask_cross_iou = 0.0
+        iou_pairs = 0
+        for i, ci in enumerate(DEFECT_CLASSES):
+            for cj in DEFECT_CLASSES[i + 1:]:
+                a = proto_mask_mean[ci] > 0.5
+                b = proto_mask_mean[cj] > 0.5
+                inter = (a & b).sum()
+                union = (a | b).sum()
+                if union > 0:
+                    proto_mask_cross_iou += float(inter / union)
+                    iou_pairs += 1
+        proto_mask_cross_iou = proto_mask_cross_iou / max(iou_pairs, 1)
+
+        refined_flat = {c: refined_data[c].reshape(refined_data[c].shape[0], -1) for c in DEFECT_CLASSES}
+        refined_cross_cos = cross_class_cosine(refined_flat)
+        refined_within_sim = within_class_similarity(refined_flat)
+
+        final_flat = {c: final_data[c].reshape(final_data[c].shape[0], -1) for c in DEFECT_CLASSES}
+        final_cross_cos = cross_class_cosine(final_flat)
+        final_within_sim = within_class_similarity(final_flat)
+
+        contrib_mean = {c: float(np.mean(contrib_data[c])) for c in DEFECT_CLASSES}
+        contrib_global = float(np.mean(list(contrib_mean.values())))
+
+        ablation_cross_cos = {}
+        for mode in ["proto_only", "p4_only", "full"]:
+            mode_data = {}
+            for cls_id in DEFECT_CLASSES:
+                masks = np.stack([abl[mode] for abl in ablation_data[cls_id]])
+                mode_data[cls_id] = masks.reshape(masks.shape[0], -1)
+            ablation_cross_cos[mode] = cross_class_cosine(mode_data)
+
+        signal_stages = ["Prototype", "Coeff", "ProtoMask", "Refined", "Final"]
+        signal_cos = [proto_cross_cos, coeff_cross_cos, proto_mask_cross_cos, refined_cross_cos, final_cross_cos]
+        signal_disc = [1.0 - x for x in signal_cos]
+
+        return {
+            "support_protos": {c: support_protos[c].tolist() for c in DEFECT_CLASSES},
+            "stage_metrics": {
+                "prototype": {"cross_class_cosine": proto_cross_cos, "within_class_similarity": proto_within_sim, "discrimination": 1.0 - proto_cross_cos},
+                "coeff": {"cross_class_cosine": coeff_cross_cos, "within_class_similarity": coeff_within_sim, "per_class_std": coeff_per_class_std, "pca_variance_ratio": coeff_pca_var},
+                "proto_mask": {"cross_class_cosine": proto_mask_cross_cos, "within_class_similarity": proto_mask_within_sim, "cross_class_iou": proto_mask_cross_iou},
+                "refined": {"cross_class_cosine": refined_cross_cos, "within_class_similarity": refined_within_sim},
+                "final": {"cross_class_cosine": final_cross_cos, "within_class_similarity": final_within_sim},
+            },
+            "signal_decay": {"stages": signal_stages, "cross_class_cosine": signal_cos, "discrimination": signal_disc},
+            "branch_contribution": {"per_class": contrib_mean, "global_mean": contrib_global},
+            "ablation": ablation_cross_cos,
+            "raw": {
+                "coeffs_2d": coeff_pca_2d.tolist(), "coeff_labels": all_coeff_labels.tolist(),
+                "coeffs_per_class": {c: coeffs_data[c].tolist() for c in DEFECT_CLASSES},
+                "proto_mask_mean": {c: proto_mask_mean[c].tolist() for c in DEFECT_CLASSES},
+                "contrib_per_class": contrib_mean,
+                "is_film": False,
+            },
+        }
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -558,15 +661,23 @@ def load_backbone_and_decoder(checkpoint_path: str, device: torch.device, logger
     with torch.no_grad():
         backbone(torch.randn(1, 3, IMG_H, IMG_W, device=device), extract_proto=True)
 
-    # ── Decoder ──
-    decoder = AdaptiveSparseDecoder(
-        in_channels=1280, proto_dim=32, hidden_dim=256,
-        use_fdr=False, normalize_proto="none", out_channels=1,
-    ).to(device)
-    decoder.load_state_dict(ckpt["decoder_state_dict"])
-    decoder.eval()
-    logger(f"Decoder: {sum(p.numel() for p in decoder.parameters())/1e3:.1f}K params restored")
+    # ── Decoder (auto-detect FiLM vs Adaptive) ──
+    dec_state = ckpt["decoder_state_dict"]
+    is_film_ckpt = any("film_gamma" in k for k in dec_state.keys())
 
+    if is_film_ckpt:
+        decoder = FiLMDecoder(in_channels=1280, hidden_dim=256).to(device)
+        decoder.load_state_dict(dec_state)
+        logger(f"Decoder: FiLM {sum(p.numel() for p in decoder.parameters())/1e3:.1f}K params restored")
+    else:
+        decoder = AdaptiveSparseDecoder(
+            in_channels=1280, proto_dim=32, hidden_dim=256,
+            use_fdr=False, normalize_proto="none", out_channels=1,
+        ).to(device)
+        decoder.load_state_dict(dec_state)
+        logger(f"Decoder: AdaptiveSparse {sum(p.numel() for p in decoder.parameters())/1e3:.1f}K params restored")
+
+    decoder.eval()
     return backbone, decoder, lora_rank
 
 
@@ -707,11 +818,12 @@ def plot_proto_mask_grid(audit: dict, output_path: Path, label: str):
 # ═══════════════════════════════════════════════════════════════════
 
 def print_audit_report(audit: dict, label: str):
-    """打印审计报告 | Print audit report."""
+    """打印审计报告 | Print audit report (Adaptive or FiLM)."""
     sm = audit["stage_metrics"]
     decay = audit["signal_decay"]
     bc = audit["branch_contribution"]
     abl = audit["ablation"]
+    is_film = audit.get("raw", {}).get("is_film", False)
 
     print(f"\n{'═'*80}")
     print(f"  Decoder Information Flow Audit — {label}")
@@ -731,72 +843,108 @@ def print_audit_report(audit: dict, label: str):
         print(f"  │ {stage:<14} {cos_v:<18.4f} {disc_v:<16.4f} {drop_str:<12}{marker}")
     print(f"  └{'─'*60}")
 
-    # ── Coeff Details ──
-    print(f"\n  ┌─ COEFF PREDICTOR DETAILS {'─'*48}")
-    coeff_m = sm["coeff"]
-    print(f"  │ Cross-Class Cosine:  {coeff_m['cross_class_cosine']:.4f}")
-    print(f"  │ Within-Class Sim:    {coeff_m['within_class_similarity']:.4f}")
-    print(f"  │ PCA Var Ratio:       PC1={coeff_m['pca_variance_ratio'][0]*100:.1f}%  "
-          f"PC2={coeff_m['pca_variance_ratio'][1]*100:.1f}%")
-    for cls_id in DEFECT_CLASSES:
-        std = coeff_m["per_class_std"].get(cls_id, coeff_m["per_class_std"].get(str(cls_id), 0))
-        print(f"  │ Coeff Std ({CLASS_NAMES[cls_id]}): {std:.4f}")
-    print(f"  └{'─'*60}")
+    if is_film:
+        # ── Gamma/Beta Details ──
+        gamma_m = sm.get("gamma", {})
+        beta_m = sm.get("beta", {})
+        print(f"\n  ┌─ FiLM GAMMA/BETA DETAILS {'─'*48}")
+        print(f"  │ Gamma Cross-Class Cosine: {gamma_m.get('cross_class_cosine', 0):.4f}")
+        print(f"  │ Beta Cross-Class Cosine:   {beta_m.get('cross_class_cosine', 0):.4f}")
+        if 'pca_variance_ratio' in gamma_m:
+            pca_v = gamma_m['pca_variance_ratio']
+            print(f"  │ Gamma PCA: PC1={pca_v[0]*100:.1f}%  PC2={pca_v[1]*100:.1f}%")
+        for cls_id in DEFECT_CLASSES:
+            g_std = gamma_m.get("per_class_std", {}).get(cls_id, gamma_m.get("per_class_std", {}).get(str(cls_id), 0))
+            b_std = beta_m.get("per_class_std", {}).get(cls_id, beta_m.get("per_class_std", {}).get(str(cls_id), 0))
+            print(f"  │ Gamma/Beta Std ({CLASS_NAMES[cls_id]}): γ={g_std:.4f}  β={b_std:.4f}")
+        print(f"  └{'─'*60}")
 
-    # ── Branch Contribution ──
-    print(f"\n  ┌─ BRANCH CONTRIBUTION {'─'*51}")
-    for cls_id in DEFECT_CLASSES:
-        pct = bc["per_class"].get(cls_id, bc["per_class"].get(str(cls_id), 0))
-        bar = "█" * int(pct * 40) + "░" * (40 - int(pct * 40))
-        print(f"  │ {CLASS_NAMES[cls_id]:<10} P4={pct:.3f}  Proto={1-pct:.3f}  [{bar}]")
-    print(f"  │ {'─'*50}")
-    print(f"  │ GLOBAL: P4 branch = {bc['global_mean']*100:.1f}%, Proto branch = {(1-bc['global_mean'])*100:.1f}%")
-    print(f"  └{'─'*60}")
+        # ── Ablation (normal vs zero) ──
+        print(f"\n  ┌─ ABLATION: NORMAL vs ZERO PROTOTYPE (lower=better) {'─'*21}")
+        for mode in ["normal", "zero_proto"]:
+            print(f"  │ {mode:<15} {abl.get(mode, 0):.4f}")
+        normal_val = abl.get("normal", 1.0)
+        zero_val = abl.get("zero_proto", 1.0)
+        if abs(normal_val - zero_val) < 0.01:
+            print(f"  │ ⚠ NORMAL ≈ ZERO → Prototype has NO effect on FiLM output!")
+        else:
+            print(f"  │ ✓ Prototype DOES affect output (Δ={abs(normal_val-zero_val):.4f})")
+        print(f"  └{'─'*60}")
 
-    # ── Ablation ──
-    print(f"\n  ┌─ ABLATION: CROSS-CLASS COSINE (lower=better) {'─'*31}")
-    for mode in ["proto_only", "p4_only", "full"]:
-        val = abl[mode]
-        print(f"  │ {mode:<15} {val:.4f}")
-    print(f"  └{'─'*60}")
-
-    # ── Verdict ──
-    print(f"\n  ┌─ BOTTLENECK VERDICT {'─'*51}")
-    # Find the stage with the largest discrimination drop
-    max_drop_stage = ""
-    max_drop_val = 0
-    for i in range(1, len(disc_vals)):
-        drop = disc_vals[i - 1] - disc_vals[i]
-        if drop > max_drop_val:
-            max_drop_val = drop
-            max_drop_stage = stages[i]
-
-    if max_drop_val > 0.02:
-        print(f"  │ ⚠ LARGEST DROP: {max_drop_stage} (Δdisc = -{max_drop_val:.4f})")
-        if max_drop_stage == "Coeff":
-            print(f"  │ → ProtoCoeffPredictor is the BOTTLENECK.")
-            print(f"  │ → Class-specific prototype info is LOST in the MLP.")
-            print(f"  │ → Fix: Cross-Attention or FiLM instead of MLP.")
-        elif max_drop_stage == "ProtoMask":
-            print(f"  │ → Proto Basis is the BOTTLENECK.")
-            print(f"  │ → Different coeffs produce similar masks (basis redundancy).")
-            print(f"  │ → Fix: Regularize proto basis orthogonality.")
-        elif max_drop_stage == "Refined":
-            print(f"  │ → P4 Refinement is the BOTTLENECK.")
-            print(f"  │ → P4 branch produces similar output regardless of class.")
-            print(f"  │ → Fix: Condition P4 refinement on prototype (FiLM).")
-        elif max_drop_stage == "Final":
-            print(f"  │ → Fusion step dilutes discrimination.")
-            print(f"  │ → Fix: Adjust fusion weight or use gating.")
+        # ── Verdict ──
+        print(f"\n  ┌─ BOTTLENECK VERDICT {'─'*51}")
+        max_drop_stage = ""
+        max_drop_val = 0
+        for i in range(1, len(disc_vals)):
+            drop = disc_vals[i - 1] - disc_vals[i]
+            if drop > max_drop_val:
+                max_drop_val = drop
+                max_drop_stage = stages[i]
+        if max_drop_val > 0.02:
+            print(f"  │ ⚠ LARGEST DROP: {max_drop_stage} (Δdisc = -{max_drop_val:.4f})")
+            if max_drop_stage == "Gamma":
+                print(f"  │ → FiLM Gamma is the BOTTLENECK — γ same for all classes.")
+                print(f"  │ → Prototype info lost at the modulation stage.")
+            elif max_drop_stage == "Beta":
+                print(f"  │ → FiLM Beta is the BOTTLENECK — β same for all classes.")
+        else:
+            print(f"  │ ➡ NO single bottleneck.")
+        print(f"  └{'─'*60}")
     else:
-        print(f"  │ ➡ NO single bottleneck — discrimination is uniformly low at all stages.")
+        # ── Coeff Details ──
+        print(f"\n  ┌─ COEFF PREDICTOR DETAILS {'─'*48}")
+        coeff_m = sm["coeff"]
+        print(f"  │ Cross-Class Cosine:  {coeff_m['cross_class_cosine']:.4f}")
+        print(f"  │ Within-Class Sim:    {coeff_m['within_class_similarity']:.4f}")
+        print(f"  │ PCA Var Ratio:       PC1={coeff_m['pca_variance_ratio'][0]*100:.1f}%  "
+              f"PC2={coeff_m['pca_variance_ratio'][1]*100:.1f}%")
+        for cls_id in DEFECT_CLASSES:
+            std = coeff_m["per_class_std"].get(cls_id, coeff_m["per_class_std"].get(str(cls_id), 0))
+            print(f"  │ Coeff Std ({CLASS_NAMES[cls_id]}): {std:.4f}")
+        print(f"  └{'─'*60}")
 
-    if bc["global_mean"] > 0.7:
-        print(f"  │")
-        print(f"  │ ⚠ P4 BRANCH DOMINATES ({bc['global_mean']*100:.0f}% contribution).")
-        print(f"  │ → Prototype pathway is effectively BYPASSED.")
-        print(f"  │ → Performance gain (if any) comes from P4, NOT prototype.")
-    print(f"  └{'─'*60}")
+        # ── Branch Contribution ──
+        print(f"\n  ┌─ BRANCH CONTRIBUTION {'─'*51}")
+        for cls_id in DEFECT_CLASSES:
+            pct = bc["per_class"].get(cls_id, bc["per_class"].get(str(cls_id), 0))
+            bar = "█" * int(pct * 40) + "░" * (40 - int(pct * 40))
+            print(f"  │ {CLASS_NAMES[cls_id]:<10} P4={pct:.3f}  Proto={1-pct:.3f}  [{bar}]")
+        print(f"  │ {'─'*50}")
+        print(f"  │ GLOBAL: P4 branch = {bc['global_mean']*100:.1f}%, Proto branch = {(1-bc['global_mean'])*100:.1f}%")
+        print(f"  └{'─'*60}")
+
+        # ── Ablation ──
+        print(f"\n  ┌─ ABLATION: CROSS-CLASS COSINE (lower=better) {'─'*31}")
+        for mode in ["proto_only", "p4_only", "full"]:
+            print(f"  │ {mode:<15} {abl[mode]:.4f}")
+        print(f"  └{'─'*60}")
+
+        # ── Verdict ──
+        print(f"\n  ┌─ BOTTLENECK VERDICT {'─'*51}")
+        max_drop_stage = ""
+        max_drop_val = 0
+        for i in range(1, len(disc_vals)):
+            drop = disc_vals[i - 1] - disc_vals[i]
+            if drop > max_drop_val:
+                max_drop_val = drop
+                max_drop_stage = stages[i]
+        if max_drop_val > 0.02:
+            print(f"  │ ⚠ LARGEST DROP: {max_drop_stage} (Δdisc = -{max_drop_val:.4f})")
+            if max_drop_stage == "Coeff":
+                print(f"  │ → ProtoCoeffPredictor is the BOTTLENECK.")
+                print(f"  │ → Class-specific prototype info is LOST in the MLP.")
+                print(f"  │ → Fix: Cross-Attention or FiLM instead of MLP.")
+            elif max_drop_stage == "ProtoMask":
+                print(f"  │ → Proto Basis is the BOTTLENECK.")
+            elif max_drop_stage == "Refined":
+                print(f"  │ → P4 Refinement is the BOTTLENECK.")
+        else:
+            print(f"  │ ➡ NO single bottleneck.")
+        if bc["global_mean"] > 0.7:
+            print(f"  │")
+            print(f"  │ ⚠ P4 BRANCH DOMINATES ({bc['global_mean']*100:.0f}% contribution).")
+            print(f"  │ → Prototype pathway is effectively BYPASSED.")
+        print(f"  └{'─'*60}")
 
     print(f"\n{'═'*80}\n")
 
@@ -867,9 +1015,13 @@ def main():
     # ── 可视化 ──
     log("Generating visualizations...")
     plot_signal_decay(audit, out_dir / "signal_decay.png", label)
-    plot_coeff_pca(audit, out_dir / "coeff_pca.png", label)
-    plot_branch_contribution(audit, out_dir / "branch_contribution.png", label)
-    plot_proto_mask_grid(audit, out_dir / "proto_mask_grid.png", label)
+    if audit.get("raw", {}).get("is_film", False):
+        # FiLM: skip coeff_pca, branch_contribution, proto_mask_grid (incompatible)
+        log("  (skipping Adaptive-specific plots for FiLM)")
+    else:
+        plot_coeff_pca(audit, out_dir / "coeff_pca.png", label)
+        plot_branch_contribution(audit, out_dir / "branch_contribution.png", label)
+        plot_proto_mask_grid(audit, out_dir / "proto_mask_grid.png", label)
 
     # ── 保存 JSON ──
     audit_json = {
