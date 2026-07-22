@@ -11,13 +11,13 @@ Standard FSS protocol: each step samples a defect class → K support + 1 query
 
 用法 | Usage::
 
-    # K=1, 快速验证 | Quick test
-    python tools/train/train_severstal_fewshot.py --k-shot 1 --seeds 42 --epochs 5 --device cuda
-
-    # 完整扫参 | Full sweep: K=1/3/5/10/20 × 3 seeds
+    # LoRA + Few-Shot (推荐 | Recommended)
     python tools/train/train_severstal_fewshot.py \
         --k-shot 1 3 5 10 20 --seeds 42 123 456 \
-        --epochs 50 --batch-size 8 --device cuda
+        --lora-rank 4 --epochs 50 --device cuda
+
+    # 纯 Few-Shot 基线 (无 LoRA) | Pure Few-Shot baseline (no LoRA)
+    python tools/train/train_severstal_fewshot.py --k-shot 1 --seeds 42 --epochs 5 --device cuda
 
     # 二值模式 (所有缺陷合并为 FG) | Binary mode
     python tools/train/train_severstal_fewshot.py --k-shot 5 --binary --device cuda
@@ -45,6 +45,7 @@ from adatile.logging import get_logger
 from adatile.logging.backends import ConsoleBackend, FileBackend
 from adatile.utils.seed import set_seed
 from adatile.backbone import FastSAMBackbone
+from adatile.backbone.fastsam_backbone import _collect_lora_modules
 from adatile.decoder.adaptive_sparse_decoder import AdaptiveSparseDecoder
 from adatile.datasets.severstal import SeverstalDataset
 
@@ -55,6 +56,26 @@ from adatile.datasets.severstal import SeverstalDataset
 
 IMG_H, IMG_W = 256, 1600  # Severstal native (multiples of 32)
 DEFECT_CLASSES = [1, 2, 3, 4]  # 四类缺陷 | Four defect classes
+
+
+# ═══════════════════════════════════════════════════════════════════
+# LoRA 工具 | LoRA Utilities
+# ═══════════════════════════════════════════════════════════════════
+
+def reset_conv_lora_weights(backbone: FastSAMBackbone):
+    """
+    将所有 ConvLoRA 权重重置为零初始化状态 | Reset all ConvLoRA weights to zero-init state.
+
+    每次 (K, seed) run 开始时调用，确保 LoRA 从原始行为开始。
+    Called at the start of each (K, seed) run to ensure LoRA starts from original behavior.
+
+    lora_down: Kaiming uniform (保留多样性 | preserve diversity)
+    lora_up:   Zero (初始不改变特征 | initially no perturbation)
+    """
+    lora_modules = _collect_lora_modules(backbone.model.model.model)
+    for m in lora_modules:
+        torch.nn.init.kaiming_uniform_(m.lora_down.weight, a=5 ** 0.5)
+        torch.nn.init.zeros_(m.lora_up.weight)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -103,6 +124,7 @@ def compute_prototype(
     support_images: torch.Tensor,    # [K, 3, H, W]
     support_masks: torch.Tensor,     # [K, H, W] binary FG mask
     device: torch.device,
+    allow_grad: bool = False,        # 启用梯度回传 (LoRA 训练时需要)
 ) -> torch.Tensor:
     """
     从 K 张 support 图像计算 L2-normalized FG prototype。
@@ -110,31 +132,37 @@ def compute_prototype(
 
     每张 support: 提取 P4 特征 → FG masked average pool → mean over K → L2 norm.
 
+    allow_grad=True: 移除 no_grad → 梯度可通过 prototype → backbone 回传到 LoRA 参数。
+    allow_grad=True: removes no_grad → gradients flow through prototype → backbone to LoRA params.
+
     :return: [1280] L2-normalized prototype vector.
     """
     K = support_images.shape[0]
     feats_list = []
 
-    for i in range(K):
-        img = support_images[i:i + 1].to(device)
-        mask = support_masks[i].to(device)
-        if mask.dim() == 2:
-            mask = mask.unsqueeze(0)
+    # 上下文管理器: 根据 allow_grad 决定是否阻断梯度
+    # Context manager: enable/disable gradient based on allow_grad
+    ctx = torch.enable_grad() if allow_grad else torch.no_grad()
+    with ctx:
+        for i in range(K):
+            img = support_images[i:i + 1].to(device)
+            mask = support_masks[i].to(device)
+            if mask.dim() == 2:
+                mask = mask.unsqueeze(0)
 
-        with torch.no_grad():
             feats = backbone(img)
             p4 = feats["p4"]  # [1, 1280, H/16, W/16]
 
-        # Resize mask to P4 resolution
-        _, _, H_p4, W_p4 = p4.shape
-        mask_p4 = F.interpolate(
-            mask.unsqueeze(0).float(), size=(H_p4, W_p4), mode="nearest"
-        ).squeeze(0)  # [1, H_p4, W_p4]
+            # Resize mask to P4 resolution
+            _, _, H_p4, W_p4 = p4.shape
+            mask_p4 = F.interpolate(
+                mask.unsqueeze(0).float(), size=(H_p4, W_p4), mode="nearest"
+            ).squeeze(0)  # [1, H_p4, W_p4]
 
-        fg_area = mask_p4.sum()
-        if fg_area > 0:
-            proto = (p4.squeeze(0) * mask_p4).sum(dim=(1, 2)) / (fg_area + 1e-8)
-            feats_list.append(proto)
+            fg_area = mask_p4.sum()
+            if fg_area > 0:
+                proto = (p4.squeeze(0) * mask_p4).sum(dim=(1, 2)) / (fg_area + 1e-8)
+                feats_list.append(proto)
 
     if not feats_list:
         return torch.zeros(1280, device=device)
@@ -512,8 +540,27 @@ def train_one_run(
     decoder_params = sum(p.numel() for p in decoder.parameters())
     logger.log_info("fewshot/model", f"AdaptiveSparseDecoder: {decoder_params/1e3:.1f}K params")
 
-    # ── Optimizer ──
-    optimizer = torch.optim.AdamW(decoder.parameters(), lr=args.lr,
+    # ── LoRA 权重重置 (每次 run 从零开始) | Reset LoRA weights (fresh start per run) ──
+    lora_rank = getattr(args, 'lora_rank', 0)
+    use_lora = lora_rank > 0
+    if use_lora:
+        reset_conv_lora_weights(backbone)
+        lora_params_count = sum(p.numel() for p in backbone.get_lora_parameters())
+        logger.log_info("fewshot/lora",
+                        f"ConvLoRA rank={lora_rank}: {lora_params_count/1e3:.1f}K params (re-initialized)")
+
+    # ── Optimizer (Decoder + optional LoRA) ──
+    optim_params = list(decoder.parameters())
+    if use_lora:
+        optim_params += backbone.get_lora_parameters()
+    total_trainable = sum(p.numel() for p in optim_params)
+    logger.log_info("fewshot/model",
+                    f"Total trainable: {total_trainable/1e3:.1f}K params "
+                    f"(Decoder: {decoder_params/1e3:.1f}K, LoRA: {(total_trainable - decoder_params)/1e3:.1f}K)"
+                    if use_lora else
+                    f"Total trainable: {total_trainable/1e3:.1f}K params (Decoder only)")
+
+    optimizer = torch.optim.AdamW(optim_params, lr=args.lr,
                                   weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs * episodes_per_epoch)
@@ -586,8 +633,11 @@ def train_one_run(
             q_img = q_img.unsqueeze(0).to(device)   # [1, 3, H, W]
             q_mask = q_mask.unsqueeze(0).to(device)  # [1, H, W]
 
-            # ── Prototype | Compute support prototype ──
-            support_proto = compute_prototype(backbone, s_imgs, s_masks, device)
+            # ── Prototype (梯度回传当 LoRA 激活时 | Grad enabled when LoRA active) ──
+            support_proto = compute_prototype(
+                backbone, s_imgs, s_masks, device,
+                allow_grad=use_lora,
+            )
 
             # ── Query forward | Query forward ──
             feats = backbone(q_img, extract_proto=True)
@@ -616,14 +666,14 @@ def train_one_run(
 
             grad_nan = any(
                 p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any())
-                for p in decoder.parameters()
+                for p in optim_params  # 检查 Decoder + LoRA | Check Decoder + LoRA
             )
             if grad_nan:
                 optimizer.zero_grad()
                 nan_count += 1
                 continue
 
-            torch.nn.utils.clip_grad_norm_(decoder.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(optim_params, max_norm=1.0)
             optimizer.step()
             scheduler.step()
             global_step += 1
@@ -668,8 +718,14 @@ def train_one_run(
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(),
                     "mIoU": miou, "mDice": mdice, "per_class_IoU": best_per_class,
-                    "k": k, "seed": seed,
+                    "k": k, "seed": seed, "lora_rank": lora_rank,
                 }
+                # ── 保存 LoRA 权重 (用于恢复/分析) | Save LoRA weights (for resume/analysis) ──
+                if use_lora:
+                    ckpt["lora_state_dict"] = {
+                        k: v.clone() for k, v in backbone.model.model.state_dict().items()
+                        if any(x in k for x in ["lora_down", "lora_up"])
+                    }
                 torch.save(ckpt, str(run_dir / "best_model.pt"))
 
     logger.log_info("fewshot/run_done",
@@ -700,6 +756,12 @@ def parse_args():
     p.add_argument("--no-augment", action="store_true")
     p.add_argument("--crop-size", type=int, default=256,
                    help="训练时随机裁剪尺寸 (default: 256, 0=全图)")
+
+    # ── LoRA | Low-Rank Adaptation ──
+    p.add_argument("--lora-rank", type=int, default=4,
+                   help="ConvLoRA 秩 (0=禁用, default: 4) | ConvLoRA rank (0=disabled).")
+    p.add_argument("--lora-alpha", type=float, default=1.0,
+                   help="LoRA 缩放因子 (default: 1.0) | LoRA scaling factor (alpha/rank).")
 
     # ── 少样本 | Few-Shot ──
     p.add_argument("--k-shot", type=int, nargs="+", default=[1, 3, 5, 10, 20],
@@ -740,7 +802,8 @@ def main():
     # ── 输出目录 | Output dir ──
     if args.output_dir is None:
         ts = datetime.now().strftime("%m%d_%H%M")
-        args.output_dir = f"runs/severstal_episodic_{mode_str}_{ts}"
+        lora_tag = f"_LoRA_r{args.lora_rank}" if args.lora_rank > 0 else "_NoLoRA"
+        args.output_dir = f"runs/severstal_episodic_{mode_str}{lora_tag}_{ts}"
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -753,7 +816,8 @@ def main():
     logger.log_info("config",
                     f"Mode={mode_str} | Crop={args.crop_size if args.crop_size>0 else 'full'} | "
                     f"Epochs={args.epochs} | "
-                    f"Episodes/epoch={args.episodes_per_epoch} | lr={args.lr}")
+                    f"Episodes/epoch={args.episodes_per_epoch} | lr={args.lr} | "
+                    f"LoRA rank={args.lora_rank}")
 
     # ── 数据 | Data ──
     train_ds = SeverstalDataset(root=args.data_root, split="train",
@@ -774,6 +838,16 @@ def main():
     with torch.no_grad():
         backbone(torch.randn(1, 3, IMG_H, IMG_W, device=device), extract_proto=True)
     logger.log_info("model", "Backbone: FastSAM-x (frozen)")
+
+    # ── ConvLoRA 注入 (一次性架构修改, 每次 run 重置权重) ──
+    # Inject ConvLoRA once (architectural change), weights reset per run
+    if args.lora_rank > 0:
+        lora_n = backbone.apply_conv_lora(rank=args.lora_rank, alpha=args.lora_alpha)
+        logger.log_info("model",
+                        f"ConvLoRA injected: rank={args.lora_rank}, alpha={args.lora_alpha}, "
+                        f"+{lora_n:,} trainable params ({lora_n/1e3:.1f}K)")
+    else:
+        logger.log_info("model", "LoRA disabled (--lora-rank 0) — pure frozen backbone")
 
     # ── 验证 K 值 | Validate K values ──
     for k in args.k_shot:
@@ -843,7 +917,8 @@ def main():
 
     print(f"\n{'='*len(header.expandtabs())}")
     print(f"  Severstal Episodic Few-Shot — AdaptiveSparseDecoder")
-    print(f"  Crop: {args.crop_size if args.crop_size > 0 else 'full image'}")
+    print(f"  Crop: {args.crop_size if args.crop_size > 0 else 'full image'} | "
+          f"LoRA rank: {args.lora_rank}")
     print(f"{'='*len(header.expandtabs())}")
     print(header)
     print(sep)
