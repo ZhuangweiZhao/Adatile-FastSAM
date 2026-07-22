@@ -216,12 +216,11 @@ class FiLMDecoder(nn.Module):
         # ═══════════════════════════════════════════════════════════
         # Step 5: 上采样到 stride 4 + Sigmoid
         # ═══════════════════════════════════════════════════════════
-        _, _, H_out, W_out = logit.shape
         final_up = F.interpolate(
             logit, scale_factor=4, mode="bilinear", align_corners=False,
         )  # [B, 1, H/4, W/4]
 
-        return torch.sigmoid(final_up)
+        return torch.sigmoid(final_up.squeeze(1))  # [B, H/4, W/4] — 兼容 AdaptiveSparseDecoder 形状
 
 
 class FiLMDecoderP3P4(nn.Module):
@@ -374,4 +373,4 @@ class FiLMDecoderP3P4(nn.Module):
         final_up = F.interpolate(
             logit, scale_factor=4, mode="bilinear", align_corners=False,
         )
-        return torch.sigmoid(final_up)
+        return torch.sigmoid(final_up.squeeze(1))  # [B, H/4, W/4]
