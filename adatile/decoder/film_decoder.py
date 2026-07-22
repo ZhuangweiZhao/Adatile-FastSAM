@@ -165,16 +165,19 @@ class FiLMDecoder(nn.Module):
     def forward(
         self,
         p4_features: torch.Tensor,     # [B, in_channels, H/16, W/16]
+        proto_masks: torch.Tensor,     # [32, H/4, W/4] — 忽略, 仅兼容旧 API | ignored, compat only
         support_proto: torch.Tensor,   # [in_channels] or [1, in_channels]
-        _proto_masks=None,             # 兼容旧接口 | compat with old API
         fdr_map=None,                  # 忽略 | ignored (no FDR)
     ) -> torch.Tensor:
         """
         FiLM 前向传播 | FiLM Forward.
 
+        参数顺序与 AdaptiveSparseDecoder 一致 (p4, proto_masks, proto).
+        proto_masks 被忽略 — FiLM 不使用 Proto Basis.
+
         :param p4_features: P4 特征图 [B, in_channels, H/16, W/16].
+        :param proto_masks: 忽略 (兼容性). Ignored — FiLM does not use Proto Basis.
         :param support_proto: Support prototype [in_channels].
-        :param _proto_masks: 忽略 (兼容旧 API) | ignored (old API compat).
         :param fdr_map: 忽略 | ignored.
         :return: Binary mask [B, H/4, W/4] in [0,1].
         """
@@ -337,12 +340,12 @@ class FiLMDecoderP3P4(nn.Module):
     def forward(
         self,
         p4_features: torch.Tensor,
+        proto_masks: torch.Tensor,         # 忽略, 兼容性
         support_proto: torch.Tensor,
         p3_features: torch.Tensor | None = None,
-        _proto_masks=None,
         fdr_map=None,
     ) -> torch.Tensor:
-        """前向传播 (兼容旧 API)."""
+        """前向传播 (参数顺序兼容 AdaptiveSparseDecoder)."""
         if support_proto.dim() == 2:
             support_proto = support_proto.squeeze(0)
         B = p4_features.shape[0]
