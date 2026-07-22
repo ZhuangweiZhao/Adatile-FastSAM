@@ -48,6 +48,7 @@ from adatile.backbone import FastSAMBackbone
 from adatile.backbone.fastsam_backbone import _collect_lora_modules
 from adatile.decoder.adaptive_sparse_decoder import AdaptiveSparseDecoder
 from adatile.decoder.film_decoder import FiLMDecoder
+from adatile.decoder.cross_attn_decoder import CrossAttnDecoder
 from adatile.datasets.severstal import SeverstalDataset
 
 
@@ -126,23 +127,24 @@ def compute_prototype(
     support_masks: torch.Tensor,     # [K, H, W] binary FG mask
     device: torch.device,
     allow_grad: bool = False,        # 启用梯度回传 (LoRA 训练时需要)
+    keep_separate: bool = False,     # 保留 K 个独立 prototype (CrossAttn 用)
 ) -> torch.Tensor:
     """
-    从 K 张 support 图像计算 L2-normalized FG prototype。
-    Compute L2-normalized FG prototype from K support images.
+    从 K 张 support 图像计算 L2-normalized FG prototype(s)。
+    Compute L2-normalized FG prototype(s) from K support images.
 
     每张 support: 提取 P4 特征 → FG masked average pool → mean over K → L2 norm.
 
-    allow_grad=True: 移除 no_grad → 梯度可通过 prototype → backbone 回传到 LoRA 参数。
-    allow_grad=True: removes no_grad → gradients flow through prototype → backbone to LoRA params.
+    keep_separate=True: 返回 [K, 1280] 而非 mean 后的 [1280]。
+    keep_separate=True: returns [K, 1280] instead of mean-pooled [1280].
 
-    :return: [1280] L2-normalized prototype vector.
+    allow_grad=True: 移除 no_grad → 梯度可通过 prototype → backbone 回传到 LoRA 参数。
+
+    :return: [1280] L2-normalized prototype vector, or [K, 1280] if keep_separate.
     """
     K = support_images.shape[0]
     feats_list = []
 
-    # 上下文管理器: 根据 allow_grad 决定是否阻断梯度
-    # Context manager: enable/disable gradient based on allow_grad
     ctx = torch.enable_grad() if allow_grad else torch.no_grad()
     with ctx:
         for i in range(K):
@@ -154,7 +156,6 @@ def compute_prototype(
             feats = backbone(img)
             p4 = feats["p4"]  # [1, 1280, H/16, W/16]
 
-            # Resize mask to P4 resolution
             _, _, H_p4, W_p4 = p4.shape
             mask_p4 = F.interpolate(
                 mask.unsqueeze(0).float(), size=(H_p4, W_p4), mode="nearest"
@@ -166,10 +167,17 @@ def compute_prototype(
                 feats_list.append(proto)
 
     if not feats_list:
-        return torch.zeros(1280, device=device)
+        z = torch.zeros(1280, device=device)
+        return z.unsqueeze(0) if keep_separate else z
 
-    proto = torch.stack(feats_list).mean(dim=0)  # [1280]
-    return F.normalize(proto, dim=0, p=2)
+    if keep_separate:
+        # 返回 K 个独立的 L2-normalized prototype | Return K independent prototypes
+        protos = torch.stack(feats_list, dim=0)  # [K_valid, 1280]
+        protos = F.normalize(protos, dim=1, p=2)  # per-prototype L2 norm
+        return protos  # [K, 1280]
+    else:
+        proto = torch.stack(feats_list).mean(dim=0)  # [1280]
+        return F.normalize(proto, dim=0, p=2)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -377,16 +385,16 @@ def evaluate_with_prototypes(
     val_ds: SeverstalDataset,
     device: torch.device,
     class_ids: list[int],
-    support_cache: dict[int, dict],  # {cls_id: {"images": [K,3,H,W], "masks": [K,H,W]}}
+    support_cache: dict[int, dict],
     binary: bool = False,
     max_samples: int = 0,
+    keep_separate: bool = False,   # CrossAttn: K×1280 instead of mean [1280]
 ) -> dict:
     """
     使用固定 support prototype 在验证集上评估每类 IoU。
     Evaluate per-class IoU on validation set using fixed support prototypes.
 
-    对每类: support → prototype → 所有 val 图预测 binary mask → IoU vs GT。
-    For each class: support → prototype → predict on all val images → IoU vs GT.
+    keep_separate=True: prototype 为 [K,1280] (CrossAttn 用), 否则 mean 为 [1280].
 
     :param support_cache: 预先采样的 support 数据 (与训练时一致)。
     :return: {"mIoU": float, "per_class_IoU": dict, "background_IoU": float}
@@ -405,6 +413,7 @@ def evaluate_with_prototypes(
             sc["masks"].to(device) if isinstance(sc["masks"], torch.Tensor)
                 else sc["masks"].clone().to(device),
             device,
+            keep_separate=keep_separate,
         )
         prototypes[cls_id] = proto
 
@@ -535,10 +544,16 @@ def train_one_run(
 
     # ── 模型 | Model (fresh init per run) ──
     decoder_type = getattr(args, 'decoder', 'adaptive')
+    keep_separate = (decoder_type == 'cross_attn')
+
     if decoder_type == 'film':
         decoder = FiLMDecoder(in_channels=1280, hidden_dim=256).to(device)
         decoder_params = sum(p.numel() for p in decoder.parameters())
         logger.log_info("fewshot/model", f"FiLMDecoder: {decoder_params/1e3:.1f}K params")
+    elif decoder_type == 'cross_attn':
+        decoder = CrossAttnDecoder(in_channels=1280, hidden_dim=256, n_heads=4).to(device)
+        decoder_params = sum(p.numel() for p in decoder.parameters())
+        logger.log_info("fewshot/model", f"CrossAttnDecoder: {decoder_params/1e3:.1f}K params (K prototypes, no mean)")
     else:
         decoder = AdaptiveSparseDecoder(
             in_channels=1280, proto_dim=32, hidden_dim=256,
@@ -644,6 +659,7 @@ def train_one_run(
             support_proto = compute_prototype(
                 backbone, s_imgs, s_masks, device,
                 allow_grad=use_lora,
+                keep_separate=keep_separate,
             )
 
             # ── Query forward | Query forward ──
@@ -704,7 +720,7 @@ def train_one_run(
             result = evaluate_with_prototypes(
                 decoder, backbone, val_ds, device,
                 class_ids=class_ids, support_cache=eval_support_cache,
-                binary=binary,
+                binary=binary, keep_separate=keep_separate,
             )
             miou = result["mIoU"]
             mdice = result.get("mDice", 0.0)
@@ -772,9 +788,10 @@ def parse_args():
 
     # ── Decoder | Decoder Architecture ──
     p.add_argument("--decoder", type=str, default="adaptive",
-                   choices=["adaptive", "film"],
+                   choices=["adaptive", "film", "cross_attn"],
                    help="Decoder 架构 (default: adaptive) | "
-                        "adaptive=ProtoCoeffPredictor+P4, film=FiLM modulation.")
+                        "adaptive=ProtoCoeffPredictor+P4, film=FiLM modulation, "
+                        "cross_attn=Multi-Prototype Cross-Attention.")
 
     # ── 少样本 | Few-Shot ──
     p.add_argument("--k-shot", type=int, nargs="+", default=[1, 3, 5, 10, 20],
