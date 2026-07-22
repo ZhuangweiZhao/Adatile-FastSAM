@@ -688,7 +688,8 @@ def plot_proto_mask_grid(audit: dict, output_path: Path, label: str):
     fig, axes = plt.subplots(1, 4, figsize=(18, 4))
     for i, cls_id in enumerate(DEFECT_CLASSES):
         ax = axes[i]
-        mask = np.array(proto_mean[str(cls_id)]).reshape(IMG_H // 4, IMG_W // 4)
+        key = cls_id if cls_id in proto_mean else str(cls_id)
+        mask = np.array(proto_mean[key]).reshape(IMG_H // 4, IMG_W // 4)
         im = ax.imshow(mask, cmap="hot", aspect="auto", vmin=0, vmax=1)
         ax.set_title(f"{CLASS_NAMES[cls_id]}\nMean Proto Mask", fontsize=10)
         ax.axis("off")
@@ -738,14 +739,14 @@ def print_audit_report(audit: dict, label: str):
     print(f"  │ PCA Var Ratio:       PC1={coeff_m['pca_variance_ratio'][0]*100:.1f}%  "
           f"PC2={coeff_m['pca_variance_ratio'][1]*100:.1f}%")
     for cls_id in DEFECT_CLASSES:
-        std = coeff_m["per_class_std"].get(str(cls_id), coeff_m["per_class_std"].get(cls_id, 0))
+        std = coeff_m["per_class_std"].get(cls_id, coeff_m["per_class_std"].get(str(cls_id), 0))
         print(f"  │ Coeff Std ({CLASS_NAMES[cls_id]}): {std:.4f}")
     print(f"  └{'─'*60}")
 
     # ── Branch Contribution ──
     print(f"\n  ┌─ BRANCH CONTRIBUTION {'─'*51}")
     for cls_id in DEFECT_CLASSES:
-        pct = bc["per_class"].get(str(cls_id), bc["per_class"].get(cls_id, 0))
+        pct = bc["per_class"].get(cls_id, bc["per_class"].get(str(cls_id), 0))
         bar = "█" * int(pct * 40) + "░" * (40 - int(pct * 40))
         print(f"  │ {CLASS_NAMES[cls_id]:<10} P4={pct:.3f}  Proto={1-pct:.3f}  [{bar}]")
     print(f"  │ {'─'*50}")
