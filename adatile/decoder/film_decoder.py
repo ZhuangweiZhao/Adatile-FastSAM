@@ -129,11 +129,11 @@ class FiLMDecoder(nn.Module):
         """
         权重初始化 | Weight Initialization.
 
-        FiLM γ 最后层 → 零初始化 (初始不改变特征).
-        FiLM β 最后层 → 零初始化 (初始不加偏置).
+        FiLM γ 最后层 → 输出 1 (恒等: γ·feat = feat).
+        FiLM β 最后层 → 输出 0 (恒等: +β = +0).
         Conv 层 → Kaiming Normal.
-        FiLM gamma final layer → zero init (identity at start).
-        FiLM beta final layer → zero init (no bias at start).
+        FiLM gamma final layer → output 1 (identity: γ·feat = feat).
+        FiLM beta final layer → output 0 (identity: +β = +0).
         """
         for name, module in self.named_modules():
             if isinstance(module, nn.Conv2d):
@@ -146,14 +146,16 @@ class FiLMDecoder(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
             elif isinstance(module, nn.Linear):
-                # 区分 FiLM 最后层 vs 中间层
-                # Distinguish FiLM final layer vs intermediate
-                is_film_final = (
-                    name.endswith("film_gamma.2") or name.endswith("film_beta.2")
-                )
-                if is_film_final:
-                    # 零初始化 → FiLM 初始为恒等变换
-                    # Zero init → FiLM starts as identity
+                is_film_gamma_final = name.endswith("film_gamma.2") or name.endswith("film_gamma_p4.2") or name.endswith("film_gamma_p3.2")
+                is_film_beta_final = name.endswith("film_beta.2") or name.endswith("film_beta_p4.2") or name.endswith("film_beta_p3.2")
+
+                if is_film_gamma_final:
+                    # γ 初始化为 1: weight=0, bias=1 → output=1 for any input
+                    nn.init.zeros_(module.weight)
+                    if module.bias is not None:
+                        nn.init.ones_(module.bias)
+                elif is_film_beta_final:
+                    # β 初始化为 0: weight=0, bias=0 → output=0 for any input
                     nn.init.zeros_(module.weight)
                     if module.bias is not None:
                         nn.init.zeros_(module.bias)
@@ -311,7 +313,7 @@ class FiLMDecoderP3P4(nn.Module):
         self._init_weights()
 
     def _init_weights(self) -> None:
-        """同 FiLMDecoder 初始化策略."""
+        """同 FiLMDecoder 初始化策略: γ→1, β→0."""
         for name, module in self.named_modules():
             if isinstance(module, nn.Conv2d):
                 nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
@@ -323,11 +325,17 @@ class FiLMDecoderP3P4(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
             elif isinstance(module, nn.Linear):
-                is_film_final = any(x in name for x in [
-                    "film_gamma_p4.2", "film_beta_p4.2",
-                    "film_gamma_p3.2", "film_beta_p3.2",
+                is_gamma_final = any(x in name for x in [
+                    "film_gamma_p4.2", "film_gamma_p3.2",
                 ])
-                if is_film_final:
+                is_beta_final = any(x in name for x in [
+                    "film_beta_p4.2", "film_beta_p3.2",
+                ])
+                if is_gamma_final:
+                    nn.init.zeros_(module.weight)
+                    if module.bias is not None:
+                        nn.init.ones_(module.bias)
+                elif is_beta_final:
                     nn.init.zeros_(module.weight)
                     if module.bias is not None:
                         nn.init.zeros_(module.bias)
