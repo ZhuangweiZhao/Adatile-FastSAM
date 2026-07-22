@@ -47,6 +47,7 @@ from adatile.utils.seed import set_seed
 from adatile.backbone import FastSAMBackbone
 from adatile.backbone.fastsam_backbone import _collect_lora_modules
 from adatile.decoder.adaptive_sparse_decoder import AdaptiveSparseDecoder
+from adatile.decoder.film_decoder import FiLMDecoder
 from adatile.datasets.severstal import SeverstalDataset
 
 
@@ -533,12 +534,18 @@ def train_one_run(
                     f"classes={class_ids}")
 
     # ── 模型 | Model (fresh init per run) ──
-    decoder = AdaptiveSparseDecoder(
-        in_channels=1280, proto_dim=32, hidden_dim=256,
-        use_fdr=False, normalize_proto="none", out_channels=1,  # binary per-class
-    ).to(device)
-    decoder_params = sum(p.numel() for p in decoder.parameters())
-    logger.log_info("fewshot/model", f"AdaptiveSparseDecoder: {decoder_params/1e3:.1f}K params")
+    decoder_type = getattr(args, 'decoder', 'adaptive')
+    if decoder_type == 'film':
+        decoder = FiLMDecoder(in_channels=1280, hidden_dim=256).to(device)
+        decoder_params = sum(p.numel() for p in decoder.parameters())
+        logger.log_info("fewshot/model", f"FiLMDecoder: {decoder_params/1e3:.1f}K params")
+    else:
+        decoder = AdaptiveSparseDecoder(
+            in_channels=1280, proto_dim=32, hidden_dim=256,
+            use_fdr=False, normalize_proto="none", out_channels=1,  # binary per-class
+        ).to(device)
+        decoder_params = sum(p.numel() for p in decoder.parameters())
+        logger.log_info("fewshot/model", f"AdaptiveSparseDecoder: {decoder_params/1e3:.1f}K params")
 
     # ── LoRA 权重重置 (每次 run 从零开始) | Reset LoRA weights (fresh start per run) ──
     lora_rank = getattr(args, 'lora_rank', 0)
@@ -763,6 +770,12 @@ def parse_args():
     p.add_argument("--lora-alpha", type=float, default=1.0,
                    help="LoRA 缩放因子 (default: 1.0) | LoRA scaling factor (alpha/rank).")
 
+    # ── Decoder | Decoder Architecture ──
+    p.add_argument("--decoder", type=str, default="adaptive",
+                   choices=["adaptive", "film"],
+                   help="Decoder 架构 (default: adaptive) | "
+                        "adaptive=ProtoCoeffPredictor+P4, film=FiLM modulation.")
+
     # ── 少样本 | Few-Shot ──
     p.add_argument("--k-shot", type=int, nargs="+", default=[1, 3, 5, 10, 20],
                    help="每类 support 图像数 (default: 1 3 5 10 20)")
@@ -803,7 +816,8 @@ def main():
     if args.output_dir is None:
         ts = datetime.now().strftime("%m%d_%H%M")
         lora_tag = f"_LoRA_r{args.lora_rank}" if args.lora_rank > 0 else "_NoLoRA"
-        args.output_dir = f"runs/severstal_episodic_{mode_str}{lora_tag}_{ts}"
+        dec_tag = f"_{args.decoder}"
+        args.output_dir = f"runs/severstal_episodic_{mode_str}{lora_tag}{dec_tag}_{ts}"
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -817,7 +831,7 @@ def main():
                     f"Mode={mode_str} | Crop={args.crop_size if args.crop_size>0 else 'full'} | "
                     f"Epochs={args.epochs} | "
                     f"Episodes/epoch={args.episodes_per_epoch} | lr={args.lr} | "
-                    f"LoRA rank={args.lora_rank}")
+                    f"LoRA rank={args.lora_rank} | Decoder={args.decoder}")
 
     # ── 数据 | Data ──
     train_ds = SeverstalDataset(root=args.data_root, split="train",
@@ -916,9 +930,9 @@ def main():
     sep = "-" * len(header.expandtabs())
 
     print(f"\n{'='*len(header.expandtabs())}")
-    print(f"  Severstal Episodic Few-Shot — AdaptiveSparseDecoder")
+    print(f"  Severstal Episodic Few-Shot — {args.decoder.upper()} Decoder")
     print(f"  Crop: {args.crop_size if args.crop_size > 0 else 'full image'} | "
-          f"LoRA rank: {args.lora_rank}")
+          f"LoRA rank: {args.lora_rank} | Decoder: {args.decoder}")
     print(f"{'='*len(header.expandtabs())}")
     print(header)
     print(sep)
