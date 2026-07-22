@@ -239,13 +239,47 @@ def get_class_mask(sample: dict, class_id: int) -> torch.Tensor:
 # 损失函数 | Loss Functions
 # ═══════════════════════════════════════════════════════════════════
 
-def dice_loss(pred: torch.Tensor, target: torch.Tensor, smooth: float = 1e-6) -> torch.Tensor:
+def binary_focal_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    gamma: float = 5.0,
+    alpha: float = 0.75,
+    eps: float = 1e-4,
+) -> torch.Tensor:
     """
-    二值 Dice 损失 | Binary Dice loss.
+    二值 Focal Loss — 极端 FG/BG 不平衡场景 (Severstal: FG ≈ 3%).
+    Binary Focal Loss for extreme FG/BG imbalance.
 
-    :param pred: [H, W] sigmoid probability ∈ [0, 1].
-    :param target: [H, W] binary float {0, 1}.
+    FL = -α·(1-pt)^γ·log(pt)  for FG
+         -(1-α)·pt^γ·log(1-pt) for BG
+
+    γ=5.0 (iSAID 经验值): 极度压低 easy-negative (背景) 的梯度.
+    α=0.75: FG 样本权重更高.
+    eps=1e-4: 防止 log(0) 梯度爆炸 (非 1e-8，否则梯度可达 1e8).
+
+    :param pred: [...] sigmoid probability ∈ [0, 1].
+    :param target: [...] binary float {0, 1} (same shape as pred).
     """
+    pred = pred.clamp(eps, 1.0 - eps)
+
+    # pt: probability of the target class
+    pt = pred * target + (1.0 - pred) * (1.0 - target)
+
+    # α_t: class-balanced weight
+    alpha_t = alpha * target + (1.0 - alpha) * (1.0 - target)
+
+    # Focal modulation: (1 - pt)^γ
+    focal_weight = (1.0 - pt) ** gamma
+
+    # Binary cross-entropy: -log(pt)
+    bce = -torch.log(pt)
+
+    loss = alpha_t * focal_weight * bce
+    return loss.mean()
+
+
+def dice_loss(pred: torch.Tensor, target: torch.Tensor, smooth: float = 1e-6) -> torch.Tensor:
+    """二值 Dice 损失 | Binary Dice loss."""
     pred_f = pred.flatten()
     target_f = target.flatten()
     if target_f.sum() == 0:
@@ -256,7 +290,55 @@ def dice_loss(pred: torch.Tensor, target: torch.Tensor, smooth: float = 1e-6) ->
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 评估: 基于 prototype 的 per-class IoU | Evaluation w/ Prototype
+# Random Crop (偏向目标类 | biased toward target class)
+# ═══════════════════════════════════════════════════════════════════
+
+def random_crop_with_class(
+    image: torch.Tensor,     # [3, H, W]
+    mask: torch.Tensor,       # [H, W] category labels
+    class_id: int,
+    crop_h: int = 256,
+    crop_w: int = 256,
+    max_attempts: int = 30,
+    rng: random.Random = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    随机裁剪, 优先选择包含目标类的区域 | Random crop biased toward target class.
+
+    在 max_attempts 次尝试内寻找包含 class_id 的 crop.
+    找到 → 返回该 crop. 未找到 → fallback 到随机位置.
+
+    Find a crop containing class_id within max_attempts tries.
+    Found → return crop. Not found → fallback to random position.
+
+    :return: (cropped_image [3, crop_h, crop_w], cropped_mask [crop_h, crop_w])
+    """
+    if rng is None:
+        rng = random
+
+    H, W = mask.shape
+    h_eff = min(crop_h, H)
+    w_eff = min(crop_w, W)
+
+    # 如果图像小于 crop size, 直接返回 | If image smaller than crop, return as-is
+    if H <= crop_h and W <= crop_w:
+        return image.clone(), mask.clone()
+
+    for _ in range(max_attempts):
+        y = rng.randint(0, H - h_eff) if H > h_eff else 0
+        x = rng.randint(0, W - w_eff) if W > w_eff else 0
+        crop_mask = mask[y:y + h_eff, x:x + w_eff]
+        if (crop_mask == class_id).sum() > 0:
+            return image[:, y:y + h_eff, x:x + w_eff].clone(), crop_mask.clone()
+
+    # Fallback: random position
+    y = rng.randint(0, H - h_eff) if H > h_eff else 0
+    x = rng.randint(0, W - w_eff) if W > w_eff else 0
+    return image[:, y:y + h_eff, x:x + w_eff].clone(), mask[y:y + h_eff, x:x + w_eff].clone()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 评估: 基于 prototype 的 per-class IoU + Dice | Evaluation w/ Prototype
 # ═══════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
@@ -358,9 +440,24 @@ def evaluate_with_prototypes(
         )
 
     valid = [v for v in per_class_iou.values() if v == v]  # filter NaN
+    miou = round(float(np.mean(valid)), 6) if valid else 0.0
+
+    # ── Dice (from IoU: Dice = 2*IoU / (1+IoU)) ──
+    per_class_dice = {}
+    for c in [0] + class_ids:
+        name = class_names.get(c, f"class_{c}")
+        iou = per_class_iou.get(name, float("nan"))
+        per_class_dice[name] = round(2 * iou / (1 + iou), 6) if iou == iou and iou > 0 else 0.0
+    fg_dice_vals = [per_class_dice[class_names.get(c, f"class_{c}")]
+                    for c in class_ids
+                    if per_class_dice[class_names.get(c, f"class_{c}")] > 0]
+    mDice = round(float(np.mean(fg_dice_vals)), 6) if fg_dice_vals else 0.0
+
     return {
-        "mIoU": round(float(np.mean(valid)), 6) if valid else 0.0,
+        "mIoU": miou,
+        "mDice": mDice,
         "per_class_IoU": per_class_iou,
+        "per_class_Dice": per_class_dice,
     }
 
 
@@ -442,13 +539,14 @@ def train_one_run(
     # ── 训练循环 | Training Loop ──
     global_step = 0
     best_miou = 0.0
+    best_mdice = 0.0
     best_epoch = 0
     best_per_class = {}
     nan_count = 0
 
     for epoch in range(1, args.epochs + 1):
         decoder.train()
-        epoch_losses, epoch_ce_list, epoch_dice_list = [], [], []
+        epoch_losses, epoch_focal_list, epoch_dice_list = [], [], []
 
         pbar = tqdm(range(episodes_per_epoch), desc=f"K{k}_S{seed} E{epoch:3d}/{args.epochs}",
                     unit="ep", leave=False)
@@ -457,22 +555,30 @@ def train_one_run(
             episode = sampler.sample()
             cls_id = episode["class_id"]
 
-            # ── 加载 support | Load support ──
+            # ── 加载 support (始终全图 — 与 eval 保持一致) | Load support (always full — consistent w/ eval) ──
             s_imgs, s_masks = [], []
             for si in episode["support_indices"]:
                 s = train_ds[si]
-                s_imgs.append(s["image"])       # [3, H, W]
-                s_masks.append(get_class_mask(s, cls_id))  # [H, W]
-            s_imgs = torch.stack(s_imgs)         # [K, 3, H, W]
-            s_masks = torch.stack(s_masks)        # [K, H, W]
+                s_imgs.append(s["image"])                 # [3, 256, 1600] full image
+                s_masks.append(get_class_mask(s, cls_id))  # [256, 1600] binary for target class
+            s_imgs = torch.stack(s_imgs)
+            s_masks = torch.stack(s_masks)
 
-            # ── 加载 query | Load query ──
+            # ── 加载 query (crop 提高 FG 密度 | crop to boost FG density) ──
             q = train_ds[episode["query_index"]]
-            q_img = q["image"]      # [3, H, W]
-            q_mask = get_class_mask(q, cls_id)  # [H, W]
+            use_crop = args.crop_size > 0
+            if use_crop:
+                q_img_full = q["image"]                    # [3, 256, 1600]
+                q_mask_full = q["masks"].squeeze(0)         # [256, 1600] category labels
+                q_img, q_mask_cat = random_crop_with_class(
+                    q_img_full, q_mask_full, cls_id, args.crop_size, args.crop_size)
+                q_mask = (q_mask_cat == cls_id).float()
+            else:
+                q_img = q["image"]
+                q_mask = get_class_mask(q, cls_id)
             H, W = q_mask.shape
 
-            # Augment query only (support stays clean for accurate prototype)
+            # Augment query only
             if augment:
                 q_img, q_mask = augment(q_img, q_mask)
                 H, W = q_mask.shape
@@ -496,12 +602,10 @@ def train_one_run(
 
             target = q_mask.squeeze(0)  # [H, W]
 
-            # ── Loss ──
-            ce = F.binary_cross_entropy(
-                pred_full.clamp(1e-7, 1 - 1e-7), target, reduction="mean"
-            )
+            # ── Loss (Focal + Dice — 极端不平衡 | extreme imbalance) ──
+            focal = binary_focal_loss(pred_full, target, gamma=5.0, alpha=0.75)
             dice = dice_loss(pred_full, target)
-            loss_val = 0.5 * ce + 0.5 * dice
+            loss_val = 0.5 * focal + 0.5 * dice
 
             if torch.isnan(loss_val) or torch.isinf(loss_val):
                 nan_count += 1
@@ -525,7 +629,7 @@ def train_one_run(
             global_step += 1
 
             epoch_losses.append(loss_val.item())
-            epoch_ce_list.append(ce.item())
+            epoch_focal_list.append(focal.item())
             epoch_dice_list.append(dice.item())
 
             if epoch_losses:
@@ -546,12 +650,15 @@ def train_one_run(
                 binary=binary,
             )
             miou = result["mIoU"]
+            mdice = result.get("mDice", 0.0)
             logger.log_info("fewshot/eval",
-                            f"K={k} S={seed} E{epoch:3d}: mIoU={miou:.4f}")
+                            f"K={k} S={seed} E{epoch:3d}: mIoU={miou:.4f} mDice={mdice:.4f}")
             logger.log_metric(f"miou_K{k}_S{seed}", miou, step=epoch, tags=["fewshot"])
+            logger.log_metric(f"mdice_K{k}_S{seed}", mdice, step=epoch, tags=["fewshot"])
 
             if miou > best_miou:
                 best_miou = miou
+                best_mdice = mdice
                 best_epoch = epoch
                 best_per_class = result["per_class_IoU"]
                 ckpt = {
@@ -560,7 +667,7 @@ def train_one_run(
                         k: v.clone() for k, v in decoder.state_dict().items()},
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(),
-                    "mIoU": miou, "per_class_IoU": best_per_class,
+                    "mIoU": miou, "mDice": mdice, "per_class_IoU": best_per_class,
                     "k": k, "seed": seed,
                 }
                 torch.save(ckpt, str(run_dir / "best_model.pt"))
@@ -570,7 +677,8 @@ def train_one_run(
 
     return {
         "k": k, "seed": seed,
-        "best_mIoU": best_miou, "best_epoch": best_epoch,
+        "best_mIoU": best_miou, "best_mDice": best_mdice,
+        "best_epoch": best_epoch,
         "per_class_IoU": best_per_class,
         "nan_count": nan_count, "episodes_per_epoch": episodes_per_epoch,
     }
@@ -590,6 +698,8 @@ def parse_args():
     p.add_argument("--binary", action="store_true",
                    help="二值模式 (所有缺陷合并为 FG) | Binary mode (all defects → FG).")
     p.add_argument("--no-augment", action="store_true")
+    p.add_argument("--crop-size", type=int, default=256,
+                   help="训练时随机裁剪尺寸 (default: 256, 0=全图)")
 
     # ── 少样本 | Few-Shot ──
     p.add_argument("--k-shot", type=int, nargs="+", default=[1, 3, 5, 10, 20],
@@ -641,7 +751,8 @@ def main():
     logger.log_info("config",
                     f"Severstal Episodic Few-Shot | K={args.k_shot} | seeds={args.seeds}")
     logger.log_info("config",
-                    f"Mode={mode_str} | Epochs={args.epochs} | "
+                    f"Mode={mode_str} | Crop={args.crop_size if args.crop_size>0 else 'full'} | "
+                    f"Epochs={args.epochs} | "
                     f"Episodes/epoch={args.episodes_per_epoch} | lr={args.lr}")
 
     # ── 数据 | Data ──
@@ -713,36 +824,41 @@ def main():
     for k in sorted(set(r["k"] for r in all_results)):
         k_results = [r for r in all_results if r["k"] == k]
         mious = [r["best_mIoU"] for r in k_results]
+        mdices = [r.get("best_mDice", 0.0) for r in k_results]
         summary_by_k[str(k)] = {
             "mean_mIoU": round(float(np.mean(mious)), 4),
             "std_mIoU": round(float(np.std(mious)), 4) if len(mious) > 1 else 0.0,
             "min_mIoU": round(float(np.min(mious)), 4),
             "max_mIoU": round(float(np.max(mious)), 4),
+            "mean_mDice": round(float(np.mean(mdices)), 4),
             "n_runs": len(k_results),
         }
 
     # ── 打印汇总表 | Print Table ──
     col_names = [class_names.get(c, f"c{c}") for c in [0] + class_ids]
-    header = (f"{'K':>3} {'Seed':>4} | {'mIoU':>7} | "
+    header = (f"{'K':>3} {'Seed':>4} | {'mIoU':>7} {'mDice':>7} | "
               + " | ".join(f"{n:>7}" for n in col_names)
               + f" | {'Ep':>5}")
     sep = "-" * len(header.expandtabs())
 
     print(f"\n{'='*len(header.expandtabs())}")
     print(f"  Severstal Episodic Few-Shot — AdaptiveSparseDecoder")
+    print(f"  Crop: {args.crop_size if args.crop_size > 0 else 'full image'}")
     print(f"{'='*len(header.expandtabs())}")
     print(header)
     print(sep)
 
     for r in all_results:
-        p = r["per_class_IoU"]
+        p = r.get("per_class_IoU", r.get("per_class_IoU", {}))
+        mdice = r.get("best_mDice", 0.0)
         vals = " | ".join(f"{p.get(class_names.get(c, f'c{c}'), float('nan')):7.4f}"
                           for c in [0] + class_ids)
-        print(f"{r['k']:3d} {r['seed']:4d} | {r['best_mIoU']:7.4f} | {vals} | {r['best_epoch']:5d}")
+        print(f"{r['k']:3d} {r['seed']:4d} | {r['best_mIoU']:7.4f} {mdice:7.4f} | {vals} | {r['best_epoch']:5d}")
 
     print(sep)
     for k_str, s in summary_by_k.items():
-        print(f"{k_str:>3} {'mean':>4} | {s['mean_mIoU']:7.4f} | ({s['std_mIoU']:.4f})")
+        mean_dice = s.get("mean_mDice", 0.0)
+        print(f"{k_str:>3} {'mean':>4} | {s['mean_mIoU']:7.4f} {mean_dice:7.4f} | ({s['std_mIoU']:.4f})")
     print(f"{'='*len(header.expandtabs())}\n")
 
     # ── results.json ──

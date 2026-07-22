@@ -284,6 +284,27 @@ def get_class_mask(sample: dict, class_id: int) -> torch.Tensor:
     return mask.float()
 
 
+def binary_focal_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    gamma: float = 5.0,
+    alpha: float = 0.75,
+    eps: float = 1e-4,
+) -> torch.Tensor:
+    """
+    二值 Focal Loss — 极端 FG/BG 不平衡 (Severstal: FG ≈ 3%).
+    FL = -α·(1-pt)^γ·log(pt) for FG, -(1-α)·pt^γ·log(1-pt) for BG.
+    γ=5.0, α=0.75, eps=1e-4.
+    """
+    pred = pred.clamp(eps, 1.0 - eps)
+    pt = pred * target + (1.0 - pred) * (1.0 - target)
+    alpha_t = alpha * target + (1.0 - alpha) * (1.0 - target)
+    focal_weight = (1.0 - pt) ** gamma
+    bce = -torch.log(pt)
+    loss = alpha_t * focal_weight * bce
+    return loss.mean()
+
+
 def dice_loss(pred: torch.Tensor, target: torch.Tensor, smooth: float = 1e-6) -> torch.Tensor:
     """二值 Dice 损失."""
     pred_f = pred.flatten()
@@ -403,7 +424,7 @@ def _train_epoch_baseline(
 ) -> dict:
     """Baseline episodic training epoch: full image → backbone → decoder."""
     decoder.train()
-    epoch_losses, epoch_ce_list, epoch_dice_list = [], [], []
+    epoch_losses, epoch_focal_list, epoch_dice_list = [], [], []
     nan_count = 0
     total_backbone_px = 0
     total_decoder_pos = 0
@@ -452,10 +473,10 @@ def _train_epoch_baseline(
 
         target = q_mask.squeeze(0)
 
-        # Loss
-        ce = F.binary_cross_entropy(pred_full.clamp(1e-7, 1 - 1e-7), target, reduction="mean")
+        # Loss (Focal + Dice — 极端不平衡 | extreme imbalance)
+        focal = binary_focal_loss(pred_full, target, gamma=5.0, alpha=0.75)
         dice = dice_loss(pred_full, target)
-        loss_val = 0.5 * ce + 0.5 * dice
+        loss_val = 0.5 * focal + 0.5 * dice
 
         if torch.isnan(loss_val) or torch.isinf(loss_val):
             nan_count += 1
@@ -478,7 +499,7 @@ def _train_epoch_baseline(
         scheduler.step()
 
         epoch_losses.append(loss_val.item())
-        epoch_ce_list.append(ce.item())
+        epoch_focal_list.append(focal.item())
         epoch_dice_list.append(dice.item())
         total_backbone_px += IMG_H * IMG_W
         total_decoder_pos += (IMG_H // P4_STRIDE) * (IMG_W // P4_STRIDE)
@@ -511,7 +532,7 @@ def _train_epoch_oracle_tile(
     每步: 切 Tile → Oracle 选 Top-K → per-tile Backbone + Decoder → Loss.
     """
     decoder.train()
-    epoch_losses, epoch_ce_list, epoch_dice_list = [], [], []
+    epoch_losses, epoch_focal_list, epoch_dice_list = [], [], []
     nan_count, skip_count = 0, 0
     total_backbone_px = 0
     total_decoder_pos = 0
@@ -557,7 +578,7 @@ def _train_epoch_oracle_tile(
         )
 
         # ── Per-Tile Query Forward | Process each selected tile ──
-        tile_losses, tile_ces, tile_dices = [], [], []
+        tile_losses, tile_focals, tile_dices = [], [], []
         for t in q_selected:
             tile_img = t["image"].unsqueeze(0).to(device)        # [1, 3, 256, W_pad]
             tile_mask = t["mask"].to(device)                      # [256, W_pad]
@@ -588,14 +609,12 @@ def _train_epoch_oracle_tile(
             pred_full = pred_full_pad[:, :orig_w]  # [256, orig_w]
 
             # Loss (只在有 FG 像素的 Tile 上计算 | Only on tiles with FG pixels)
-            ce = F.binary_cross_entropy(
-                pred_full.clamp(1e-7, 1 - 1e-7), fg_binary, reduction="mean"
-            )
+            focal = binary_focal_loss(pred_full, fg_binary, gamma=5.0, alpha=0.75)
             dice = dice_loss(pred_full, fg_binary)
-            loss_tile = 0.5 * ce + 0.5 * dice
+            loss_tile = 0.5 * focal + 0.5 * dice
 
             tile_losses.append(loss_tile)
-            tile_ces.append(ce.item())
+            tile_focals.append(focal.item())
             tile_dices.append(dice.item())
 
             total_backbone_px += IMG_H * padded_w
@@ -607,7 +626,7 @@ def _train_epoch_oracle_tile(
 
         # ── 平均所有选中 Tile 的 Loss | Average loss across selected tiles ──
         loss_val = torch.stack(tile_losses).mean()
-        avg_ce = np.mean(tile_ces)
+        avg_focal = np.mean(tile_focals)
         avg_dice = np.mean(tile_dices)
 
         if torch.isnan(loss_val) or torch.isinf(loss_val):
@@ -631,7 +650,7 @@ def _train_epoch_oracle_tile(
         scheduler.step()
 
         epoch_losses.append(loss_val.item())
-        epoch_ce_list.append(avg_ce)
+        epoch_focal_list.append(avg_focal)
         epoch_dice_list.append(avg_dice)
 
         if epoch_losses:
